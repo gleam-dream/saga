@@ -4,7 +4,8 @@
     rescue/5,
     schedulers_online/0,
     unique_integer/0,
-    monotonic_time/0
+    monotonic_time/0,
+    system_time/0
 ]).
 
 %% Runs `Fun` and calls back into exactly one of the supplied continuations:
@@ -35,3 +36,6 @@ unique_integer() ->
 
 monotonic_time() ->
     erlang:monotonic_time(millisecond).
+
+system_time() ->
+    erlang:system_time(millisecond).

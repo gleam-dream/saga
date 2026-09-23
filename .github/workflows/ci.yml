@@ -5,12 +5,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: saga
+      - name: Read sinal's pinned sibling revision
+        id: sinal_rev
+        run: |
+          echo "rev=$(grep '^sinal=' saga/sibling-revisions.txt | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: gleam-dream/sinal
+          ref: ${{ steps.sinal_rev.outputs.rev }}
+          path: sinal
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "28"
           gleam-version: "1.18.1"
           rebar3-version: "3.27.0"
       - run: gleam deps download
+        working-directory: saga
       - run: gleam format --check src test
+        working-directory: saga
       - run: gleam build --warnings-as-errors
+        working-directory: saga
       - run: gleam test
+        working-directory: saga

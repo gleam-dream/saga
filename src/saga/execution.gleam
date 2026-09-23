@@ -1,14 +1,23 @@
 /// Run lifecycle for a `saga.Workflow`: config and its validation, starting
 /// a run, waiting for or inspecting its outcome, and cancellation.
 ///
-/// Increment 1 scope: `run`/`start`/`await`/`progress` are implemented with
-/// bounded concurrency, retry/compensation, and reverse-order undo.
-/// `cancel` is accepted (idempotent, returns immediately) but does not yet
-/// interrupt a running attempt — cancellation settlement of active siblings
-/// is increment 2, along with deadlines, per-step timeouts, and Sinal
-/// observations. `Config`'s `deadline`/`settle_timeout`/`cleanup_timeout`
-/// fields exist now for API stability and are validated, but are not yet
-/// enforced by the coordinator.
+/// `run`/`start`/`await`/`cancel`/`progress` are implemented with bounded
+/// concurrency, retry/compensation, reverse-order undo, a run deadline,
+/// per-step timeouts, and cancellation settlement of active siblings.
+///
+/// **Resource bounds.** Worst-case run time is bounded by
+/// `deadline + settle_timeout + (undone entries + compensations) *
+/// cleanup_timeout`: once a run stops admitting new work (on a step
+/// failure, the deadline, or a cancellation), in-flight attempts and
+/// compensations are given up to `settle_timeout` to finish on their own
+/// before being killed, and each compensation decision or undo action
+/// individually is bounded by `cleanup_timeout`.
+///
+/// **Cancellation never reverses an unknown effect.** A step whose attempt
+/// or compensation is killed — by its own `timeout`, or by the settle
+/// window closing — is reported `interrupted`: its effect is unknown and is
+/// never journaled or undone. Only steps that are known to have completed
+/// are undone.
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -100,6 +109,7 @@ pub type Cause(e) {
   StepTimedOut(step: StepAddress)
   RetryLimitReached(step: StepAddress, last: saga.AttemptFailure(e))
   OutputCrashed(crash: Crash)
+  DeadlineExceeded
   DefinitionChanged
 }
 
@@ -107,42 +117,61 @@ pub type Cause(e) {
 pub type UndoFailure(u) {
   UndoFailed(step: StepAddress, error: u)
   UndoCrashed(step: StepAddress, crash: Crash)
+  UndoTimedOut(step: StepAddress)
 }
 
 /// A compensation decision itself failed to produce a clean outcome.
 pub type CompensationFailure(u) {
   CleanupFailed(step: StepAddress, error: u)
   CompensationCrashed(step: StepAddress, crash: Crash)
+  CompensationTimedOut(step: StepAddress)
+}
+
+/// Why a run was cancelled: an explicit `cancel` call, or the owning
+/// process exiting.
+pub type CancelReason {
+  CancelRequested
+  OwnerExited
 }
 
 /// What happened to every step once a run stopped admitting new work:
 /// which were undone (in reverse completion order), which undo actions
 /// failed (all retained, not just the first), which had no undo configured,
-/// which were held by an unresolved `Hold`, and which sibling failures
-/// settled after the primary cause.
+/// which were held by an unresolved `Hold`, which attempts or compensations
+/// were killed in flight with an unknown, never-undone effect, and which
+/// sibling failures settled after the primary cause.
 pub type Settlement(e, u) {
   Settlement(
     undone: List(StepAddress),
     undo_failures: List(UndoFailure(u)),
     not_undoable: List(StepAddress),
     held: List(StepAddress),
+    interrupted: List(StepAddress),
     compensation_failures: List(CompensationFailure(u)),
     sibling_failures: List(Cause(e)),
   )
 }
 
-/// A run's terminal result: success, a failure with its settlement, or an
-/// unresolved `Hold` that left completed effects untouched.
+/// A run's terminal result: success, a failure with its settlement, a
+/// cancellation, or an unresolved `Hold` that left completed effects
+/// untouched. `Cancelled`'s settlement follows the same rules as `Failed`'s:
+/// completed steps are undone, and interrupted or not-undoable effects are
+/// listed rather than claimed reversed.
 pub type Outcome(o, e, u) {
   Completed(output: o)
   Failed(cause: Cause(e), settlement: Settlement(e, u))
+  Cancelled(reason: CancelReason, settlement: Settlement(e, u))
   Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
 }
 
-/// The run's current admission phase.
+/// The run's current admission phase: accepting new work, letting active
+/// siblings settle after a terminal trigger, undoing completed steps, or
+/// about to report a terminal outcome.
 pub type Phase {
   Running
+  Settling
   RollingBack
+  Finishing
 }
 
 /// One step's current state, as reported by `progress`.
@@ -153,6 +182,7 @@ pub type StepState {
   RetryScheduled(next_attempt: Int)
   Succeeded
   FailedStep
+  Interrupted
   Undoing
   Undone
   UndoFailedStep
@@ -184,14 +214,18 @@ pub type AwaitError {
 
 /// A started run. Only the process that called `start` may `await` it.
 ///
-/// Increment 1: `AwaitError.AlreadyAwaited` is part of the public shape but
-/// is not yet distinguished from `AwaitTimedOut` after the outcome message
-/// has already been consumed — tracking that explicitly is increment 2.
+/// `await`'s monitor on the coordinator is what makes `AlreadyAwaited` and
+/// `Lost` distinguishable after the fact: the coordinator always sends the
+/// outcome before it exits, and message order from one process to another
+/// is preserved, so the owner's `result` mailbox always has the outcome
+/// waiting (or already consumed) strictly before the monitor's `Down`
+/// message for a normal exit could arrive.
 pub opaque type Execution(o, e, u) {
   Execution(
     pid: Pid,
     run_id: Int,
     owner: Pid,
+    monitor: process.Monitor,
     control: Subject(coordinator.Control(o, e, u)),
     result: Subject(coordinator.Outcome(o, e, u)),
   )
@@ -232,16 +266,23 @@ pub fn start(
   let control_subject_out = process.new_subject()
   let #(pid, run_id) =
     coordinator.start(
+      workflow_name: saga.name(workflow),
+      owner: owner,
       max_concurrency: validated.max_concurrency,
+      deadline: validated.deadline,
+      settle_timeout: validated.settle_timeout,
+      cleanup_timeout: validated.cleanup_timeout,
       build_graph: fn() { saga.for_run(workflow, input) },
       result_subject: result_subject,
       control_subject_out: control_subject_out,
     )
   let assert Ok(control) = process.receive(control_subject_out, 5000)
+  let monitor = process.monitor(pid)
   Ok(Execution(
     pid: pid,
     run_id: run_id,
     owner: owner,
+    monitor: monitor,
     control: control,
     result: result_subject,
   ))
@@ -257,9 +298,56 @@ fn result_try(
   }
 }
 
+type AwaitSignal(o, e, u) {
+  GotOutcome(coordinator.Outcome(o, e, u))
+  CoordinatorDown(process.ExitReason)
+}
+
+fn await_selector(
+  execution: Execution(o, e, u),
+) -> process.Selector(AwaitSignal(o, e, u)) {
+  process.new_selector()
+  |> process.select_map(execution.result, GotOutcome)
+  |> process.select_specific_monitor(execution.monitor, fn(down) {
+    case down {
+      process.ProcessDown(_, _, reason) -> CoordinatorDown(reason)
+      process.PortDown(_, _, reason) -> CoordinatorDown(reason)
+    }
+  })
+}
+
+fn await_signal(
+  signal: AwaitSignal(o, e, u),
+) -> Result(Outcome(o, e, u), AwaitError) {
+  case signal {
+    GotOutcome(outcome) -> Ok(to_public_outcome(outcome))
+    // The coordinator always sends the outcome before it exits; a `Down`
+    // observed here (rather than the outcome above) means either no
+    // outcome was ever sent (the coordinator was killed: `Lost`), or this
+    // is a second `await` after the first already consumed the outcome
+    // message and the coordinator has since exited normally
+    // (`AlreadyAwaited`).
+    CoordinatorDown(process.Normal) -> Error(AlreadyAwaited)
+    CoordinatorDown(reason) ->
+      Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
+  }
+}
+
+fn exit_reason_to_string(reason: process.ExitReason) -> String {
+  case reason {
+    process.Normal -> "normal"
+    process.Killed -> "killed"
+    process.Abnormal(_) -> "abnormal"
+  }
+}
+
 /// Waits up to `milliseconds` for the run's outcome. Returns
 /// `Error(AwaitTimedOut)` on timeout — the run continues, and `await` may
-/// be called again.
+/// be called again. Returns `Error(AlreadyAwaited)` if a previous `await`
+/// on this same `Execution` already consumed the outcome. Returns
+/// `Error(Lost(crash))` if the coordinator was killed externally before it
+/// could report an outcome (`execution.pid` lets applications monitor it
+/// themselves for this case).
 pub fn await(
   execution: Execution(o, e, u),
   timeout milliseconds: Int,
@@ -267,8 +355,8 @@ pub fn await(
   case process.self() == execution.owner {
     False -> Error(NotOwner)
     True ->
-      case process.receive(execution.result, milliseconds) {
-        Ok(outcome) -> Ok(to_public_outcome(outcome))
+      case process.selector_receive(await_selector(execution), milliseconds) {
+        Ok(signal) -> await_signal(signal)
         Error(_) -> Error(AwaitTimedOut)
       }
   }
@@ -279,13 +367,17 @@ fn await_forever(
 ) -> Result(Outcome(o, e, u), AwaitError) {
   case process.self() == execution.owner {
     False -> Error(NotOwner)
-    True -> Ok(to_public_outcome(process.receive_forever(execution.result)))
+    True ->
+      await_signal(process.selector_receive_forever(await_selector(execution)))
   }
 }
 
-/// Requests cancellation. Returns immediately; the request is idempotent.
-/// Increment 1: accepted but not yet enforced (no in-flight attempt is
-/// interrupted). Increment 2 adds settlement of active siblings.
+/// Requests cancellation. Returns immediately; the request is idempotent
+/// and a no-op once settling or later has already begun. Cancellation stops
+/// admission, lets active siblings settle within `settle_timeout`, then
+/// kills whatever remains (reported `interrupted`) and rolls back known
+/// completed effects. It never reverses an interrupted or not-undoable
+/// effect.
 pub fn cancel(execution: Execution(o, e, u)) -> Nil {
   process.send(execution.control, coordinator.CancelRequest)
 }
@@ -330,6 +422,18 @@ fn to_public_outcome(
         evidence,
         to_public_settlement(settlement),
       )
+    coordinator.Cancelled(reason, settlement) ->
+      Cancelled(
+        to_public_cancel_reason(reason),
+        to_public_settlement(settlement),
+      )
+  }
+}
+
+fn to_public_cancel_reason(reason: coordinator.CancelReason) -> CancelReason {
+  case reason {
+    coordinator.CancelRequested -> CancelRequested
+    coordinator.OwnerExited -> OwnerExited
   }
 }
 
@@ -347,6 +451,7 @@ fn to_public_cause(cause: coordinator.Cause(e)) -> Cause(e) {
       )
     coordinator.OutputCrashed(crash) ->
       OutputCrashed(saga.crash_from_node(crash))
+    coordinator.DeadlineExceeded -> DeadlineExceeded
     coordinator.DefinitionChanged -> DefinitionChanged
   }
 }
@@ -359,6 +464,7 @@ fn to_public_settlement(
     undo_failures: list.map(settlement.undo_failures, to_public_undo_failure),
     not_undoable: list.map(settlement.not_undoable, saga.address_from_node),
     held: list.map(settlement.held, saga.address_from_node),
+    interrupted: list.map(settlement.interrupted, saga.address_from_node),
     compensation_failures: list.map(
       settlement.compensation_failures,
       to_public_compensation_failure,
@@ -375,6 +481,7 @@ fn to_public_undo_failure(
       UndoFailed(saga.address_from_node(step), error)
     coordinator.UndoCrashed(step, crash) ->
       UndoCrashed(saga.address_from_node(step), saga.crash_from_node(crash))
+    coordinator.UndoTimedOut(step) -> UndoTimedOut(saga.address_from_node(step))
   }
 }
 
@@ -389,15 +496,25 @@ fn to_public_compensation_failure(
         saga.address_from_node(step),
         saga.crash_from_node(crash),
       )
+    coordinator.CompensationTimedOut(step) ->
+      CompensationTimedOut(saga.address_from_node(step))
   }
 }
 
 fn to_public_progress(progress: coordinator.Progress) -> Progress {
   Progress(
     run_id: progress.run_id,
+    // The coordinator reports its outcome and exits in the same step that
+    // finishes rollback (or reaches `Unresolved`/`Completed`), so there is
+    // no observable window between "rollback just finished" and "the run
+    // is gone" for a `progress` call to land in. Public `Finishing` exists
+    // for API completeness (so a caller matching exhaustively on `Phase`
+    // is future-proofed) but `progress` never actually returns it.
     phase: case progress.phase {
       coordinator.Running -> Running
+      coordinator.Settling -> Settling
       coordinator.RollingBack -> RollingBack
+      coordinator.Finishing -> Finishing
     },
     steps: list.map(progress.steps, fn(sp) {
       StepProgress(
@@ -416,6 +533,7 @@ fn to_public_step_state(state: coordinator.StepState) -> StepState {
     coordinator.RetryScheduled(next_attempt) -> RetryScheduled(next_attempt)
     coordinator.Succeeded -> Succeeded
     coordinator.FailedStep -> FailedStep
+    coordinator.Interrupted -> Interrupted
     coordinator.Undoing -> Undoing
     coordinator.Undone -> Undone
     coordinator.UndoFailedStep -> UndoFailedStep
