@@ -1172,8 +1172,7 @@ fn start_crash_recovery(
 /// `Continue` that lets the run proceed leaves this one attempt's effect
 /// permanently unknown, and that fact must survive to the final `Outcome`
 /// (see `Outcome.Completed`'s doc comment; a terminal failure instead
-/// carries it via `settlement.interrupted`, folded in by
-/// `fold_timed_out_attempts_into_settlement`).
+/// carries it via `settlement.interrupted`, folded in by `run_finished`).
 fn handle_step_timeout_fired(
   state: RunState(o, e, u),
   node_id: Int,
@@ -1183,7 +1182,7 @@ fn handle_step_timeout_fired(
     False -> state
     True ->
       case dict.get(state.state, node_id) {
-        Ok(NodeAttempting(_seq, attempt_number, pid, _timer, _started_at)) -> {
+        Ok(NodeAttempting(_seq, attempt_number, pid, _timer, started_at)) -> {
           process.kill(pid)
           let assert Ok(n) = dict.get(state.nodes, node_id)
           let state =
@@ -1193,27 +1192,56 @@ fn handle_step_timeout_fired(
                 state.state,
                 node_id,
                 // Bump to a fresh (unreachable) seq so a stray late message
-                // from the killed task cannot be mistaken for this attempt.
+                // from the killed task cannot be mistaken for this attempt,
+                // but keep the *original* `started_at` — this killed
+                // attempt's own `step_stopped` (emitted either by
+                // `fail_terminal` just below, when there is no decider, or
+                // right here otherwise) must report its real elapsed time,
+                // not the ~0 duration a freshly-taken timestamp would give.
                 NodeAttempting(
                   ffi.unique_integer(),
                   attempt_number,
                   pid,
                   None,
-                  ffi.monotonic_time(),
+                  started_at,
                 ),
               ),
               timed_out_attempts: [n.address, ..state.timed_out_attempts],
             )
           case n.prepare_crash_recovery {
             None ->
+              // No decider: `fail_terminal` below is this attempt's own
+              // terminal outcome, and it emits `step_stopped` using this
+              // same attempt's real duration (its `started_at` was just
+              // preserved above) — a single, correct event, so nothing
+              // extra is needed here.
               fail_terminal(
                 state,
                 node_id,
                 TimedOut,
                 observation.AttemptTimedOut,
               )
-            Some(prepare) ->
+            Some(prepare) -> {
+              // A decider exists: the decision's own resolution
+              // (`fail_terminal`/`commit_success`, from
+              // `handle_recovery_done`) will emit a *different*
+              // `step_stopped` later, using the decider task's own
+              // (much shorter) duration and its own outcome kind — never
+              // `AttemptTimedOut`. Without emitting one here, the killed
+              // attempt's own timeout would never be reported at all, so
+              // it is emitted now, using its real elapsed duration, before
+              // `start_crash_recovery` moves the node into
+              // `NodeCompensating` with its own fresh `started_at`.
+              let duration = ffi.monotonic_time() - started_at
+              emit_step_stopped(
+                state,
+                n.address,
+                attempt_number,
+                observation.AttemptTimedOut,
+                duration,
+              )
               start_crash_recovery(state, node_id, prepare, TimedOut)
+            }
           }
         }
         _ -> state
