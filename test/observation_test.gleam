@@ -208,6 +208,105 @@ pub fn observation_events_cancelled_test() {
   list.contains(events(collector), "run_stop:cancelled") |> should.be_true
 }
 
+/// A step-timeout kill with a `compensate` decider attached still emits its
+/// own `step_stop:<name>:timed_out` for the killed attempt — distinct from
+/// the decider's own `compensate_stop` event — and with the killed attempt's
+/// real elapsed duration (close to its configured `timeout`), not the near-0
+/// duration of the (much faster) decider that runs afterwards.
+pub fn step_timeout_with_decider_emits_step_stopped_test() {
+  let gate = probe.new_gate()
+  let durations = process.new_subject()
+  let counter = probe.new_counter()
+
+  let subscriptions =
+    sinal.subscriptions([
+      sinal.subscription(observation.step_stopped(), fn(m, d) {
+        case d.result {
+          observation.AttemptTimedOut ->
+            process.send(durations, #(d.step, m.duration))
+          _ -> Nil
+        }
+      }),
+    ])
+
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("flaky", fn(x: Int) {
+          probe.counter_enter(counter)
+          case probe.total_entries(counter) {
+            1 -> {
+              probe.enter(gate)
+              Ok(x)
+            }
+            _ -> Ok(x)
+          }
+        })
+        |> saga.timeout(50)
+        |> saga.compensate(max_attempts: 2, with: fn(_i, failure, _a) {
+          case failure {
+            saga.TimedOut -> saga.Retry
+            _ -> panic as "expected TimedOut"
+          }
+        }),
+      )
+    })
+
+  let assert Ok(sinal.SubscriptionCompletion(Ok(_result), [])) =
+    sinal.with_subscriptions(subscriptions, fn() {
+      execution.run(workflow, 0, execution.config())
+    })
+
+  let assert Ok(#(step, duration)) = process.receive(durations, 1000)
+  step |> should.equal("flaky")
+  // The killed attempt was blocked on `gate` for at least its 50ms
+  // `timeout` before being killed; a near-0 duration here would mean the
+  // event was (wrongly) emitted using the decider's own much-faster
+  // duration instead of the killed attempt's real elapsed time.
+  { duration >= 40 } |> should.be_true
+}
+
+/// The plain (no `compensate` decider) step-timeout path also reports the
+/// killed attempt's real elapsed duration, not a near-0 duration from a
+/// freshly-taken timestamp overwriting the original `started_at`.
+pub fn step_timeout_without_decider_reports_real_duration_test() {
+  let gate = probe.new_gate()
+  let durations = process.new_subject()
+
+  let subscriptions =
+    sinal.subscriptions([
+      sinal.subscription(observation.step_stopped(), fn(m, d) {
+        case d.result {
+          observation.AttemptTimedOut ->
+            process.send(durations, #(d.step, m.duration))
+          _ -> Nil
+        }
+      }),
+    ])
+
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("blocked", fn(x: Int) {
+          probe.enter(gate)
+          Ok(x)
+        })
+        |> saga.timeout(50),
+      )
+    })
+
+  let assert Ok(sinal.SubscriptionCompletion(Ok(_result), [])) =
+    sinal.with_subscriptions(subscriptions, fn() {
+      execution.run(workflow, 0, execution.config())
+    })
+
+  let assert Ok(#(step, duration)) = process.receive(durations, 1000)
+  step |> should.equal("blocked")
+  { duration >= 40 } |> should.be_true
+}
+
 /// A raising Sinal handler is isolated by Sinal itself (it is detached, and
 /// the failure is reported through `on_failure`, never re-raised into the
 /// coordinator) — the run's outcome is unaffected.
