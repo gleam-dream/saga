@@ -40,7 +40,13 @@ pub fn failure_with_active_siblings_settles_test() {
       saga.both(slow, fast)
     })
 
-  probe.with_run(workflow, 0, execution.config(), fn(exec) {
+  // `slow` and `fast_fail` must both be admitted at once for this test's
+  // "the fast sibling fails while the slow one is still active" scenario
+  // to happen at all — `max_concurrency` is set explicitly (rather than
+  // relying on `config()`'s scheduler-count default) so this passes under
+  // a single-scheduler `+S 1:1` run too.
+  let config = execution.Config(..execution.config(), max_concurrency: 2)
+  probe.with_run(workflow, 0, config, fn(exec) {
     // Let the slow sibling start, then release it once the run has already
     // failed via the fast sibling.
     let assert Ok(_slow_pid) = probe.wait_entered(slow_gate, 2000)
