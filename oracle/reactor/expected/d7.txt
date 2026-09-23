@@ -1,0 +1,3 @@
+d7.trace: [:produce]
+d7.produce_count: 1
+d7.result: {:ok, {{:left, :shared_value}, {:right, :shared_value}}}

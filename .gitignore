@@ -2,3 +2,10 @@ build/
 erl_crash.dump
 *.beam
 .direnv/
+
+# Reactor differential oracle (oracle/reactor/): Elixir/mix build
+# artifacts and dependency sources are not vendored, but mix.lock is
+# committed so `reactor == 1.0.6` stays pinned.
+oracle/reactor/deps/
+oracle/reactor/_build/
+oracle/reactor/upstream/

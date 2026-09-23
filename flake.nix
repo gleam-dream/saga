@@ -41,6 +41,20 @@
           ];
         };
 
+        # Elixir-equipped shell for the Reactor differential oracle
+        # (oracle/reactor/). Kept out of devShells.default and CI so the
+        # package's own toolchain stays Elixir-free; run explicitly with
+        # `nix develop .#oracle -- scripts/oracle.sh`.
+        devShells.oracle = pkgs.mkShell {
+          packages = with pkgs; [
+            lefthook
+            gleam
+            beam28Packages.erlang
+            beam28Packages.elixir
+            rebar3
+          ];
+        };
+
         formatter = treefmtEval.config.build.wrapper;
 
         checks.formatting = treefmtEval.config.build.check ./.;
