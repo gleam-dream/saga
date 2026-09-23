@@ -150,8 +150,15 @@ pub fn step_timeout_recovery_can_retry_test() {
       )
     })
 
-  let assert Ok(execution.Completed(0)) =
+  // The first attempt was killed mid-flight by its own `timeout` — its
+  // effect is unknown, even though `Retry` let the run reach a normal
+  // output — so the outcome must say so rather than reporting a plain
+  // `Completed` that silently drops it.
+  let assert Ok(execution.CompletedWithUnknownEffects(0, unknown_effects)) =
     execution.run(workflow, 0, execution.config())
+  unknown_effects
+  |> list.map(fn(address) { address.name })
+  |> should.equal(["flaky"])
   probe.total_entries(counter) |> should.equal(2)
 }
 
@@ -461,17 +468,17 @@ pub fn coordinator_kill_terminates_tasks_test() {
   wait_until_dead(task_pid, 2000)
 }
 
+/// Waits for `pid` to exit via a monitor (no polling): if it is already
+/// dead, `process.monitor` itself resolves immediately by delivering a
+/// synthetic `Down`, so this never blocks on an already-finished process.
 fn wait_until_dead(pid: process.Pid, timeout_ms: Int) -> Nil {
-  case process.is_alive(pid) {
-    False -> Nil
-    True ->
-      case timeout_ms <= 0 {
-        True -> panic as "expected task process to die with its coordinator"
-        False -> {
-          process.sleep(10)
-          wait_until_dead(pid, timeout_ms - 10)
-        }
-      }
+  let monitor = process.monitor(pid)
+  let selector =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_down) { Nil })
+  case process.selector_receive(selector, timeout_ms) {
+    Ok(Nil) -> Nil
+    Error(_) -> panic as "expected task process to die with its coordinator"
   }
 }
 

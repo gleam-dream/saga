@@ -51,3 +51,18 @@ pub fn monotonic_time() -> Int
 /// measurements.
 @external(erlang, "saga_ffi", "system_time")
 pub fn system_time() -> Int
+
+/// A boolean flag opaquely keyed (by `Int`, e.g. from `unique_integer`) in
+/// the *calling process's* own process dictionary — purely local state that
+/// never touches a mailbox. Used where a message-based flag (a value sent
+/// to one's own `Subject`, later read) would risk leaving a stray,
+/// never-consumed message behind in a long-lived process — see
+/// `saga/execution`'s "already awaited" tracking.
+@external(erlang, "saga_ffi", "put_flag")
+pub fn put_flag(key: Int) -> Nil
+
+/// Reads a flag set by `put_flag`, leaving it set; `False` if it was never
+/// set. Only meaningful when called by the same process that could have
+/// called `put_flag` with this same `key`.
+@external(erlang, "saga_ffi", "check_flag")
+pub fn check_flag(key: Int) -> Bool
