@@ -165,6 +165,16 @@ pub type DefinitionError {
   InvalidMaxAttempts(step: StepAddress, value: Int)
   InvalidTimeout(step: StepAddress, value: Int)
   ForeignPort(step: StepAddress)
+  /// `all([])` was called: there is no port to combine, so no output could
+  /// ever be produced. Reported instead of panicking, so an empty list
+  /// built at runtime (rather than authored literally) is an ordinary
+  /// definition-time rejection like any other.
+  EmptyAll
+  /// A node was created during the builder (via `perform`/`embed`) but its
+  /// output port was never consumed by anything reaching the workflow's
+  /// final output — the step would silently never run. Named so the
+  /// message can point at exactly which step(s) are unreachable.
+  OrphanStep(step: StepAddress)
 }
 
 /// A static, read-only description of one step: its address, its
@@ -393,14 +403,22 @@ fn map_undo(undo_choice: Undo(u1), f: fn(u1) -> u2) -> Undo(u2) {
 /// Identifies one workflow's evaluation. A `Port` created under one scope
 /// cannot be consumed by `perform`/`map`/`both`/`all` under an unrelated
 /// scope; mixing them is rejected as `ForeignPort` at `define` time. `embed`
-/// passes the parent scope through unchanged, so an inner builder may
-/// legitimately capture outer ports.
+/// passes the parent scope's `id` through unchanged (only extending `path`
+/// for addressing), so an inner builder may legitimately capture outer
+/// ports. `registry` accumulates every node `perform` creates anywhere in
+/// this one evaluation — including ones a builder later discards rather
+/// than threading into its returned port — so `define`/`for_run` can detect
+/// steps unreachable from the final output (see `OrphanStep`).
 type ScopeToken {
-  ScopeToken(id: Int, path: List(String))
+  ScopeToken(
+    id: Int,
+    path: List(String),
+    registry: cell.Registry(#(Int, StepAddress)),
+  )
 }
 
 fn root_scope() -> ScopeToken {
-  ScopeToken(id: ffi.unique_integer(), path: [])
+  ScopeToken(id: ffi.unique_integer(), path: [], registry: cell.new_registry())
 }
 
 // ---------------------------------------------------------------------------
@@ -411,13 +429,31 @@ fn root_scope() -> ScopeToken {
 /// being built: either the workflow's own input, or the output of a
 /// `perform`/`map`/`both`/`all`/`embed`. Two consumers of the same `Port`
 /// value depend on the same node, so that node executes once per run.
+///
+/// `fetch` has three levels, each meant to run in a different place:
+///
+///  1. The outer call happens while the graph is being built (in `perform`,
+///     `both`, `all`, `map`, and `for_run`'s final output read): purely
+///     structural, composing closures, never touching a cell.
+///  2. The middle call happens in the coordinator, once per attempt
+///     (`perform`'s `prepare_attempt`/`prepare_crash_recovery`) or once for
+///     the final output (`for_run`'s `fetch_output`): it performs every
+///     underlying cell read (`cell.read` is a selective receive, which only
+///     the coordinator — the cell's owning process — may perform) and
+///     returns a *pure* thunk with the raw dependency value(s) already
+///     captured.
+///  3. The inner call happens wherever that pure thunk is actually run: for
+///     `perform`, inside the spawned attempt/recovery task, under `rescue`.
+///     This is the only level `map`'s `with` function is ever invoked from,
+///     so a panicking or slow `map` becomes an ordinary attempt
+///     crash/duration instead of reaching the coordinator.
 pub opaque type Port(a, e, u) {
   Port(
     scope: ScopeToken,
     nodes: Dict(Int, Node(e, u)),
     deps: Set(Int),
     errors: List(DefinitionError),
-    fetch: fn() -> fn() -> a,
+    fetch: fn() -> fn() -> fn() -> a,
   )
 }
 
@@ -425,7 +461,7 @@ fn merge_ports(
   scope: ScopeToken,
   first: Port(a, e, u),
   second: Port(b, e, u),
-  fetch: fn() -> fn() -> c,
+  fetch: fn() -> fn() -> fn() -> c,
 ) -> Port(c, e, u) {
   let foreign_errors =
     list.append(
@@ -458,11 +494,17 @@ fn foreign_error_for(
 }
 
 /// Applies a pure transformation to a port's value. `map` is not memoized:
-/// it re-runs in every task that consumes the resulting port.
+/// it re-runs in every task that consumes the resulting port. `with` is
+/// only ever invoked from the innermost (task-level) call of `fetch` — see
+/// `Port`'s doc comment — so a panic or a slow computation inside `with`
+/// never reaches the coordinator.
 pub fn map(port: Port(a, e, u), with: fn(a) -> b) -> Port(b, e, u) {
   Port(..port, fetch: fn() {
-    let read_a = port.fetch()
-    fn() { with(read_a()) }
+    let capture_a = port.fetch()
+    fn() {
+      let produce_a = capture_a()
+      fn() { with(produce_a()) }
+    }
   })
 }
 
@@ -473,22 +515,41 @@ pub fn both(
   second: Port(b, e, u),
 ) -> Port(#(a, b), e, u) {
   merge_ports(first.scope, first, second, fn() {
-    let read_a = first.fetch()
-    let read_b = second.fetch()
-    fn() { #(read_a(), read_b()) }
+    let capture_a = first.fetch()
+    let capture_b = second.fetch()
+    fn() {
+      let produce_a = capture_a()
+      let produce_b = capture_b()
+      fn() { #(produce_a(), produce_b()) }
+    }
   })
 }
 
 /// Combines a list of ports into one port producing their values, in list
-/// order.
+/// order. An empty list has no port to combine and so can never produce a
+/// value; rather than panicking (the list length is ordinary runtime data,
+/// e.g. the result of a `list.map` over a caller-supplied collection), this
+/// is reported as `EmptyAll` alongside any other definition errors, and a
+/// placeholder port is returned so the rest of the builder can keep running
+/// to collect further errors.
 pub fn all(ports: List(Port(a, e, u))) -> Port(List(a), e, u) {
   case ports {
-    [] -> panic as "saga.all requires at least one port"
+    [] -> empty_all_port()
     [first, ..rest] ->
       list.fold(rest, map(first, fn(a) { [a] }), fn(acc, port) {
         both(acc, port) |> map(fn(pair) { list.append(pair.0, [pair.1]) })
       })
   }
+}
+
+fn empty_all_port() -> Port(List(a), e, u) {
+  Port(
+    scope: root_scope(),
+    nodes: dict.new(),
+    deps: set.new(),
+    errors: [EmptyAll],
+    fetch: fn() { fn() { fn() { [] } } },
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +566,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   let address =
     StepAddress(scope: input.scope.path, name: step.name, occurrence: 1)
   let deps = set.to_list(input.deps)
-  let read_input = input.fetch()
+  let capture_input = input.fetch()
 
   let output_cell = cell.new()
 
@@ -531,16 +592,24 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
     }
   }
 
-  // `read_input` is a cell read (a selective receive), which only the
-  // owning process — the coordinator — may perform. `prepare_attempt` and
-  // `prepare_crash_recovery` are themselves called by the coordinator, so
-  // the read happens here, before the returned thunk is handed to a
-  // spawned task; the thunk itself only runs the pure/effectful step body,
-  // never touches a cell.
+  // `prepare_attempt`/`prepare_crash_recovery` are themselves called by the
+  // coordinator, so this is where `capture_input` (the port's fetch,
+  // level 2 — see `Port`'s doc comment) is invoked: every underlying cell
+  // read it performs (a selective receive, which only a cell's owning
+  // process — the coordinator — may perform) happens here, in the
+  // coordinator. Its result, `produce_value`, is the pure level-3 thunk:
+  // for a plain dependency it just returns the already-read value, but for
+  // a `map`med port it also closes over the caller-supplied (potentially
+  // panicking, potentially slow) transformation function. `produce_value`
+  // is therefore only ever invoked from inside the spawned task body below,
+  // under `rescue`, never here — so a panicking or slow `map` becomes an
+  // ordinary attempt crash/duration instead of taking the coordinator down
+  // or blocking its mailbox.
   let prepare_attempt = fn(_node_attempt: node.Attempt) -> fn() ->
     node.AttemptResult(e, u) {
-    let value = read_input()
+    let produce_value = capture_input()
     fn() {
+      let value = produce_value()
       case step.attempt(value) {
         Succeeded(output, undo_choice) ->
           AttemptSucceeded(commit: fn() {
@@ -569,14 +638,18 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
 
   // The coordinator's path for a crash/timeout it observed itself (the task
   // never returned an `AttemptResult` at all, so `AttemptFailed.recover` was
-  // never bound). This calls `decide_crash` directly with the input read for
-  // this attempt — `read_input` is a cell read, not a re-run of the step's
-  // effect, so nothing is repeated.
+  // never bound). This calls `decide_crash` directly with the input value
+  // for this attempt — not a re-run of the step's effect, so nothing is
+  // repeated. As with `prepare_attempt` above, `capture_input()` (every
+  // underlying cell read) runs here, in the coordinator, while the
+  // resulting `produce_value` thunk is only invoked inside the returned
+  // inner thunk (run inside the recovery task, under `rescue`), so a
+  // panicking or slow upstream `map` cannot crash or block the coordinator.
   let prepare_crash_recovery =
     option.map(step.decide_crash, fn(decide_fn) {
       fn(node_failure: node.AttemptFailure(e), node_attempt: node.Attempt) -> fn() ->
         ErasedRecovery(e, u) {
-        let value = read_input()
+        let produce_value = capture_input()
         let crash_or_timeout = case node_failure {
           node.Crashed(crash) -> StepCrashed(crash_from_node(crash))
           node.TimedOut -> StepTimedOut
@@ -584,7 +657,13 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             panic as "saga: prepare_crash_recovery received a Returned failure"
         }
         let attempt = attempt_from_node(node_attempt)
-        fn() { to_erased_recovery(decide_fn(value, crash_or_timeout, attempt)) }
+        fn() {
+          to_erased_recovery(decide_fn(
+            produce_value(),
+            crash_or_timeout,
+            attempt,
+          ))
+        }
       }
     })
 
@@ -600,6 +679,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       prepare_attempt: prepare_attempt,
       prepare_crash_recovery: prepare_crash_recovery,
     )
+  cell.register(input.scope.registry, #(id, address))
 
   let name_error = case step.name {
     "" -> [EmptyStepName(scope: input.scope.path)]
@@ -625,7 +705,12 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       attempts_error,
       timeout_error,
     ]),
-    fetch: fn() { fn() { cell.read(output_cell) } },
+    fetch: fn() {
+      fn() {
+        let value = cell.read(output_cell)
+        fn() { value }
+      }
+    },
   )
 }
 
@@ -673,7 +758,14 @@ pub fn define(
     _ -> []
   }
   let root_scope_errors = foreign_error_for(scope, output)
-  let all_errors = list.flatten([name_errors, output.errors, root_scope_errors])
+  let orphan_errors = orphan_errors_for(scope, output)
+  // `scope.registry` was only ever needed for `orphan_errors_for`'s check,
+  // just above; retiring it now keeps this (typically long-lived) calling
+  // process's mailbox from accumulating one stray message per `define`
+  // call. See `cell.close`.
+  cell.close(scope.registry)
+  let all_errors =
+    list.flatten([name_errors, output.errors, root_scope_errors, orphan_errors])
 
   case all_errors {
     [] ->
@@ -686,6 +778,36 @@ pub fn define(
   }
 }
 
+/// Every node `perform` created anywhere during this scope's one evaluation
+/// (via `scope.registry`) whose id never made it into `output.nodes` — the
+/// dependency closure actually reachable from the workflow's own output.
+/// Such a node was authored (its `Port` value exists, and may even have
+/// been bound to a local variable and read) but never threaded, directly or
+/// indirectly, into what the builder returned, so it would silently never
+/// run. Reported once per orphaned node, not deduplicated by address, so
+/// two independently-orphaned occurrences of the same step name are both
+/// named.
+fn orphan_errors_for(
+  scope: ScopeToken,
+  output: Port(a, e, u),
+) -> List(DefinitionError) {
+  case scope.id == output.scope.id {
+    // A foreign-scoped output already reports `ForeignPort`; this scope's
+    // own registry cannot be meaningfully diffed against a foreign node
+    // table, so orphan detection is skipped rather than double-reporting.
+    False -> []
+    True ->
+      cell.all_registered(scope.registry)
+      |> list.filter_map(fn(entry) {
+        let #(id, address) = entry
+        case dict.has_key(output.nodes, id) {
+          True -> Error(Nil)
+          False -> Ok(OrphanStep(address))
+        }
+      })
+  }
+}
+
 fn fresh_root_port(scope: ScopeToken) -> Port(i, e, u) {
   let input_cell = cell.new()
   Port(
@@ -693,7 +815,12 @@ fn fresh_root_port(scope: ScopeToken) -> Port(i, e, u) {
     nodes: dict.new(),
     deps: set.new(),
     errors: [],
-    fetch: fn() { fn() { cell.read(input_cell) } },
+    fetch: fn() {
+      fn() {
+        let value = cell.read(input_cell)
+        fn() { value }
+      }
+    },
   )
 }
 
@@ -789,7 +916,12 @@ pub fn for_run(
       nodes: dict.new(),
       deps: set.new(),
       errors: [],
-      fetch: fn() { fn() { cell.read(input_cell) } },
+      fetch: fn() {
+        fn() {
+          let value = cell.read(input_cell)
+          fn() { value }
+        }
+      },
     )
   let output = workflow.build(root_input)
   let #(ordered_ids, nodes) = resolved_nodes(output.nodes)
@@ -797,8 +929,19 @@ pub fn for_run(
   case live_descriptors == workflow.descriptors {
     False -> Error(Nil)
     True -> {
-      let fetch = output.fetch()
-      Ok(#(nodes, ordered_ids, fn() { ffi.rescue(fetch) }))
+      // Called only from the coordinator's own loop, never from a task —
+      // there is no further step to hand a final `map` off to — so both
+      // the cell reads (level 2) and any pending pure transform (level 3)
+      // are rescued together here.
+      let capture_output = output.fetch()
+      Ok(
+        #(nodes, ordered_ids, fn() {
+          ffi.rescue(fn() {
+            let produce_output = capture_output()
+            produce_output()
+          })
+        }),
+      )
     }
   }
 }
@@ -815,13 +958,32 @@ pub fn describe(workflow: Workflow(i, o, e, u)) -> List(StepDescriptor) {
 
 /// Sequentially composes `workflow` into the port graph being built for
 /// another workflow, sharing the same run and journal (not an independent
-/// child). The parent's scope flows through unchanged via `input`, so an
-/// inner builder may legitimately capture outer ports.
+/// child). `input`'s scope *id* flows through unchanged, so an inner
+/// builder may legitimately capture outer ports (and the parent's own
+/// `define` still validates against a single scope id) — but every node the
+/// inner builder creates is addressed under a nested scope path, extended
+/// with `workflow`'s name, so repeated `embed` calls of the same workflow
+/// (or a name that collides with an outer step) do not collide in
+/// `saga.describe`/`saga.address_to_string` or in Sinal step names. See the
+/// `StepAddress` doc comment.
 pub fn embed(
   input: Port(i, e, u),
   workflow: Workflow(i, o, e, u),
 ) -> Port(o, e, u) {
-  workflow.build(input)
+  let scoped_input =
+    Port(
+      ..input,
+      scope: ScopeToken(
+        id: input.scope.id,
+        path: list.append(input.scope.path, [workflow.name]),
+        registry: input.scope.registry,
+      ),
+    )
+  let output = workflow.build(scoped_input)
+  // Restore the parent's own scope (path) on the output port, so a sibling
+  // `perform`/`embed` chained after this one addresses its own steps at the
+  // parent's path, not nested under this embed's.
+  Port(..output, scope: input.scope)
 }
 
 /// Adapts a whole workflow's error and undo-error types.
@@ -851,18 +1013,24 @@ pub fn map_errors(
   )
 }
 
-/// Rebuilds a fresh port carrying the same scope and fetch behaviour as
-/// `input` but with an empty node dictionary retyped for the original
-/// (e1, u1) vocabulary. This is sound because a `Port`'s only field that
-/// mentions `e`/`u` is its node dictionary, and it starts empty here; every
-/// node the shadow builder subsequently creates is later converted back
-/// through `node.map_errors`, never read under the wrong type.
+/// Rebuilds a fresh port carrying the same scope, dependencies, errors, and
+/// fetch behaviour as `input`, but with an empty node dictionary retyped for
+/// the original (e1, u1) vocabulary. This is sound because a `Port`'s only
+/// field that mentions `e`/`u` is its node dictionary, and it starts empty
+/// here; every node the shadow builder subsequently creates is later
+/// converted back through `node.map_errors`, never read under the wrong
+/// type. `deps` and `errors` must be carried over unchanged (not reset):
+/// dropping `deps` would make every step performed on this shadow input
+/// believe it has no dependencies at all, admitting before its real
+/// upstream node finishes and deadlocking on that node's still-unwritten
+/// cell; dropping `errors` would silently discard definition errors
+/// collected before this `embed`/`map_errors` boundary.
 fn retype_empty_port(input: Port(i, e2, u2)) -> Port(i, e1, u1) {
   Port(
     scope: input.scope,
     nodes: dict.new(),
-    deps: set.new(),
-    errors: [],
+    deps: input.deps,
+    errors: input.errors,
     fetch: input.fetch,
   )
 }

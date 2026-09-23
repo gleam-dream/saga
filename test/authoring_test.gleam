@@ -196,8 +196,35 @@ pub fn embedded_workflow_scopes_addresses_test() {
   list.length(descriptors) |> should.equal(2)
   let assert [inner, outer] = descriptors
   inner.address.name |> should.equal("inner_step")
+  inner.address.scope |> should.equal(["inner"])
+  saga.address_to_string(inner.address) |> should.equal("inner/inner_step")
   outer.address.name |> should.equal("outer_step")
+  outer.address.scope |> should.equal([])
+  saga.address_to_string(outer.address) |> should.equal("outer_step")
   outer.depends_on |> should.equal([inner.address])
+}
+
+/// Embedding the same workflow twice addresses each occurrence's steps
+/// under the same nested scope path, disambiguated by occurrence — not
+/// merged into one node and not collapsed into the parent's own scope.
+pub fn repeated_embed_scopes_and_disambiguates_test() {
+  let assert Ok(workflow) =
+    saga.define("outer", fn(input) {
+      let a = input |> saga.embed(inner_workflow())
+      let b = a |> saga.embed(inner_workflow())
+      b |> saga.perform(saga.step("inner_step", fn(x: Int) { Ok(x) }))
+    })
+
+  let descriptors = saga.describe(workflow)
+  list.length(descriptors) |> should.equal(3)
+  let assert [first, second, outer] = descriptors
+  first.address.scope |> should.equal(["inner"])
+  second.address.scope |> should.equal(["inner"])
+  outer.address.scope |> should.equal([])
+  saga.address_to_string(first.address) |> should.equal("inner/inner_step")
+  saga.address_to_string(second.address)
+  |> should.equal("inner/inner_step#2")
+  saga.address_to_string(outer.address) |> should.equal("inner_step")
 }
 
 pub fn shared_dependency_creates_one_node_test() {
