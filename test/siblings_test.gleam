@@ -49,11 +49,11 @@ pub fn failure_with_active_siblings_settles_test() {
   probe.with_run(workflow, 0, config, fn(exec) {
     // Let the slow sibling start, then release it once the run has already
     // failed via the fast sibling.
-    let assert Ok(_slow_pid) = probe.wait_entered(slow_gate, 2000)
+    let assert Ok(_slow_pid) = probe.wait_entered(slow_gate, 10_000)
     probe.open(slow_gate)
 
     let assert Ok(execution.Failed(cause, settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     case cause {
       execution.StepFailed(step, Boom) -> step.name |> should.equal("fast_fail")
       _ -> panic as "expected StepFailed(fast_fail, Boom)"

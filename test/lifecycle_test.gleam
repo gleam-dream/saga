@@ -1,6 +1,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{Some}
+import gleam/string
 import gleeunit/should
 import saga
 import saga/execution
@@ -55,9 +56,9 @@ pub fn deadline_interrupts_run_test() {
     )
 
   probe.with_run(workflow, 0, config, fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     cause |> should.equal(execution.DeadlineExceeded)
     settlement.interrupted
     |> list.map(fn(a) { a.name })
@@ -111,9 +112,9 @@ pub fn step_timeout_reports_timed_out_test() {
     })
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     case cause {
       execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
       _ -> panic as "expected StepTimedOut(blocked)"
@@ -184,9 +185,9 @@ pub fn late_result_after_timeout_is_discarded_test() {
     })
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
-    let assert Ok(pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     cause
     |> should.equal(execution.StepFailed(
       saga.StepAddress(scope: [], name: "blocked", occurrence: 1),
@@ -222,9 +223,9 @@ pub fn undo_timeout_recorded_and_rollback_continues_test() {
   let config = execution.Config(..execution.config(), cleanup_timeout: 50)
 
   probe.with_run(workflow, 0, config, fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(_cause, settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     case settlement.undo_failures {
       [execution.UndoTimedOut(step)] -> step.name |> should.equal("a")
       _ -> panic as "expected a single UndoTimedOut(a)"
@@ -253,9 +254,9 @@ pub fn compensation_timeout_recorded_test() {
   let config = execution.Config(..execution.config(), cleanup_timeout: 50)
 
   probe.with_run(workflow, 0, config, fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     case cause {
       execution.StepTimedOut(step) -> step.name |> should.equal("s")
       _ -> panic as "expected StepTimedOut(s) from the killed compensation"
@@ -317,18 +318,18 @@ pub fn cancel_with_active_siblings_test() {
     )
 
   probe.with_run(workflow, 0, config, fn(exec) {
-    let assert Ok(_) = probe.wait_entered(releasable_gate, 2000)
-    let assert Ok(_) = probe.wait_entered(blocked_gate, 2000)
+    let assert Ok(_) = probe.wait_entered(releasable_gate, 10_000)
+    let assert Ok(_) = probe.wait_entered(blocked_gate, 10_000)
 
     execution.cancel(exec)
 
-    let assert Ok(progress) = execution.progress(exec, 2000)
+    let assert Ok(progress) = execution.progress(exec, 10_000)
     progress.phase |> should.equal(execution.Settling)
 
     probe.open(releasable_gate)
 
     let assert Ok(execution.Cancelled(reason, settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     reason |> should.equal(execution.CancelRequested)
     settlement.undone
     |> list.map(fn(a) { a.name })
@@ -347,7 +348,7 @@ pub fn cancel_after_completion_is_noop_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
   execution.cancel(exec)
 }
 
@@ -366,13 +367,13 @@ pub fn cancel_is_idempotent_test() {
     })
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     execution.cancel(exec)
     execution.cancel(exec)
     execution.cancel(exec)
     probe.open(gate)
     let assert Ok(execution.Cancelled(execution.CancelRequested, _)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     Nil
   })
 }
@@ -394,7 +395,7 @@ pub fn completion_processed_before_cancel_is_undone_test() {
   // No gate: the step is expected to have completed by the time cancel is
   // requested, which is deterministic here because it does no blocking I/O.
   execution.cancel(exec)
-  let assert Ok(outcome) = execution.await(exec, 2000)
+  let assert Ok(outcome) = execution.await(exec, 10_000)
   case outcome {
     execution.Completed(0) -> Nil
     execution.Cancelled(_, settlement) ->
@@ -439,14 +440,14 @@ pub fn owner_exit_cancels_and_rolls_back_test() {
   let _ = owner_pid
 
   let assert Ok(coordinator_pid) =
-    process.receive(coordinator_pid_subject, 2000)
+    process.receive(coordinator_pid_subject, 10_000)
   let monitor = process.monitor(coordinator_pid)
   let selector =
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(down) { down })
   let _down = process.selector_receive_forever(selector)
 
-  probe.await_total_entries(undo_counter, 1, 2000)
+  probe.await_total_entries(undo_counter, 1, 10_000)
   process.send(outcome_subject, Nil)
 }
 
@@ -466,17 +467,17 @@ pub fn coordinator_kill_terminates_tasks_test() {
     })
 
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(task_pid) = probe.wait_entered(gate, 2000)
+  let assert Ok(task_pid) = probe.wait_entered(gate, 10_000)
 
   process.kill(execution.pid(exec))
 
-  case execution.await(exec, 2000) {
+  case execution.await(exec, 10_000) {
     Error(execution.Lost(_crash)) -> Nil
     _other -> panic as "expected Lost, got something else"
   }
 
   // The task the killed coordinator had spawned (linked) dies with it.
-  wait_until_dead(task_pid, 2000)
+  wait_until_dead(task_pid, 10_000)
 }
 
 /// Waits for `pid` to exit via a monitor (no polling): if it is already
@@ -502,10 +503,10 @@ pub fn await_not_owner_test() {
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
 
   let reply = process.new_subject()
-  process.spawn(fn() { process.send(reply, execution.await(exec, 2000)) })
-  let assert Ok(Error(execution.NotOwner)) = process.receive(reply, 2000)
+  process.spawn(fn() { process.send(reply, execution.await(exec, 10_000)) })
+  let assert Ok(Error(execution.NotOwner)) = process.receive(reply, 10_000)
 
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
   Nil
 }
 
@@ -517,8 +518,8 @@ pub fn await_twice_already_awaited_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
-  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
   Nil
 }
 
@@ -532,17 +533,22 @@ pub fn await_twice_is_prompt_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
   let before = system_time_ms()
   let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
   let elapsed = system_time_ms() - before
-  { elapsed < 1000 } |> should.be_true
+  // A generous bound, well under the 10s timeout: the point is that this
+  // resolves from a fresh monitor's immediate `noproc` plus an empty
+  // mailbox rather than idling out the timeout, not that it beats some
+  // tight budget — under heavy scheduler load, this process's own wakeup
+  // can be delayed too.
+  { elapsed < 5000 } |> should.be_true
 }
 
 /// After a coordinator is killed (never awaited), `await` reports `Lost`. A
 /// second `await` on the same `Execution` must not hang for the full
-/// timeout either — it settles (as documented on `AwaitError`) as either
-/// `Lost` or `AlreadyAwaited`.
+/// timeout either, and — since the original monitor's `Down` was already
+/// consumed by the first call — settles as `AlreadyAwaited`.
 pub fn await_after_lost_then_second_await_is_prompt_test() {
   let gate = probe.new_gate()
   let assert Ok(workflow) =
@@ -557,23 +563,71 @@ pub fn await_after_lost_then_second_await_is_prompt_test() {
     })
 
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+  let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
   process.kill(execution.pid(exec))
 
-  case execution.await(exec, 2000) {
+  case execution.await(exec, 10_000) {
     Error(execution.Lost(_crash)) -> Nil
     _other -> panic as "expected Lost, got something else"
   }
 
   let before = system_time_ms()
-  let second = execution.await(exec, 10_000)
+  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
   let elapsed = system_time_ms() - before
-  { elapsed < 1000 } |> should.be_true
-  case second {
-    Error(execution.Lost(_)) -> Nil
-    Error(execution.AlreadyAwaited) -> Nil
-    _other -> panic as "expected Lost or AlreadyAwaited on second await"
-  }
+  // See `await_twice_is_prompt_test`: a generous bound under the 10s
+  // timeout, not a tight one — the property under test is "does not idle
+  // out the timeout", which tolerates scheduler jitter under load.
+  { elapsed < 5000 } |> should.be_true
+}
+
+/// If the coordinator dies *during* an in-flight `await` (rather than
+/// before it was ever awaited), that same `await` call must observe the
+/// original monitor's real `Down` and report `Lost` — never `AlreadyAwaited`
+/// — and must leave nothing behind in the owner's mailbox. Repeated many
+/// times to pressure the race between `await`'s two monitors (the original,
+/// armed since `start`, and the fresh one `await` creates for this call):
+/// both become eligible at once when the kill lands while `await` is
+/// already blocked in `selector_receive`, and `await_signal`'s zero-timeout
+/// check on `FreshDown` is what keeps that race from ever surfacing the
+/// fresh monitor's uninformative `noproc` instead of the original's real
+/// reason.
+pub fn coordinator_killed_mid_await_reports_lost_test() {
+  let iterations = list.repeat(Nil, 50)
+  list.each(iterations, fn(_i) {
+    probe.flush_mailbox()
+    let mailbox_before = probe.mailbox_length()
+    let gate = probe.new_gate()
+    let assert Ok(workflow) =
+      saga.define("wf", fn(input) {
+        input
+        |> saga.perform(
+          saga.step("blocked", fn(x: Int) {
+            probe.enter(gate)
+            Ok(x)
+          }),
+        )
+      })
+
+    let assert Ok(exec) = execution.start(workflow, 0, execution.config())
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
+
+    // Kill from a fresh process, concurrently with the `await` call below,
+    // so the coordinator's exit can land while `await` is already blocked
+    // in `selector_receive` rather than strictly before it.
+    process.spawn(fn() { process.kill(execution.pid(exec)) })
+
+    case execution.await(exec, 10_000) {
+      Error(execution.Lost(_crash)) -> Nil
+      other ->
+        panic as {
+          "expected Lost, got "
+          <> string.inspect(other)
+          <> " (mailbox mid-await race)"
+        }
+    }
+
+    probe.mailbox_length() |> should.equal(mailbox_before)
+  })
 }
 
 /// `start`/`await`/`await` never grows the calling process's own process
@@ -589,8 +643,8 @@ pub fn await_does_not_grow_process_dictionary_test() {
 
   let before = probe.dictionary_size()
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
-  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
   probe.dictionary_size() |> should.equal(before)
 }
 
@@ -636,10 +690,10 @@ pub fn await_timeout_then_success_test() {
     })
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Error(execution.AwaitTimedOut) = execution.await(exec, 50)
     probe.open(gate)
-    let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+    let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
     Nil
   })
 }

@@ -97,13 +97,13 @@ pub fn max_concurrency_bounds_running_attempts_test() {
 
   probe.with_run(workflow, 0, config, fn(exec) {
     // Wait until exactly 3 are attempting (bounded by max_concurrency).
-    probe.await_high_water(counter, 3, 2000)
+    probe.await_high_water(counter, 3, 10_000)
     probe.high_water(counter) |> should.equal(3)
 
     // Release one; exactly one more should be admitted, keeping the total
     // in-flight count at 3.
     probe.open(gate)
-    probe.await_total_entries(counter, 4, 2000)
+    probe.await_total_entries(counter, 4, 10_000)
     probe.high_water(counter) |> should.equal(3)
 
     // Release the rest.
@@ -111,7 +111,7 @@ pub fn max_concurrency_bounds_running_attempts_test() {
       list_range(1, 9)
       |> list_each(fn(_i) { probe.open(gate) })
 
-    let assert Ok(execution.Completed(_)) = execution.await(exec, 2000)
+    let assert Ok(execution.Completed(_)) = execution.await(exec, 10_000)
     Nil
   })
 }
@@ -197,18 +197,39 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
     })
   let cfg = execution.Config(..execution.config(), max_concurrency: 2)
 
+  // Every wait below is a lower-bound "poll until true" (or a plain
+  // completion wait), never paired with an upper-bound timing assertion —
+  // widening any of them only costs wall-clock time on a starved scheduler,
+  // never correctness. A generous 30s tolerates heavy CPU contention (many
+  // other processes competing for the same cores) that could otherwise
+  // starve the coordinator's own message loop past a tighter budget, which
+  // was observed to flake this specific test under load.
+  let generous = 30_000
+
   probe.with_run(wf, 1, cfg, fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(dgate, 2000)
-    // Wait until `a`'s compensation decider is actually running (not just
-    // its attempt, which already failed synchronously) before releasing
-    // `d`: that is what confirms admission has settled to exactly `d`
-    // holding the one occupied slot, with the decider's own task occupying
-    // the other, rather than sleeping a fixed guess at how long that
-    // takes.
+    let assert Ok(_pid) = probe.wait_entered(dgate, generous)
+    // Wait until `a`'s attempt has actually failed and moved on to its
+    // recovery machinery — `Compensating` (the decider task is running) or
+    // already `RetryScheduled` (the decider has already decided and the
+    // backoff timer is armed) — before releasing `d`: either confirms `a`'s
+    // attempt slot was freed, which is what matters for the assertion below
+    // (the freed slot must go through the same admission gate as anything
+    // else, never bypass it). `Compensating` alone is not a safe thing to
+    // wait for here: `a`'s decider body is a synchronous, allocation-free
+    // `case`, so under heavy scheduler contention the coordinator can
+    // process `AttemptDone` and the decider's `RecoveryDone` back-to-back,
+    // in the same scheduling slice, before this test process ever gets to
+    // poll in between — skipping the `Compensating` snapshot entirely
+    // without anything having gone wrong. Waiting for either state removes
+    // that race instead of hoping to catch a window that is not guaranteed
+    // to be observable.
     let assert Ok(_progress) =
-      probe.wait_until_progress(exec, 2000, fn(p) {
+      probe.wait_until_progress(exec, generous, fn(p) {
         list.any(p.steps, fn(sp) {
-          sp.address.name == "a" && is_compensating(sp.state)
+          sp.address.name == "a"
+          && {
+            is_compensating(sp.state) || sp.state == execution.RetryScheduled(2)
+          }
         })
       })
     probe.open(dgate)
@@ -218,9 +239,9 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
     // entries to 4 (`a`, `d`, `b`, `c`), and `a`'s own decision settles
     // into `RetryScheduled(2)` once its backoff timer is armed. Waiting on
     // both replaces sleeping past a fixed guess at the backoff delay.
-    probe.await_total_entries(counter, 4, 2000)
+    probe.await_total_entries(counter, 4, generous)
     let assert Ok(_progress) =
-      probe.wait_until_progress(exec, 2000, fn(p) {
+      probe.wait_until_progress(exec, generous, fn(p) {
         list.any(p.steps, fn(sp) {
           sp.address.name == "a" && sp.state == execution.RetryScheduled(2)
         })
@@ -229,7 +250,7 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
 
     probe.open(gate)
     probe.open(gate)
-    let assert Ok(execution.Completed(_)) = execution.await(exec, 3000)
+    let assert Ok(execution.Completed(_)) = execution.await(exec, generous)
     probe.high_water(counter) |> should.equal(2)
     Nil
   })

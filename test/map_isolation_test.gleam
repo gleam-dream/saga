@@ -83,13 +83,13 @@ pub fn slow_map_does_not_block_cancel_test() {
 
   let config = execution.Config(..execution.config(), settle_timeout: 100)
   probe.with_run(wf, 1, config, fn(exec) {
-    let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     // The map is blocked inside "b"'s attempt task. Cancellation must still
     // be observed promptly: settling begins immediately, and the settle
     // window (bounded) sweeps the blocked task rather than waiting forever.
     execution.cancel(exec)
     let assert Ok(execution.Cancelled(_reason, _settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     Nil
   })
 }

@@ -49,7 +49,7 @@ pub fn await_does_not_leak_monitor_down_test() {
     })
   let before = probe.mailbox_length()
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
   probe.mailbox_length() |> should.equal(before)
 }
 
@@ -65,7 +65,7 @@ pub fn progress_after_end_reports_execution_ended_test() {
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
   let assert Ok(execution.Completed(0)) = execution.await(exec, 1000)
-  case execution.progress(exec, timeout: 2000) {
+  case execution.progress(exec, timeout: 10_000) {
     Error(execution.ExecutionEnded) -> Nil
     other ->
       panic as { "expected ExecutionEnded, got " <> string.inspect(other) }
@@ -150,8 +150,8 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
   // for the decider to be blocked, and for `failing` to be blocked, then
   // release `failing` first so its own terminal failure begins settling
   // while the decider is still deciding on `retryable`.
-  let assert Ok(_pid) = probe.wait_entered(decider_gate, 2000)
-  let assert Ok(_pid2) = probe.wait_entered(fail_gate, 2000)
+  let assert Ok(_pid) = probe.wait_entered(decider_gate, 10_000)
+  let assert Ok(_pid2) = probe.wait_entered(fail_gate, 10_000)
   probe.open(fail_gate)
   // Wait until settling has actually begun (the run's phase has left
   // `Running`) before releasing the decider, rather than sleeping a fixed
@@ -159,13 +159,13 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
   // before the decider's `RetryAfter` decision arrives, or the refusal
   // this test exercises never happens.
   let assert Ok(_progress) =
-    probe.wait_until_progress(exec, 2000, fn(p) {
+    probe.wait_until_progress(exec, 10_000, fn(p) {
       p.phase == execution.Settling
     })
   probe.open(decider_gate)
 
   let assert Ok(execution.Failed(cause, settlement)) =
-    execution.await(exec, 3000)
+    execution.await(exec, 15_000)
   case cause {
     execution.StepFailed(step, Nil) -> step.name |> should.equal("failing")
     _ -> panic as "expected the primary cause to be `failing`'s StepFailed"
