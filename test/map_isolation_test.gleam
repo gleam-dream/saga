@@ -1,7 +1,6 @@
 /// Regression tests for independent-review findings on `saga.map`,
-/// `saga.embed`/`saga.map_errors`, `saga.all([])`, and orphan step
-/// rejection — ported from the reviewer's repro suite (REPRO1, REPRO2,
-/// REPRO7, REPRO8).
+/// `saga.embed`/`saga.map_errors`, `saga.all`, and orphan step rejection —
+/// ported from the reviewer's repro suite (REPRO1, REPRO2, REPRO7, REPRO8).
 import gleam/erlang/process
 import gleam/list
 import gleeunit/should
@@ -241,30 +240,16 @@ pub fn non_orphaned_shared_dependency_is_not_rejected_test() {
 }
 
 // ---------------------------------------------------------------------------
-// Finding 12: `saga.all([])` must not panic.
+// Finding 12: `saga.all` takes a required first port, so there is no empty
+// case to construct or reject at all — the type system rules it out at the
+// call site (see `saga.all`'s doc comment).
 // ---------------------------------------------------------------------------
 
-pub fn all_empty_rejected_without_panic_test() {
-  let result =
-    saga.define("empty_all", fn(_input) {
-      // Constructing `saga.all([])` must not panic, and its result must
-      // reach the final output for `EmptyAll` to surface at `define` (an
-      // error on a discarded port would instead be reported `OrphanStep`,
-      // which the empty case cannot even produce — see `empty_all_port`).
-      saga.all([]) |> saga.map(fn(_: List(Int)) { Nil })
-    })
-
-  case result {
-    Error(errors) -> list.contains(errors, saga.EmptyAll) |> should.be_true
-    Ok(_) -> panic as "expected definition to fail with EmptyAll"
-  }
-}
-
-pub fn all_non_empty_runs_normally_test() {
+pub fn all_single_port_runs_normally_test() {
   let assert Ok(workflow) =
     saga.define("wf", fn(input) {
       let a = input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))
-      saga.all([a])
+      saga.all(a, [])
     })
   let assert Ok(execution.Completed([2])) =
     execution.run(workflow, 1, execution.config())
