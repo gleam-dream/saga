@@ -1,6 +1,13 @@
 -module(probe_ffi).
 
--export([ensure/2, mailbox_length/0, flush_mailbox/0, native_throw/0]).
+-export([
+    ensure/2,
+    mailbox_length/0,
+    flush_mailbox/0,
+    native_throw/0,
+    dictionary_size/0,
+    monotonic_time_ms/0
+]).
 
 %% Runs `Body`, always running `After` afterwards — even if `Body` raises —
 %% then re-raises the original exception (if any). Used by `with_run` so a
@@ -32,3 +39,14 @@ flush_mailbox() ->
 %% reported with `ThrowClass`, not folded into `ErrorClass`.
 native_throw() ->
     throw(native_throw_boom).
+
+%% The number of entries in the calling process's own process dictionary,
+%% for asserting that `execution.start`/`await`/`run` never grow it (see the
+%% removed process-dictionary "already awaited" flag).
+dictionary_size() ->
+    length(erlang:get()).
+
+%% Native monotonic time in milliseconds, for bounding a poll loop's total
+%% wait time without relying on wall-clock time.
+monotonic_time_ms() ->
+    erlang:monotonic_time(millisecond).

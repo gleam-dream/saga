@@ -4,6 +4,7 @@ import gleam/option.{Some}
 import gleeunit/should
 import saga
 import saga/execution
+import saga/internal/ffi
 import support/probe
 
 pub type DemoError {
@@ -303,7 +304,17 @@ pub fn cancel_with_active_siblings_test() {
       saga.both(releasable, blocked)
     })
 
-  let config = execution.Config(..execution.config(), settle_timeout: 100)
+  // Both siblings must be able to attempt concurrently for this test to
+  // exercise "cancel while one is still active" at all — `max_concurrency`
+  // is set explicitly here (rather than relying on `config()`'s
+  // scheduler-count default) so the test passes under a single-scheduler
+  // `+S 1:1` run too.
+  let config =
+    execution.Config(
+      ..execution.config(),
+      settle_timeout: 100,
+      max_concurrency: 2,
+    )
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_) = probe.wait_entered(releasable_gate, 2000)
@@ -509,6 +520,104 @@ pub fn await_twice_already_awaited_test() {
   let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
   let assert Error(execution.AlreadyAwaited) = execution.await(exec, 2000)
   Nil
+}
+
+/// A second `await` reports `AlreadyAwaited` promptly — it must not wait
+/// out the full timeout, since there is no process-dictionary flag left to
+/// short-circuit it: it is derived entirely from a fresh monitor's
+/// immediate `noproc` plus an empty mailbox.
+pub fn await_twice_is_prompt_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+    })
+  let assert Ok(exec) = execution.start(workflow, 0, execution.config())
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+  let before = system_time_ms()
+  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
+  let elapsed = system_time_ms() - before
+  { elapsed < 1000 } |> should.be_true
+}
+
+/// After a coordinator is killed (never awaited), `await` reports `Lost`. A
+/// second `await` on the same `Execution` must not hang for the full
+/// timeout either — it settles (as documented on `AwaitError`) as either
+/// `Lost` or `AlreadyAwaited`.
+pub fn await_after_lost_then_second_await_is_prompt_test() {
+  let gate = probe.new_gate()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("blocked", fn(x: Int) {
+          probe.enter(gate)
+          Ok(x)
+        }),
+      )
+    })
+
+  let assert Ok(exec) = execution.start(workflow, 0, execution.config())
+  let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+  process.kill(execution.pid(exec))
+
+  case execution.await(exec, 2000) {
+    Error(execution.Lost(_crash)) -> Nil
+    _other -> panic as "expected Lost, got something else"
+  }
+
+  let before = system_time_ms()
+  let second = execution.await(exec, 10_000)
+  let elapsed = system_time_ms() - before
+  { elapsed < 1000 } |> should.be_true
+  case second {
+    Error(execution.Lost(_)) -> Nil
+    Error(execution.AlreadyAwaited) -> Nil
+    _other -> panic as "expected Lost or AlreadyAwaited on second await"
+  }
+}
+
+/// `start`/`await`/`await` never grows the calling process's own process
+/// dictionary — the "already awaited" tracking is derived statelessly from
+/// a fresh monitor plus a zero-timeout mailbox check, not from a
+/// process-dictionary flag that would otherwise accumulate one entry per
+/// `Execution`.
+pub fn await_does_not_grow_process_dictionary_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+    })
+
+  let before = probe.dictionary_size()
+  let assert Ok(exec) = execution.start(workflow, 0, execution.config())
+  let assert Ok(execution.Completed(0)) = execution.await(exec, 2000)
+  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 2000)
+  probe.dictionary_size() |> should.equal(before)
+}
+
+/// Repeated `run`s (start+await-to-completion in one call) never grow the
+/// calling process's own process dictionary, nor leave anything behind in
+/// its mailbox.
+pub fn run_does_not_grow_process_dictionary_or_mailbox_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+    })
+
+  probe.flush_mailbox()
+  let dict_before = probe.dictionary_size()
+  let mailbox_before = probe.mailbox_length()
+  let assert Ok(execution.Completed(0)) =
+    execution.run(workflow, 0, execution.config())
+  let assert Ok(execution.Completed(0)) =
+    execution.run(workflow, 0, execution.config())
+  let assert Ok(execution.Completed(0)) =
+    execution.run(workflow, 0, execution.config())
+  probe.dictionary_size() |> should.equal(dict_before)
+  probe.mailbox_length() |> should.equal(mailbox_before)
+}
+
+fn system_time_ms() -> Int {
+  ffi.monotonic_time()
 }
 
 /// `await` may time out and be called again while the run continues, then

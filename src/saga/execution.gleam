@@ -24,7 +24,6 @@ import gleam/option.{type Option, None, Some}
 import gleam/string
 import saga.{type Workflow}
 import saga/internal/coordinator
-import saga/internal/ffi
 
 /// Bounds and pacing for one run.
 pub type Config {
@@ -226,6 +225,16 @@ pub type ProgressError {
 }
 
 /// Why `await` did not return an `Outcome`.
+///
+/// `AlreadyAwaited` is reported both for the ordinary case (a previous
+/// `await` on this `Execution` already consumed its outcome) and, by
+/// design, for a second `await` after a previous one already reported
+/// `Lost`: telling those two apart would require keeping state across
+/// calls (see `Execution`'s doc comment for why `await` deliberately keeps
+/// none), and both leave nothing further to observe — the coordinator is
+/// gone either way and no fresh `Down` will ever arrive again. A caller
+/// that needs to distinguish them should keep the first `await`'s own
+/// result instead of relying on a second call.
 pub type AwaitError {
   AwaitTimedOut
   NotOwner
@@ -235,22 +244,31 @@ pub type AwaitError {
 
 /// A started run. Only the process that called `start` may `await` it.
 ///
-/// `await`'s monitor on the coordinator is what makes `Lost` observable: if
-/// the coordinator is killed before it can send an outcome, the monitor's
-/// `Down` is the only signal that will ever arrive. Once an outcome *has*
-/// been consumed, though, the monitor has served its purpose and is
-/// demonitored (with `[flush]`, via `process.demonitor_process`) right
-/// away — otherwise its `Down` message for the coordinator's (now
-/// imminent, always-normal) exit would sit in the owner's mailbox forever,
-/// since nothing else ever consumes it. `already_awaited_key` identifies a
-/// boolean flag in the owner's own process dictionary (see
-/// `saga/internal/ffi.put_flag`/`check_flag`) — deliberately *not* a
-/// `Subject`-based marker, which would have the same mailbox-leak problem
-/// as the monitor itself whenever the flag is set but never subsequently
-/// checked (an `Execution` that is awaited once and then simply dropped,
-/// the common case) — so a second `await` can report `AlreadyAwaited`
-/// without needing the monitor to still be armed, and without leaving
-/// anything behind in the owner's mailbox either way.
+/// Deliberately stateless on the owner's side: no process-dictionary flag
+/// or other bookkeeping outside this immutable value survives between
+/// `await` calls, so starting and awaiting any number of `Execution`s never
+/// grows the owner's process dictionary. `monitor` is the *original*
+/// monitor set up once, in `start` — an ordinary value held on `Execution`,
+/// not owner-process state, so keeping it costs nothing once the
+/// `Execution` itself is dropped. It is what makes a coordinator that dies
+/// abnormally *before ever being awaited* reliably reported as `Lost`: a
+/// monitor set up while the coordinator was still alive is the only way to
+/// see its *real* exit reason, since a monitor set up afterwards (once the
+/// coordinator is already dead) always reports the synthetic reason
+/// `noproc` instead. See `await`'s doc comment for how a second `await`
+/// (after `monitor` has already fired and been torn down) is still
+/// detected — without extra owner-side state — using a second, freshly
+/// created monitor for that call only.
+///
+/// **Lifetime.** Every `await` that actually consumes a signal (an outcome,
+/// or a `Down`) demonitors/drains as it returns, so nothing is left in the
+/// owner's mailbox *once that call happens* — but a call that never
+/// happens cannot clean up after itself. An `Execution` you stop awaiting
+/// (an `await` that timed out, followed by `cancel`, with no `await`
+/// afterwards) can still leave a monitor `Down` or an unclaimed outcome
+/// message sitting in the owner's mailbox once the run eventually settles.
+/// Always `await` again after `cancel` (even with a short timeout) so the
+/// run's terminal outcome is consumed before the `Execution` is dropped.
 pub opaque type Execution(o, e, u) {
   Execution(
     pid: Pid,
@@ -259,16 +277,7 @@ pub opaque type Execution(o, e, u) {
     monitor: process.Monitor,
     control: Subject(coordinator.Control(o, e, u)),
     result: Subject(coordinator.Outcome(o, e, u)),
-    already_awaited_key: Int,
   )
-}
-
-fn mark_already_awaited(execution: Execution(o, e, u)) -> Nil {
-  ffi.put_flag(execution.already_awaited_key)
-}
-
-fn was_already_awaited(execution: Execution(o, e, u)) -> Bool {
-  ffi.check_flag(execution.already_awaited_key)
 }
 
 /// Runs `workflow` with `input` to completion, validating `config` first.
@@ -332,18 +341,15 @@ pub fn start(
           "coordinator did not complete its startup handshake within 5000ms",
         )),
       )
-    Ok(control) -> {
-      let monitor = process.monitor(pid)
+    Ok(control) ->
       Ok(Execution(
         pid: pid,
         run_id: run_id,
         owner: owner,
-        monitor: monitor,
+        monitor: process.monitor(pid),
         control: control,
         result: result_subject,
-        already_awaited_key: ffi.unique_integer(),
       ))
-    }
   }
 }
 
@@ -359,51 +365,100 @@ fn result_try(
 
 type AwaitSignal(o, e, u) {
   GotOutcome(coordinator.Outcome(o, e, u))
-  CoordinatorDown(process.ExitReason)
+  OriginalDown(process.ExitReason)
+  FreshDown(process.ExitReason)
 }
 
+/// Builds the selector for one `await`/`await_forever` call: it races
+/// `execution.result` against *two* monitors on the coordinator —
+/// `execution.monitor` (the original one, set up once in `start`, still
+/// armed only until it has fired and been torn down once) and a brand new
+/// one created here, just for this call. Returns the fresh monitor
+/// alongside the selector so the caller can demonitor it afterwards;
+/// `execution.monitor` is demonitored by `await_signal` instead, since
+/// whether *it* still needs tearing down depends on which signal actually
+/// matched.
+///
+/// Racing both, rather than only the original, is what makes a *second*
+/// `await` (after the first already consumed the outcome, or already
+/// observed the original's `Down`) resolve promptly instead of idling out
+/// the full timeout: `execution.monitor` cannot fire again once spent, but
+/// Erlang delivers a brand new monitor's `Down` immediately — with the
+/// synthetic reason `noproc` — when the monitored process is already dead,
+/// which `await_signal` recognizes as "nothing further to await". See
+/// `Execution`'s doc comment for why the *original* monitor still has to
+/// exist at all (a monitor created after the fact can never report a real
+/// exit reason, only `noproc`).
+///
+/// Erlang mailboxes are FIFO, and a coordinator's real `Down` for
+/// `execution.monitor` (fired while that monitor was live) is always
+/// enqueued before the fresh monitor's synthetic post-mortem `Down`
+/// (created afterwards) can be, so racing both together can never lose the
+/// original's real exit reason to the fresh monitor's `noproc`.
 fn await_selector(
   execution: Execution(o, e, u),
-) -> process.Selector(AwaitSignal(o, e, u)) {
-  process.new_selector()
-  |> process.select_map(execution.result, GotOutcome)
-  |> process.select_specific_monitor(execution.monitor, fn(down) {
-    case down {
-      process.ProcessDown(_, _, reason) -> CoordinatorDown(reason)
-      process.PortDown(_, _, reason) -> CoordinatorDown(reason)
-    }
-  })
+) -> #(process.Monitor, process.Selector(AwaitSignal(o, e, u))) {
+  let fresh_monitor = process.monitor(execution.pid)
+  let selector =
+    process.new_selector()
+    |> process.select_map(execution.result, GotOutcome)
+    |> process.select_specific_monitor(execution.monitor, fn(down) {
+      OriginalDown(down_reason(down))
+    })
+    |> process.select_specific_monitor(fresh_monitor, fn(down) {
+      FreshDown(down_reason(down))
+    })
+  #(fresh_monitor, selector)
 }
 
-/// `signal`'s monitor is always demonitored here, with `[flush]` (see
-/// `process.demonitor_process`), regardless of which branch matched: once
-/// `await`/`await_forever` return, the coordinator has either already
-/// exited or is about to (it always sends its outcome immediately before
-/// exiting), so its `Down` message — due imminently if not already
-/// delivered — would otherwise sit in the owner's mailbox forever after
-/// being observed here. Demonitoring with flush both stops any further
-/// `Down` from arriving and removes one already queued, so a caller that
-/// calls `run`/`await` repeatedly never accumulates stale monitor messages
-/// in its own mailbox.
+fn down_reason(down: process.Down) -> process.ExitReason {
+  case down {
+    process.ProcessDown(_, _, reason) -> reason
+    process.PortDown(_, _, reason) -> reason
+  }
+}
+
+/// `fresh_monitor` (created fresh for this one call, see `await_selector`)
+/// is always demonitored here, with `[flush]`, regardless of which branch
+/// matched — it has either already fired (its `Down`, if any, must not sit
+/// in the owner's mailbox forever) or never will (a `GotOutcome` or
+/// `OriginalDown` win instead, or this call is timing out) and either way
+/// must be torn down before the next `await`. `execution.monitor` (the
+/// original) is demonitored only on `GotOutcome`/`OriginalDown` — the two
+/// cases that actually consume it — never on `FreshDown` or a timeout,
+/// since it may still be legitimately armed and useful to a later `await`.
 fn await_signal(
   execution: Execution(o, e, u),
+  fresh_monitor: process.Monitor,
   signal: AwaitSignal(o, e, u),
 ) -> Result(Outcome(o, e, u), AwaitError) {
-  process.demonitor_process(execution.monitor)
+  process.demonitor_process(fresh_monitor)
   case signal {
     GotOutcome(outcome) -> {
-      mark_already_awaited(execution)
+      process.demonitor_process(execution.monitor)
       Ok(to_public_outcome(outcome))
     }
-    // `was_already_awaited` (checked by both `await` and `await_forever`
-    // before this is ever reached) is what normally reports a second
-    // `await`; a `Normal` `Down` observed here instead would mean the
-    // coordinator exited without ever sending an outcome, which the
-    // coordinator's own contract rules out — kept as `Lost` rather than
-    // panicking, since it is cheaper to report defensively than to prove
-    // unreachable.
-    CoordinatorDown(reason) ->
+    // A first-hand `Down` from the *original* monitor: it was still armed
+    // when the coordinator exited, so this is a genuine, fresh report of
+    // that exit, never seen by any earlier `await` (the original monitor
+    // only ever fires once). A live `Normal` here would mean the
+    // coordinator exited without ever sending an outcome, which its own
+    // contract rules out; kept as `Lost` rather than panicking, since it is
+    // cheaper to report defensively than to prove unreachable.
+    OriginalDown(reason) -> {
+      process.demonitor_process(execution.monitor)
       Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
+    }
+    // The *fresh* monitor fired instead: the original either already fired
+    // for an earlier `await` (consumed, and demonitored then) or was never
+    // going to fire at all for this signal (its own `Down`, if further in
+    // the future, is unrelated to this one). Either way the coordinator
+    // was already dead by the time this call's fresh monitor was set up,
+    // which can only produce the synthetic reason `noproc` — see
+    // `AwaitError`'s doc comment for why this is reported as
+    // `AlreadyAwaited` regardless of whether the outcome was consumed or a
+    // `Lost` was already reported.
+    FreshDown(_reason) -> Error(AlreadyAwaited)
   }
 }
 
@@ -418,27 +473,33 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
 /// Waits up to `milliseconds` for the run's outcome. Returns
 /// `Error(AwaitTimedOut)` on timeout — the run continues, and `await` may
 /// be called again. Returns `Error(AlreadyAwaited)` if a previous `await`
-/// on this same `Execution` already consumed the outcome. Returns
-/// `Error(Lost(crash))` if the coordinator was killed externally before it
-/// could report an outcome (`execution.pid` lets applications monitor it
-/// themselves for this case).
+/// on this same `Execution` already consumed the outcome, *or* if a
+/// previous `await` already reported `Lost` for it (see `AwaitError`'s doc
+/// comment). Returns `Error(Lost(crash))` if the coordinator was killed
+/// externally before it could report an outcome (`execution.pid` lets
+/// applications monitor it themselves independently, for comparison).
+///
+/// Stateless on the owner's side: no process-dictionary flag or other
+/// owner-process bookkeeping is used to detect a repeated `await` — see
+/// `Execution`/`await_selector`'s doc comments for how a fresh, per-call
+/// monitor takes its place instead, so starting and awaiting any number of
+/// runs never grows the owner's process dictionary.
 pub fn await(
   execution: Execution(o, e, u),
   timeout milliseconds: Int,
 ) -> Result(Outcome(o, e, u), AwaitError) {
   case process.self() == execution.owner {
     False -> Error(NotOwner)
-    True ->
-      case was_already_awaited(execution) {
-        True -> Error(AlreadyAwaited)
-        False ->
-          case
-            process.selector_receive(await_selector(execution), milliseconds)
-          {
-            Ok(signal) -> await_signal(execution, signal)
-            Error(_) -> Error(AwaitTimedOut)
-          }
+    True -> {
+      let #(fresh_monitor, selector) = await_selector(execution)
+      case process.selector_receive(selector, milliseconds) {
+        Ok(signal) -> await_signal(execution, fresh_monitor, signal)
+        Error(_) -> {
+          process.demonitor_process(fresh_monitor)
+          Error(AwaitTimedOut)
+        }
       }
+    }
   }
 }
 
@@ -447,15 +508,14 @@ fn await_forever(
 ) -> Result(Outcome(o, e, u), AwaitError) {
   case process.self() == execution.owner {
     False -> Error(NotOwner)
-    True ->
-      case was_already_awaited(execution) {
-        True -> Error(AlreadyAwaited)
-        False ->
-          await_signal(
-            execution,
-            process.selector_receive_forever(await_selector(execution)),
-          )
-      }
+    True -> {
+      let #(fresh_monitor, selector) = await_selector(execution)
+      await_signal(
+        execution,
+        fresh_monitor,
+        process.selector_receive_forever(selector),
+      )
+    }
   }
 }
 
