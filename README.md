@@ -128,9 +128,60 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   `define` recorded, the run fails immediately with `DefinitionChanged`
   before any step is admitted — nothing partially executes against a
   builder that cannot be trusted to reproduce its own shape.
+- **A step whose output port is never consumed is rejected at `define`
+  time**, as `DefinitionError.OrphanStep(step)`, instead of silently never
+  running: every step created via `perform`/`embed` must have its output
+  port threaded (directly or through `map`/`both`/`all`) into the
+  workflow's final returned port.
+- **A `Completed` outcome does not always mean every effect is known.**
+  `execution.Outcome.CompletedWithUnknownEffects(output, unknown_effects)`
+  is `Completed`'s counterpart for the one case a plain `Completed` cannot
+  honestly report: a step whose attempt was killed by its own `timeout`,
+  but whose `compensate` decider chose `Retry`/`RetryAfter`/`Continue`
+  anyway, letting the run reach a normal output. The _killed_ attempt's own
+  effect is still unknown and was never journaled or undone — only the
+  _replacement_ attempt is known-good. `unknown_effects` names every such
+  step; it is never empty on this variant. `saga/observation`'s
+  `run_stopped` event reports this case as `OutcomeCompleted` (the same
+  `OutcomeKind` as a plain `Completed`), with its `interrupted` measurement
+  populated from `unknown_effects`'s length instead — check that field, not
+  the outcome kind, to tell the two apart from telemetry alone.
+- **A refused retry is distinguished from an exhausted one.** A
+  `Retry`/`RetryAfter` compensation decision that arrives after the run has
+  already begun settling for a different, unrelated trigger cannot be
+  honored (it would race the settle window); it is recorded as
+  `Cause.RetrySuperseded(step, last)`, kept distinct from
+  `RetryLimitReached` (which means the step's own attempt budget was
+  actually exhausted) so a `case` over `Cause` cannot conflate "never got
+  the chance to retry" with "ran out of retries."
 - **`saga.map` is not memoized.** It re-runs in every task that consumes
   the resulting port. Use a `saga.step` for expensive or effectful
   transforms.
+- **`saga.all` takes a required first port.**
+  `saga.all(first: Port(a, e, u), rest: List(Port(a, e, u))) -> Port(List(a), e, u)`
+  combines `first` and `rest` (in that order) into one port producing
+  their values as a list. There is no empty-list case to construct or
+  reject: a caller with zero ports has no `Port` to pass as `first` and
+  cannot call `all` at all, which the type system enforces at the call
+  site. To combine an existing `List(Port(..))` of unknown length, split
+  it yourself first: `let assert [first, ..rest] = ports; saga.all(first, rest)`.
+- **A killed attempt's own effect can outlive the run that killed it.**
+  `Settlement.interrupted`/`not_undoable` name exactly which steps' effects
+  are unknown, but an `Execution` you stop awaiting — an `await` that timed
+  out, followed by `cancel`, with no further `await` — can still leave a
+  monitor `Down` or an outcome message sitting in your own mailbox once the
+  run finally settles: `await` only demonitors/drains on the call that
+  actually consumes a signal. Always `await` again (even with a short
+  timeout) after `cancel`, so the run's eventual `Cancelled` outcome is
+  consumed and nothing is left behind in your mailbox.
+- **A repeated `await` cannot always tell `AlreadyAwaited` apart from a
+  previously-reported `Lost`.** `execution.await`/`AwaitError` are
+  deliberately stateless on the caller's side (no process-dictionary
+  bookkeeping survives between calls), so a _second_ `await` on an
+  `Execution` whose coordinator already exited reports `AlreadyAwaited`
+  whether the first `await` consumed a normal outcome or already reported
+  `Lost`. If you need to know which one actually happened, keep the first
+  `await`'s own result — do not rely on a second call to re-derive it.
 
 ## Development
 

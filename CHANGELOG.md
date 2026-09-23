@@ -34,8 +34,6 @@ increments toward the first local-execution release.
   `embed` calls of the same workflow (or a name collision with an outer
   step) are addressed distinctly (e.g. `inner/charge`, `inner/charge#2`)
   instead of colliding at the root scope.
-- `saga.DefinitionError.EmptyAll`: `saga.all([])` no longer panics: an
-  empty list is reported as an ordinary definition error instead.
 - `execution.Outcome.CompletedWithUnknownEffects(output, unknown_effects)`:
   a new outcome variant for the case a plain `Completed` cannot honestly
   report — a step whose attempt was killed by its own `timeout` but whose
@@ -66,6 +64,16 @@ increments toward the first local-execution release.
 assert` panic.
 - `execution.progress` on a run that has already ended now returns
   `Error(ExecutionEnded)` promptly instead of always timing out.
+- **Breaking:** `saga.all`'s signature changed from
+  `all(ports: List(Port(a, e, u))) -> Port(List(a), e, u)` to
+  `all(first: Port(a, e, u), rest: List(Port(a, e, u))) -> Port(List(a), e, u)`.
+  A caller with zero ports now simply has no `first` to pass, so there is
+  no empty case left to construct, panic on, or report as a definition
+  error — `DefinitionError.EmptyAll` and its placeholder port (which
+  allocated a real, unused registry as a side effect on every empty call)
+  are both removed. Existing call sites change from `saga.all(ports)` to
+  `let assert [first, ..rest] = ports; saga.all(first, rest)`, or
+  `saga.all(a, [b, c])` for a literal list.
 
 ### Fixed
 
@@ -97,6 +105,23 @@ assert` panic.
   "abnormal".
 - `lifecycle_test.gleam`'s coordinator-kill test no longer polls
   `process.is_alive` in a sleep loop; it waits on a monitor instead.
+- `execution.await`'s "already awaited" tracking grew the calling process's
+  own process dictionary by one entry per `Execution`, forever (a boolean
+  flag keyed by a fresh integer, never removed). `await` is now stateless
+  on the owner's side: a repeated `await` is detected from a fresh,
+  per-call monitor's immediate `noproc` `Down` instead, and the original
+  monitor set up in `start` still catches a coordinator that dies
+  abnormally before ever being awaited (reported `Lost`). A second `await`
+  after an earlier `Lost` is now also reported promptly, as
+  `AlreadyAwaited` rather than idling out the full timeout — see
+  `AwaitError`'s doc comment for why the two cases are not distinguished.
+- A step killed by its own `timeout` when a `compensate` decider was
+  attached never emitted its own `step_stopped(AttemptTimedOut)`
+  observation at all — only the decider's later resolution emitted a
+  `step_stopped`, under its own (much shorter) duration and outcome kind.
+  The killed attempt's `step_stopped(AttemptTimedOut)` is now always
+  emitted, with its own real elapsed duration (previously overwritten with
+  a fresh, near-zero timestamp before that duration was read).
 
 ## Increment 2
 
