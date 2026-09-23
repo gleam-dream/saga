@@ -226,15 +226,23 @@ pub type ProgressError {
 
 /// Why `await` did not return an `Outcome`.
 ///
-/// `AlreadyAwaited` is reported both for the ordinary case (a previous
-/// `await` on this `Execution` already consumed its outcome) and, by
-/// design, for a second `await` after a previous one already reported
-/// `Lost`: telling those two apart would require keeping state across
-/// calls (see `Execution`'s doc comment for why `await` deliberately keeps
-/// none), and both leave nothing further to observe — the coordinator is
-/// gone either way and no fresh `Down` will ever arrive again. A caller
-/// that needs to distinguish them should keep the first `await`'s own
-/// result instead of relying on a second call.
+/// `AlreadyAwaited` is reported for the ordinary case (a previous `await`
+/// on this `Execution` already consumed its outcome) and also for a second
+/// `await` after a previous one already reported `Lost` — both leave
+/// nothing further to observe, since the coordinator is gone either way and
+/// no fresh `Down` will ever arrive again for a monitor that already fired.
+/// A caller that needs the crash detail should keep the first `await`'s own
+/// `Lost` result instead of relying on a second call to repeat it.
+///
+/// **Timing.** If `await` is issued immediately after a previous `await`
+/// already succeeded (returned `Ok`), it may still report
+/// `Error(AwaitTimedOut)` rather than `Error(AlreadyAwaited)`: succeeding
+/// only means the coordinator has sent its outcome, not that the
+/// coordinator process has actually exited yet, and `AlreadyAwaited` is
+/// only guaranteed once it has. A caller relying on `AlreadyAwaited` to
+/// detect a repeated `await` should either retry past a timeout or give a
+/// long enough one, rather than treating a single short-timeout call right
+/// after success as conclusive.
 pub type AwaitError {
   AwaitTimedOut
   NotOwner
@@ -293,11 +301,27 @@ pub fn run(
       case await_forever(execution) {
         Ok(outcome) -> Ok(outcome)
         Error(Lost(crash)) -> Error(ExecutionLost(crash))
+        // `await_forever` cannot produce `AwaitTimedOut` (no timeout was
+        // given) or `NotOwner` (the same process that started also awaits).
+        // `AlreadyAwaited` should likewise be unreachable here: this is the
+        // only `await` ever raced against `execution.monitor`, and that
+        // monitor has been armed since `start` — so if the coordinator has
+        // already died by the time this call's fresh monitor is created,
+        // the original's real `Down` was necessarily enqueued first (mailbox
+        // order is FIFO) and `await_signal`'s zero-timeout check on
+        // `FreshDown` finds it, reporting `Lost` rather than
+        // `AlreadyAwaited`. Mapped to `ExecutionLost` with a synthetic crash
+        // instead of a panic, on the same "report defensively rather than
+        // prove unreachable" principle as `await_signal`'s own `OriginalDown`
+        // branch — a future refactor that reintroduces the gap fails a run
+        // instead of crashing the caller's process.
         Error(_other) ->
-          // await_forever never produces AwaitTimedOut (no timeout was
-          // given), NotOwner (the same process that started also awaits),
-          // or AlreadyAwaited (this is the first and only await).
-          panic as "saga: unreachable await error from the owning process"
+          Error(
+            ExecutionLost(saga.Crash(
+              saga.ExitClass,
+              "saga: await reported AlreadyAwaited on a run's first and only await",
+            )),
+          )
       }
   }
 }
@@ -424,9 +448,11 @@ fn down_reason(down: process.Down) -> process.ExitReason {
 /// in the owner's mailbox forever) or never will (a `GotOutcome` or
 /// `OriginalDown` win instead, or this call is timing out) and either way
 /// must be torn down before the next `await`. `execution.monitor` (the
-/// original) is demonitored only on `GotOutcome`/`OriginalDown` — the two
-/// cases that actually consume it — never on `FreshDown` or a timeout,
-/// since it may still be legitimately armed and useful to a later `await`.
+/// original) is demonitored (with `[flush]`) on every branch: `GotOutcome`
+/// and `OriginalDown` consume it directly, and `FreshDown` either finds and
+/// consumes its `Down` too (see below) or tears down a monitor that can now
+/// never fire (the coordinator is confirmed dead either way), so nothing is
+/// ever left armed after this call returns.
 fn await_signal(
   execution: Execution(o, e, u),
   fresh_monitor: process.Monitor,
@@ -449,16 +475,46 @@ fn await_signal(
       process.demonitor_process(execution.monitor)
       Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
     }
-    // The *fresh* monitor fired instead: the original either already fired
-    // for an earlier `await` (consumed, and demonitored then) or was never
-    // going to fire at all for this signal (its own `Down`, if further in
-    // the future, is unrelated to this one). Either way the coordinator
-    // was already dead by the time this call's fresh monitor was set up,
-    // which can only produce the synthetic reason `noproc` — see
-    // `AwaitError`'s doc comment for why this is reported as
-    // `AlreadyAwaited` regardless of whether the outcome was consumed or a
-    // `Lost` was already reported.
-    FreshDown(_reason) -> Error(AlreadyAwaited)
+    // The *fresh* monitor fired instead, with the synthetic reason `noproc`
+    // — the coordinator was already dead by the time this call's fresh
+    // monitor was set up. That leaves two possibilities that a selector
+    // race between two simultaneously-eligible monitors cannot be trusted
+    // to tell apart by delivery order alone:
+    //
+    //   1. The coordinator died *before this `await`* (an earlier `await`
+    //      already consumed its outcome, or already observed and reported
+    //      the original's `Down`, or no `await` ever raced it at all). The
+    //      original monitor's `Down` is not sitting in the mailbox — either
+    //      already drained by that earlier call, or (the "coordinator
+    //      killed, never awaited" case) not yet delivered, but with no
+    //      further relevance to this one.
+    //   2. The run was lost *during this very `await`* — the coordinator
+    //      died only just now, and both the original and fresh monitors'
+    //      `Down` messages are in flight together. The original's real
+    //      exit reason is then genuinely available and must win over the
+    //      fresh monitor's uninformative `noproc`, exactly as `await`'s own
+    //      first race already prefers `OriginalDown` when it arrives first.
+    //
+    // A zero-timeout selective receive on the original monitor alone
+    // resolves this without polling or a process-dictionary flag: if its
+    // `Down` is already in the mailbox, case 2 applies and its real reason
+    // is reported as `Lost`; otherwise case 1 applies. Either way
+    // `execution.monitor` is demonitored with `[flush]` afterwards, so it
+    // never lingers into a later `await`.
+    FreshDown(_reason) -> {
+      let original_selector =
+        process.new_selector()
+        |> process.select_specific_monitor(execution.monitor, fn(down) {
+          down_reason(down)
+        })
+      let outcome = case process.selector_receive(original_selector, 0) {
+        Ok(reason) ->
+          Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
+        Error(_) -> Error(AlreadyAwaited)
+      }
+      process.demonitor_process(execution.monitor)
+      outcome
+    }
   }
 }
 
@@ -476,8 +532,16 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
 /// on this same `Execution` already consumed the outcome, *or* if a
 /// previous `await` already reported `Lost` for it (see `AwaitError`'s doc
 /// comment). Returns `Error(Lost(crash))` if the coordinator was killed
-/// externally before it could report an outcome (`execution.pid` lets
+/// externally before it could report an outcome, whether that happened
+/// before this call started or during it (`execution.pid` lets
 /// applications monitor it themselves independently, for comparison).
+///
+/// **Timing.** An `await` issued immediately after a previous `await`
+/// already returned `Ok` may still return `Error(AwaitTimedOut)` rather
+/// than `Error(AlreadyAwaited)`: a successful outcome only means the
+/// coordinator has sent it, not that the coordinator process has exited
+/// yet. `AlreadyAwaited` is only guaranteed once the coordinator has
+/// actually exited — see `AwaitError`'s doc comment.
 ///
 /// Stateless on the owner's side: no process-dictionary flag or other
 /// owner-process bookkeeping is used to detect a repeated `await` — see

@@ -129,6 +129,17 @@ assert` panic.
   The killed attempt's `step_stopped(AttemptTimedOut)` is now always
   emitted, with its own real elapsed duration (previously overwritten with
   a fresh, near-zero timestamp before that duration was read).
+- `execution.await`'s `FreshDown` branch (the run was already lost by the
+  time this call's fresh monitor was set up) always reported
+  `AlreadyAwaited`, even when the coordinator died _during_ this very
+  `await` and the original monitor's real `Down` was racing the fresh
+  one's synthetic `noproc` in the mailbox — losing the real crash reason to
+  a generic "already awaited" in that window. `await` now checks the
+  original monitor with a zero-timeout selective receive first and reports
+  `Lost` with its real reason when found, and demonitors the original (with
+  `[flush]`) on every `FreshDown` outcome rather than only some. `run`'s
+  now-truly-unreachable `AlreadyAwaited` case is mapped to
+  `Error(ExecutionLost(_))` instead of a panic.
 
 ## Increment 2
 
