@@ -43,3 +43,6 @@ result = Reactor.run(Oracle.D6, %{agent: agent}, %{}, max_concurrency: 3)
 
 Oracle.Trace.print("d6.peak_concurrency", peak)
 Oracle.Trace.print("d6.result", elem(result, 0))
+
+Oracle.Trace.print_normalized("normalized.d6.peak_concurrency", peak)
+Oracle.Trace.print_normalized("normalized.d6.result", elem(result, 0))

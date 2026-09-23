@@ -77,3 +77,11 @@ error_classes =
 
 Oracle.Trace.print("d2.error_classes", error_classes)
 Oracle.Trace.print("d2.result", elem(result, 0))
+
+# Normalized: the trace order is where D2's deliberate difference lives
+# (Reactor undoes forward, Saga undoes in reverse completion order — see
+# oracle/differences/d2.diff). `undo_failure_count` is comparable directly:
+# both sides retain every undo failure, not just the first.
+Oracle.Trace.print_normalized("normalized.d2.trace", Agent.get(agent, &Enum.reverse/1))
+Oracle.Trace.print_normalized("normalized.d2.undo_failure_count", length(error_classes) - 1)
+Oracle.Trace.print_normalized("normalized.d2.result", elem(result, 0))

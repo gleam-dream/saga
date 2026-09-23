@@ -55,9 +55,62 @@ Every capability below carries a status:
   enforcing the pure-builder requirement.
 - Sequential composition (`saga.embed`) of one workflow into another's
   port graph, sharing the same run and journal.
+- Foreign-port rejection: `define` rejects a `Port` used from outside the
+  build it belongs to (`DefinitionError.ForeignPort`).
+- Scoped step addresses as representation: `StepAddress(scope, name,
+occurrence)` distinguishes repeated occurrences of the same step name at
+  one scope. `saga.embed` does not yet push a fresh nested scope for the
+  embedded workflow (see Deferred); today every direct step shares the
+  root scope, so `scope` is exercised by occurrence disambiguation, not
+  yet by embed nesting.
 
 ## Deferred
 
+- **Orphan / unreachable-output rejection.** `define`'s validation
+  (`DefinitionError`) currently checks step names, attempt budgets,
+  timeouts, and foreign-port usage, but does not reject a step whose
+  output is never consumed by the workflow's declared output or any other
+  step (an orphan node), or a builder that leaves part of its graph
+  unreachable from the output port. The design's shared-graph requirement
+  (`saga-design.md`, "Fabric graph requirements accepted by Saga") calls
+  for rejecting unreachable outputs alongside cycles, missing producers,
+  and undeclared duplicate writers (the last two tracked separately
+  below); cycles and missing producers are already unrepresentable by
+  Saga's `Port`-threading builder, but orphan/unreachable-output rejection
+  is not yet implemented. **In progress in this release** — being
+  implemented in `src/saga.gleam` in parallel with this documentation
+  pass; confirm against `git log`/`CHANGELOG.md` before relying on this
+  being shipped.
+- **Scoped embed addresses.** `saga.embed` shares the parent's `scope`
+  rather than pushing a fresh nested scope path for the embedded
+  workflow's steps, so an embedded step's address does not yet record
+  which `embed` call it came from the way the design's "nested choice
+  scope" language implies. **In progress in this release** — being
+  implemented in `src/saga.gleam` in parallel with this documentation
+  pass; confirm against `git log`/`CHANGELOG.md` before relying on this
+  being shipped.
+- **Step labels and metadata beyond name.** `StepDescriptor` exposes
+  `address`, `depends_on`, `undoable`, `compensates`, `max_attempts`, and
+  `timeout`, but there is no free-text label or arbitrary metadata
+  attachment point separate from a step's own `name`. The design's
+  "Diagnostic labels do not transport values or replace typed port
+  connections" language (saga-design.md, "Typed DAG construction")
+  anticipates a label surface distinct from the step name used for
+  addressing; that surface does not exist yet.
+- **Predefined generic runtime nodes** (`Identity<T>`, `Delay<T>`,
+  `Choose<T>`, `Collect<T>`, `Constant<T>`, `Validate<T>`, `Map<A, B>`,
+  `LLM<Input, Output>` from saga-design.md's "Parametric node
+  definitions"). None of these has an executable adapter; the design
+  itself notes "No executable runtime-node adapter exists for this
+  operation" for `Identity`, `Choose`, and the LLM node specifically.
+  Blocked on the runtime-authored schema graph surface below.
+- **Exact structural compatibility for runtime-authored connections.**
+  The design's conservative first cut ("exact structural equality plus
+  explicit transformation nodes," saga-design.md "Schema compatibility")
+  has no implementation; it presupposes the runtime-authored schema graph
+  surface, which is itself deferred below. Width subtyping and broader
+  assignability are explicitly out of scope until the conservative form
+  exists.
 - Durable execution: PostgreSQL journals, persistent checkpoints,
   freeze/thaw, snapshot codecs, restore, and migration.
 - Grind integration (`saga_grind` optional runner), durable per-activity
@@ -74,6 +127,13 @@ Every capability below carries a status:
   `traverse_parallel`, and closed choice execution.
 - Runtime-authored schema graphs: registry, publication, unification, and
   Blueprint runtime contracts.
+- Draft/Published/Retired graph states, immutable executable graphs once
+  published, and registry versions (saga-design.md "Graph publication");
+  publication's ten validation checks (decode configurations, resolve
+  definitions/versions, instantiate type parameters, unify ports, derive
+  output schemas, detect cycles, validate constants/defaults, check
+  required inputs, validate graph-level input/output schemas, produce an
+  immutable `PublishedGraph`) have no implementation to test against.
 - Visual editors, graph visualization export (Reactor's mermaid export),
   and historical review forks.
 - Fabric/LLM execution nodes, bounded agent loops as nodes, and suspending
@@ -94,6 +154,18 @@ Every capability below carries a status:
 
 - Closure serialization: a `Step`/`Workflow` closure is never serialized.
   This is a design decision, not a gap to fill later.
+- Arbitrary heterogeneous runtime steps and named native-result lookup
+  (saga-design.md, "Where exact Reactor parity becomes impossible" and the
+  capability-disposition table's final row): loading an arbitrary step
+  type from configuration, referencing a result by name instead of a
+  typed `Port`, serializing an arbitrary workflow closure, storing
+  heterogeneous results centrally, and returning arbitrary new
+  heterogeneous steps from a step (Reactor's
+  `{:ok, value, dynamically_created_steps}`) are original, intentional
+  exclusions of this design, not backlog. The schema-typed runtime graph
+  surface (deferred above) is a separate, narrower mechanism for
+  runtime-introduced types and is not a route back to unrestricted
+  heterogeneity.
 
 ## Deliberate behavioral differences from the Reactor oracle
 

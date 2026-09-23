@@ -57,3 +57,6 @@ produce_count = Enum.count(events, &(&1 == :produce))
 Oracle.Trace.print("d7.trace", events)
 Oracle.Trace.print("d7.produce_count", produce_count)
 Oracle.Trace.print("d7.result", result)
+
+Oracle.Trace.print_normalized("normalized.d7.produce_count", produce_count)
+Oracle.Trace.print_normalized("normalized.d7.result", elem(result, 0))

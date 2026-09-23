@@ -1,0 +1,9 @@
+--- reactor
++++ saga
+@@ -1,5 +1,5 @@
+ normalized.d3.fast_fail_compensated: true
+ normalized.d3.quick_undone: true
+ normalized.d3.slow_done: true
+-normalized.d3.slow_undone: false
++normalized.d3.slow_undone: true
+ normalized.d3.result: error

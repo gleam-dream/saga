@@ -99,3 +99,25 @@ Process.sleep(500)
 events_after_settle = Agent.get(agent, &Enum.reverse/1)
 Oracle.Trace.print("d3.slow_done_after_settle", {:done, :slow} in events_after_settle)
 Oracle.Trace.print("d3.slow_undone_after_settle", {:undo, :slow} in events_after_settle)
+
+# Normalized facts, evaluated at the same logical point on both sides: the
+# state fully settled (Reactor: after the 500ms sleep above; Saga: at the
+# moment execution.run/3 returns, because Saga settles synchronously
+# before returning — that difference in WHEN settlement happens is exactly
+# what oracle/differences/d3.diff records). `slow_undone` is the fact that
+# genuinely differs: Reactor never undoes an orphaned effect, Saga always
+# does once it is known to have completed.
+Oracle.Trace.print_normalized(
+  "normalized.d3.fast_fail_compensated",
+  {:compensate, :fast_fail} in events_at_return
+)
+
+Oracle.Trace.print_normalized("normalized.d3.quick_undone", {:undo, :quick} in events_at_return)
+Oracle.Trace.print_normalized("normalized.d3.slow_done", {:done, :slow} in events_after_settle)
+
+Oracle.Trace.print_normalized(
+  "normalized.d3.slow_undone",
+  {:undo, :slow} in events_after_settle
+)
+
+Oracle.Trace.print_normalized("normalized.d3.result", elem(result, 0))

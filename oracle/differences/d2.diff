@@ -1,0 +1,7 @@
+--- reactor
++++ saga
+@@ -1,3 +1,3 @@
+-normalized.d2.trace: [run:e1, run:e2, run:e3, undo:e1, undo:e2, undo:e3]
++normalized.d2.trace: [run:e1, run:e2, run:e3, undo:e3, undo:e2, undo:e1]
+ normalized.d2.undo_failure_count: 2
+ normalized.d2.result: error
