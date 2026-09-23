@@ -139,7 +139,13 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
       saga.both(a, b)
     })
 
-  let assert Ok(exec) = execution.start(workflow, 0, execution.config())
+  // `retryable`'s compensation decider and `failing`'s attempt must be able
+  // to run concurrently (via `both`) for this interleaving to happen at
+  // all — `max_concurrency` is set explicitly (rather than relying on
+  // `config()`'s scheduler-count default) so this passes under a
+  // single-scheduler `+S 1:1` run too.
+  let config = execution.Config(..execution.config(), max_concurrency: 2)
+  let assert Ok(exec) = execution.start(workflow, 0, config)
   // Both attempts start together (`both` schedules independent nodes): wait
   // for the decider to be blocked, and for `failing` to be blocked, then
   // release `failing` first so its own terminal failure begins settling
@@ -147,8 +153,15 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
   let assert Ok(_pid) = probe.wait_entered(decider_gate, 2000)
   let assert Ok(_pid2) = probe.wait_entered(fail_gate, 2000)
   probe.open(fail_gate)
-  // Give settling a moment to actually begin before releasing the decider.
-  process.sleep(100)
+  // Wait until settling has actually begun (the run's phase has left
+  // `Running`) before releasing the decider, rather than sleeping a fixed
+  // guess: `failing`'s failure must be observed and settling started
+  // before the decider's `RetryAfter` decision arrives, or the refusal
+  // this test exercises never happens.
+  let assert Ok(_progress) =
+    probe.wait_until_progress(exec, 2000, fn(p) {
+      p.phase == execution.Settling
+    })
   probe.open(decider_gate)
 
   let assert Ok(execution.Failed(cause, settlement)) =
@@ -226,7 +239,17 @@ pub fn settle_sweep_kill_emits_attempt_interrupted_test() {
       saga.both(blocked, failing)
     })
 
-  let config = execution.Config(..execution.config(), settle_timeout: 100)
+  // `blocked` and `failing` must run concurrently (via `both`) for
+  // `failing`'s terminal failure to begin settling while `blocked` is
+  // still active — `max_concurrency` is set explicitly (rather than
+  // relying on `config()`'s scheduler-count default) so this passes under
+  // a single-scheduler `+S 1:1` run too.
+  let config =
+    execution.Config(
+      ..execution.config(),
+      settle_timeout: 100,
+      max_concurrency: 2,
+    )
   let assert Ok(sinal.SubscriptionCompletion(Ok(_result), [])) =
     sinal.with_subscriptions(collect_step_stop_durations(collector), fn() {
       execution.run(workflow, 0, config)
