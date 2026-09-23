@@ -197,10 +197,10 @@ pub fn observation_events_cancelled_test() {
   let assert Ok(sinal.SubscriptionCompletion(_work_result, [])) =
     sinal.with_subscriptions(all_subscriptions(collector), fn() {
       probe.with_run(workflow, 0, config, fn(exec) {
-        let assert Ok(_pid) = probe.wait_entered(gate, 2000)
+        let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
         execution.cancel(exec)
         let assert Ok(execution.Cancelled(_reason, _settlement)) =
-          execution.await(exec, 2000)
+          execution.await(exec, 10_000)
         Nil
       })
     })

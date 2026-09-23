@@ -117,8 +117,8 @@ pub fn concurrent_runs_are_isolated_test() {
   let assert Ok(exec_a) = execution.start(workflow, 10, execution.config())
   let assert Ok(exec_b) = execution.start(workflow, 20, execution.config())
 
-  let assert Ok(execution.Completed(a)) = execution.await(exec_a, 2000)
-  let assert Ok(execution.Completed(b)) = execution.await(exec_b, 2000)
+  let assert Ok(execution.Completed(a)) = execution.await(exec_a, 10_000)
+  let assert Ok(execution.Completed(b)) = execution.await(exec_b, 10_000)
 
   a |> should.equal(20)
   b |> should.equal(40)
@@ -164,11 +164,11 @@ pub fn killed_step_task_is_crash_test() {
     })
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
-    let assert Ok(task_pid) = probe.wait_entered(gate, 2000)
+    let assert Ok(task_pid) = probe.wait_entered(gate, 10_000)
     kill_process(task_pid)
 
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, 10_000)
     case cause {
       execution.StepCrashed(_step, _crash) -> Nil
       _ -> panic as "expected StepCrashed"

@@ -140,6 +140,23 @@ assert` panic.
   `[flush]`) on every `FreshDown` outcome rather than only some. `run`'s
   now-truly-unreachable `AlreadyAwaited` case is mapped to
   `Error(ExecutionLost(_))` instead of a panic.
+- `scheduling_test.gleam`'s `retry_after_backoff_honors_max_concurrency_test`
+  waited for step `a` to reach `Compensating` specifically before releasing
+  a gated sibling — but `a`'s decider body is a synchronous, allocation-free
+  `case`, so under heavy scheduler contention the coordinator can process
+  its `AttemptDone` and the decider's `RecoveryDone` back-to-back in one
+  scheduling slice, skipping the `Compensating` snapshot entirely before
+  the test process ever gets to poll in between. Fixed by waiting for
+  either `Compensating` or the already-settled `RetryScheduled`, both of
+  which confirm what the test actually needs (the attempt slot was freed
+  through admission). Several other timing-sensitive tests used 2-3 second
+  wait budgets for lower-bound "poll until true" conditions
+  (progress-polling, gate entry, run completion), tight enough to
+  spuriously fail under heavy machine load; widened to 10-30 seconds where
+  waiting longer only costs wall-clock time. Two "must be prompt" assertions
+  in `lifecycle_test.gleam` compared elapsed time against an overly tight
+  upper bound; widened to a generous multiple of the property actually
+  under test (not idling out a much longer timeout).
 
 ## Increment 2
 

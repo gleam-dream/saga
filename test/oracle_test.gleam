@@ -364,7 +364,7 @@ fn run_d3() -> #(
         |> saga.perform(
           saga.step("slow", fn(x: Int) {
             record(events, #("start", "slow"))
-            wait_for_gate(slow_gate, 2000)
+            wait_for_gate(slow_gate, 10_000)
             record(events, #("done", "slow"))
             Ok(x)
           })
