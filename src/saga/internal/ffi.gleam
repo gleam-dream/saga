@@ -46,3 +46,8 @@ pub fn unique_integer() -> Int
 /// Native monotonic time in milliseconds, for duration measurements.
 @external(erlang, "saga_ffi", "monotonic_time")
 pub fn monotonic_time() -> Int
+
+/// Native wall-clock system time in milliseconds, for observation
+/// measurements.
+@external(erlang, "saga_ffi", "system_time")
+pub fn system_time() -> Int
