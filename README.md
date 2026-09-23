@@ -164,7 +164,14 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   reject: a caller with zero ports has no `Port` to pass as `first` and
   cannot call `all` at all, which the type system enforces at the call
   site. To combine an existing `List(Port(..))` of unknown length, split
-  it yourself first: `let assert [first, ..rest] = ports; saga.all(first, rest)`.
+  it yourself first with a `case`, handling the empty list explicitly
+  rather than asserting it away:
+  ```gleam
+  case ports {
+    [first, ..rest] -> Ok(saga.all(first, rest))
+    [] -> Error(NoPortsToCombine)
+  }
+  ```
 - **A killed attempt's own effect can outlive the run that killed it.**
   `Settlement.interrupted`/`not_undoable` name exactly which steps' effects
   are unknown, but an `Execution` you stop awaiting — an `await` that timed

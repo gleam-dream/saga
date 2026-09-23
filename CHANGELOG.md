@@ -72,8 +72,15 @@ assert` panic.
   error — `DefinitionError.EmptyAll` and its placeholder port (which
   allocated a real, unused registry as a side effect on every empty call)
   are both removed. Existing call sites change from `saga.all(ports)` to
-  `let assert [first, ..rest] = ports; saga.all(first, rest)`, or
-  `saga.all(a, [b, c])` for a literal list.
+  `saga.all(a, [b, c])` for a literal list, or, for a `List(Port(..))` of
+  unknown length, a `case` that handles the empty list explicitly instead
+  of asserting it away:
+  ```gleam
+  case ports {
+    [first, ..rest] -> Ok(saga.all(first, rest))
+    [] -> Error(NoPortsToCombine)
+  }
+  ```
 
 ### Fixed
 
