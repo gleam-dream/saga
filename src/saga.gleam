@@ -165,11 +165,6 @@ pub type DefinitionError {
   InvalidMaxAttempts(step: StepAddress, value: Int)
   InvalidTimeout(step: StepAddress, value: Int)
   ForeignPort(step: StepAddress)
-  /// `all([])` was called: there is no port to combine, so no output could
-  /// ever be produced. Reported instead of panicking, so an empty list
-  /// built at runtime (rather than authored literally) is an ordinary
-  /// definition-time rejection like any other.
-  EmptyAll
   /// A node was created during the builder (via `perform`/`embed`) but its
   /// output port was never consumed by anything reaching the workflow's
   /// final output — the step would silently never run. Named so the
@@ -525,31 +520,21 @@ pub fn both(
   })
 }
 
-/// Combines a list of ports into one port producing their values, in list
-/// order. An empty list has no port to combine and so can never produce a
-/// value; rather than panicking (the list length is ordinary runtime data,
-/// e.g. the result of a `list.map` over a caller-supplied collection), this
-/// is reported as `EmptyAll` alongside any other definition errors, and a
-/// placeholder port is returned so the rest of the builder can keep running
-/// to collect further errors.
-pub fn all(ports: List(Port(a, e, u))) -> Port(List(a), e, u) {
-  case ports {
-    [] -> empty_all_port()
-    [first, ..rest] ->
-      list.fold(rest, map(first, fn(a) { [a] }), fn(acc, port) {
-        both(acc, port) |> map(fn(pair) { list.append(pair.0, [pair.1]) })
-      })
-  }
-}
-
-fn empty_all_port() -> Port(List(a), e, u) {
-  Port(
-    scope: root_scope(),
-    nodes: dict.new(),
-    deps: set.new(),
-    errors: [EmptyAll],
-    fetch: fn() { fn() { fn() { [] } } },
-  )
+/// Combines `first` and `rest` into one port producing their values, in
+/// list order (`first` then `rest`, in `rest`'s own order). Takes `first`
+/// as a separate required argument (rather than one `List(Port(..))` that
+/// could be empty) so there is no empty case to report or work around at
+/// all: a caller with zero ports simply has no `Port` to pass as `first`
+/// and cannot call `all` in the first place, which the type system already
+/// enforces at the call site — nothing here needs its own placeholder
+/// value or definition error for it.
+pub fn all(
+  first: Port(a, e, u),
+  rest: List(Port(a, e, u)),
+) -> Port(List(a), e, u) {
+  list.fold(rest, map(first, fn(a) { [a] }), fn(acc, port) {
+    both(acc, port) |> map(fn(pair) { list.append(pair.0, [pair.1]) })
+  })
 }
 
 // ---------------------------------------------------------------------------

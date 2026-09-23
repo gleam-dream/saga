@@ -1,4 +1,4 @@
-import gleam/erlang/process
+import gleam/list
 import gleeunit/should
 import saga
 import saga/execution
@@ -89,7 +89,8 @@ pub fn max_concurrency_bounds_running_attempts_test() {
         list_range(1, 10)
         |> list_map(fn(i) { make_step("step" <> int_to_string(i)) })
       let ports = list_map(steps, fn(s) { input |> saga.perform(s) })
-      saga.all(ports)
+      let assert [first, ..rest] = ports
+      saga.all(first, rest)
     })
 
   let config = execution.Config(..execution.config(), max_concurrency: 3)
@@ -192,15 +193,38 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
       let d = input |> saga.perform(gated("d", dgate))
       let b = input |> saga.perform(gated("b", gate))
       let c = input |> saga.perform(gated("c", gate))
-      saga.all([a, d, b, c])
+      saga.all(a, [d, b, c])
     })
   let cfg = execution.Config(..execution.config(), max_concurrency: 2)
 
   probe.with_run(wf, 1, cfg, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(dgate, 2000)
-    process.sleep(50)
+    // Wait until `a`'s compensation decider is actually running (not just
+    // its attempt, which already failed synchronously) before releasing
+    // `d`: that is what confirms admission has settled to exactly `d`
+    // holding the one occupied slot, with the decider's own task occupying
+    // the other, rather than sleeping a fixed guess at how long that
+    // takes.
+    let assert Ok(_progress) =
+      probe.wait_until_progress(exec, 2000, fn(p) {
+        list.any(p.steps, fn(sp) {
+          sp.address.name == "a" && is_compensating(sp.state)
+        })
+      })
     probe.open(dgate)
-    process.sleep(500)
+    // Wait until `b` and `c` have both been admitted and are concurrently
+    // blocked in `gate` (the state the 300ms `RetryAfter` backoff must not
+    // be able to exceed): `b`+`c` entering brings the counter's total
+    // entries to 4 (`a`, `d`, `b`, `c`), and `a`'s own decision settles
+    // into `RetryScheduled(2)` once its backoff timer is armed. Waiting on
+    // both replaces sleeping past a fixed guess at the backoff delay.
+    probe.await_total_entries(counter, 4, 2000)
+    let assert Ok(_progress) =
+      probe.wait_until_progress(exec, 2000, fn(p) {
+        list.any(p.steps, fn(sp) {
+          sp.address.name == "a" && sp.state == execution.RetryScheduled(2)
+        })
+      })
     probe.high_water(counter) |> should.equal(2)
 
     probe.open(gate)
@@ -209,4 +233,11 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
     probe.high_water(counter) |> should.equal(2)
     Nil
   })
+}
+
+fn is_compensating(state: execution.StepState) -> Bool {
+  case state {
+    execution.Compensating(_) -> True
+    _ -> False
+  }
 }

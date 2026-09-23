@@ -405,10 +405,16 @@ fn run_d3() -> #(
             Ok(Nil)
           }),
         )
-      saga.all([slow, fast_fail, quick])
+      saga.all(slow, [fast_fail, quick])
     })
 
-  let assert Ok(outcome) = execution.run(workflow, 0, execution.config())
+  // `slow`, `fast_fail`, and `quick` must all be able to attempt
+  // concurrently for D3's interleaving (fast_fail fails while slow is still
+  // waiting) to happen at all — `max_concurrency` is set explicitly (rather
+  // than relying on `config()`'s scheduler-count default) so this passes
+  // under a single-scheduler `+S 1:1` run too.
+  let config = execution.Config(..execution.config(), max_concurrency: 3)
+  let assert Ok(outcome) = execution.run(workflow, 0, config)
   #(outcome, snapshot(events))
 }
 
@@ -630,9 +636,10 @@ fn run_d6() -> #(execution.Outcome(List(Int), DemoError, DemoUndoError), Int) {
 
   let assert Ok(workflow) =
     saga.define("d6", fn(input) {
-      ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]
-      |> list.map(fn(name) { input |> saga.perform(make_step(name)) })
-      |> saga.all
+      let assert [first, ..rest] =
+        ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]
+        |> list.map(fn(name) { input |> saga.perform(make_step(name)) })
+      saga.all(first, rest)
     })
 
   let assert Ok(outcome) =
