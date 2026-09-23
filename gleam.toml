@@ -2,6 +2,7 @@ name = "saga"
 version = "0.1.0"
 target = "erlang"
 gleam = ">= 1.18.0"
+internal_modules = ["saga/internal", "saga/internal/*"]
 licenses = ["Apache-2.0"]
 description = "A strongly-typed saga/DAG orchestrator for Gleam: typed dependency graphs instead of dynamic step maps."
 repository = { type = "github", user = "gleam-dream", repo = "saga" }
@@ -9,7 +10,6 @@ repository = { type = "github", user = "gleam-dream", repo = "saga" }
 [dependencies]
 gleam_stdlib = ">= 0.70.0 and < 1.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
-gleam_otp = ">= 1.0.0 and < 2.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
