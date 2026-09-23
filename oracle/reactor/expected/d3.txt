@@ -1,0 +1,7 @@
+d3.result: :error
+d3.fast_fail_compensated_at_return: true
+d3.quick_undone_at_return: true
+d3.slow_done_at_return: false
+d3.slow_undone_at_return: false
+d3.slow_done_after_settle: true
+d3.slow_undone_after_settle: false

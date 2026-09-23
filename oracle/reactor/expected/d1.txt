@@ -1,0 +1,2 @@
+d1.trace: [run: :a, run: :b, run: :c]
+d1.result: :ok

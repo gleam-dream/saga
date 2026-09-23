@@ -146,6 +146,36 @@ pub fn hold_leaves_completed_effects_unresolved_test() {
   settlement.undone |> should.equal([])
 }
 
+// Adapted from reactor/executor/step_runner_test.exs:252-307: undo
+// receives the step's original input and its successful output. Saga has
+// no undo-retry loop at all (deliberate difference, see PROVENANCE.md
+// R10 and design §3.3): a failing undo is retained once, never retried.
+pub fn undo_receives_input_and_output_test() {
+  let assert Ok(workflow) =
+    saga.define("chain", fn(input) {
+      let a =
+        input
+        |> saga.perform(
+          saga.step("a", fn(x: Int) { Ok(x + 10) })
+          |> saga.undo(fn(received_input, received_output) {
+            case received_input == 5 && received_output == 15 {
+              True -> Ok(Nil)
+              False -> Error(UndoBoom("a: wrong args"))
+            }
+          }),
+        )
+      a |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
+    })
+
+  let assert Ok(execution.Failed(_cause, settlement)) =
+    execution.run(workflow, 5, execution.config())
+
+  // The undo closure asserted the exact input (5) and output (15) it
+  // received; no UndoFailed means those assertions held.
+  settlement.undo_failures |> should.equal([])
+  settlement.undone |> list.map(fn(a) { a.name }) |> should.equal(["a"])
+}
+
 pub fn continue_replacement_undo_used_test() {
   let assert Ok(workflow) =
     saga.define("chain", fn(input) {
