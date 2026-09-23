@@ -1,0 +1,3 @@
+# A Continue recovery's replacement output must be the step's declared
+# output type, not an arbitrary one.
+Type mismatch
