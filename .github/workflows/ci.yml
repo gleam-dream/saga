@@ -41,3 +41,9 @@ jobs:
         working-directory: saga/examples/order_consumer
       - run: scripts/check_negative.sh
         working-directory: saga
+      - run: gleam deps download
+        working-directory: saga/bench
+      - run: gleam format --check src
+        working-directory: saga/bench
+      - run: gleam build --warnings-as-errors
+        working-directory: saga/bench

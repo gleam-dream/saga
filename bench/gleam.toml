@@ -1,0 +1,12 @@
+name = "bench"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+licenses = ["Apache-2.0"]
+description = "Throwaway benchmark harness for saga's run cost against step count. Not part of gleam test; run with `gleam run`."
+
+[dependencies]
+gleam_stdlib = ">= 0.70.0 and < 1.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+saga = { path = ".." }
+sinal = { path = "../../sinal" }
