@@ -1,0 +1,3 @@
+# Port is opaque: an external consumer cannot reach its constructor.
+Unknown module value
+type constructor

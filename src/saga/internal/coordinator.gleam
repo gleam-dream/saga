@@ -129,7 +129,6 @@ pub type Phase {
   Running
   Settling
   RollingBack
-  Finishing
 }
 
 pub type Progress {

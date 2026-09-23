@@ -165,13 +165,14 @@ pub type Outcome(o, e, u) {
 }
 
 /// The run's current admission phase: accepting new work, letting active
-/// siblings settle after a terminal trigger, undoing completed steps, or
-/// about to report a terminal outcome.
+/// siblings settle after a terminal trigger, or undoing completed steps.
+/// The coordinator reports its outcome and exits in the same step that
+/// finishes rollback (or reaches `Unresolved`/`Completed`), so there is no
+/// observable window for `progress` to report a "finishing" phase.
 pub type Phase {
   Running
   Settling
   RollingBack
-  Finishing
 }
 
 /// One step's current state, as reported by `progress`.
@@ -504,17 +505,10 @@ fn to_public_compensation_failure(
 fn to_public_progress(progress: coordinator.Progress) -> Progress {
   Progress(
     run_id: progress.run_id,
-    // The coordinator reports its outcome and exits in the same step that
-    // finishes rollback (or reaches `Unresolved`/`Completed`), so there is
-    // no observable window between "rollback just finished" and "the run
-    // is gone" for a `progress` call to land in. Public `Finishing` exists
-    // for API completeness (so a caller matching exhaustively on `Phase`
-    // is future-proofed) but `progress` never actually returns it.
     phase: case progress.phase {
       coordinator.Running -> Running
       coordinator.Settling -> Settling
       coordinator.RollingBack -> RollingBack
-      coordinator.Finishing -> Finishing
     },
     steps: list.map(progress.steps, fn(sp) {
       StepProgress(

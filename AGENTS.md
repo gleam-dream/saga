@@ -12,4 +12,24 @@ Ports/wraps: Reactor (Elixir). Design: [gleam-dream/oversight](https://github.co
 - `nix fmt`: formats the whole repo via treefmt (`gleam format`, `nixfmt`, `prettier`).
 - `lefthook`: pre-commit hook formats staged files and re-stages them.
 - `nix flake check`: fails iff the tree is not formatted (plus any existing checks).
-- `gleam test`: runs the test suite.
+
+## Gates
+
+Run from the repo root, inside `nix develop`:
+
+```sh
+gleam format --check src test
+gleam build --warnings-as-errors
+gleam test
+(cd examples/order_consumer && gleam format --check && gleam build --warnings-as-errors && gleam test && gleam run)
+scripts/check_negative.sh
+nix fmt
+nix flake check
+```
+
+`examples/order_consumer` is a separate Gleam package (path dependency on
+saga) that only imports saga's public modules — it is the external
+acceptance test for saga's facade, not part of saga's own build.
+`scripts/check_negative.sh` proves the compiler-negative fixtures under
+`fixtures/negative/` still fail to compile, from that same external point
+of view.
