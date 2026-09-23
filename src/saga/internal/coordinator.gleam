@@ -66,6 +66,15 @@ pub type Cause(e) {
   StepCrashed(step: StepAddress, crash: node.Crash)
   StepTimedOut(step: StepAddress)
   RetryLimitReached(step: StepAddress, last: AttemptFailure(e))
+  /// A `Retry`/`RetryAfter` decision was refused not because its attempt
+  /// budget was exhausted, but because settling had already begun for a
+  /// different, unrelated trigger by the time it was decided (§3.3): a
+  /// fresh attempt would race the settle window. Kept distinct from
+  /// `RetryLimitReached` so a caller inspecting a sibling failure's cause
+  /// can tell "this step genuinely ran out of attempts" from "this step
+  /// could have retried, but the run was already stopping for another
+  /// reason".
+  RetrySuperseded(step: StepAddress, last: AttemptFailure(e))
   OutputCrashed(crash: node.Crash)
   DeadlineExceeded
   DefinitionChanged
@@ -100,8 +109,26 @@ fn empty_settlement() -> Settlement(e, u) {
   )
 }
 
+/// `CompletedWithUnknownEffects` is `Completed`'s counterpart for the one
+/// case a plain successful output cannot honestly report: a step whose
+/// attempt was killed by its own `timeout` (see
+/// `handle_step_timeout_fired`), but whose recovery decider nonetheless
+/// chose `Retry`/`RetryAfter`/`Continue`, letting the run reach a normal
+/// output anyway. That step's *killed* attempt's own side effect is still
+/// unknown and was never journaled or undone — only the *replacement*
+/// attempt (the retry, or `Continue`'s supplied output) is known-good.
+/// Kept as a distinct variant (rather than an extra always-present field on
+/// `Completed`) specifically so it is impossible to pattern-match
+/// `Completed` and silently ignore this: any caller matching only
+/// `Completed` on this closed type fails to compile once a workflow's
+/// steps declare a `timeout`, and must decide how to treat the residual
+/// uncertainty (`unknown_effects` is never empty on this variant — an
+/// empty result is always plain `Completed` instead). The same fact is
+/// folded into `Settlement.interrupted` for every other outcome kind,
+/// since those already carry a settlement to report it in.
 pub type Outcome(o, e, u) {
   Completed(output: o)
+  CompletedWithUnknownEffects(output: o, unknown_effects: List(StepAddress))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
   Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
@@ -170,13 +197,34 @@ pub type UndoOutcome(u) {
 /// can be cancelled the moment the task finishes on its own.
 type NodeRunState {
   NodeWaiting(remaining_deps: Int)
-  NodeAttempting(seq: Int, attempt: Int, pid: Pid, timer: Option(Timer))
-  NodeCompensating(seq: Int, attempt: Int, pid: Pid, timer: Option(Timer))
+  /// `started_at` is `ffi.monotonic_time()` when this attempt/compensation
+  /// began, so `emit_step_stopped`/`emit_compensation_stopped` can report
+  /// its real elapsed duration instead of a hard-coded `0`.
+  NodeAttempting(
+    seq: Int,
+    attempt: Int,
+    pid: Pid,
+    timer: Option(Timer),
+    started_at: Int,
+  )
+  NodeCompensating(
+    seq: Int,
+    attempt: Int,
+    pid: Pid,
+    timer: Option(Timer),
+    started_at: Int,
+  )
   NodeRetryScheduled(seq: Int, attempt: Int)
+  /// A scheduled retry's backoff has fired (or an immediate `Retry` was
+  /// decided) and the node is ready to attempt again, but is waiting for
+  /// `admit` to grant it a concurrency slot — exactly like a fresh node
+  /// whose dependencies just became ready, so a retry can never itself
+  /// exceed `max_concurrency`.
+  NodeReadyForRetry(attempt: Int)
   NodeDone
   NodeFailedTerminal
   NodeSkipped
-  NodeUndoing(seq: Int, pid: Pid, timer: Option(Timer))
+  NodeUndoing(seq: Int, pid: Pid, timer: Option(Timer), started_at: Int)
   NodeUndone
   NodeUndoFailedTerminal
   /// A task was killed (settle deadline, or an unrelated fatal condition)
@@ -208,6 +256,12 @@ type RunState(o, e, u) {
     journal: List(JournalEntry(u)),
     phase: RunPhase(e, u),
     start_time: Int,
+    // Every step whose attempt was killed by its own `timeout`, recorded
+    // the moment the kill happens — independent of `phase`/`Settlement`,
+    // since the run may still be `PhaseRunning` (a Retry/Continue decision
+    // can let it proceed to `Completed`) when this needs to be remembered.
+    // See `Outcome.Completed`'s doc comment.
+    timed_out_attempts: List(StepAddress),
   )
 }
 
@@ -267,6 +321,14 @@ pub fn start(
         ready,
       )
     })
+  // This wait is a startup smoke-check, not the caller's actual failure
+  // path: whether or not `ready` arrives in time, `saga/execution.start`
+  // separately waits on `control_subject_out` (with its own bounded
+  // timeout) before handing back a usable `Execution`, and reports
+  // `ExecutionLost` if the coordinator never gets that far. A timeout here
+  // is therefore not silently swallowed overall — it is handled one level
+  // up, where a `Result` can actually be returned (`#(Pid, Int)` here has
+  // no room for one).
   let _ = process.receive(ready, 5000)
   #(pid, run_id)
 }
@@ -334,6 +396,7 @@ fn run(
           journal: [],
           phase: PhaseRunning,
           start_time: start_time,
+          timed_out_attempts: [],
         )
       let admitted = admit(initial)
       loop(admitted, fetch_output, result_subject)
@@ -372,8 +435,16 @@ fn loop(
           case fetch_output() {
             ffi.Rescued(output) -> {
               cancel_deadline_timer(state)
-              emit_run_stopped(state, Completed(output))
-              process.send(result_subject, Completed(output))
+              // `timed_out_attempts` is accumulated oldest-last (each new
+              // one is prepended); reverse so callers see them in the
+              // order they occurred.
+              let unknown_effects = list.reverse(state.timed_out_attempts)
+              let outcome = case unknown_effects {
+                [] -> Completed(output)
+                _ -> CompletedWithUnknownEffects(output, unknown_effects)
+              }
+              emit_run_stopped(state, outcome)
+              process.send(result_subject, outcome)
             }
             ffi.Raised(class, reason) ->
               begin_settling(
@@ -420,13 +491,29 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
     PhaseRollingBack(trigger, settlement) ->
       case rollback_complete(state) {
         False -> None
-        True ->
+        True -> {
+          // Every step-timeout kill recorded during this run (regardless
+          // of when it happened, or what its recovery decision was) is
+          // folded into `interrupted` here — the run did not, in the end,
+          // complete cleanly, so this settlement is exactly where callers
+          // already look for "effects never journaled or undone". See
+          // `Outcome.Completed`'s doc comment for the parallel case where
+          // the run *did* complete.
+          let settlement =
+            Settlement(
+              ..settlement,
+              interrupted: list.append(
+                list.reverse(state.timed_out_attempts),
+                settlement.interrupted,
+              ),
+            )
           Some(case trigger {
             TriggerFailure(cause) -> Failed(cause, settlement)
             TriggerUnresolved(step, evidence) ->
               Unresolved(step, evidence, settlement)
             TriggerCancel(reason) -> Cancelled(reason, settlement)
           })
+        }
       }
   }
 }
@@ -466,16 +553,29 @@ fn admit(state: RunState(o, e, u)) -> RunState(o, e, u) {
       case state.running >= state.max_concurrency {
         True -> state
         False -> {
+          // A node ready to retry (its backoff already fired, or an
+          // immediate `Retry` was just decided) is exactly as eligible as
+          // a node whose dependencies just became ready — neither may
+          // start ahead of `max_concurrency`, and this is the one place
+          // that bound is enforced, so a fired retry is granted a slot
+          // here rather than at `RetryFire`/decision time.
           let ready_ids =
             list.filter(state.order, fn(id) {
               case dict.get(state.state, id) {
                 Ok(NodeWaiting(0)) -> True
+                Ok(NodeReadyForRetry(_)) -> True
                 _ -> False
               }
             })
           case ready_ids {
             [] -> state
-            [next, ..] -> admit(start_attempt(state, next, 1))
+            [next, ..] -> {
+              let attempt_number = case dict.get(state.state, next) {
+                Ok(NodeReadyForRetry(attempt)) -> attempt
+                _ -> 1
+              }
+              admit(start_attempt(state, next, attempt_number))
+            }
           }
         }
       }
@@ -498,10 +598,10 @@ fn start_attempt(
       case ffi.rescue(body) {
         ffi.Rescued(result) ->
           process.send(control, AttemptDone(node_id, seq, result))
-        ffi.Raised(_class, reason) ->
+        ffi.Raised(class, reason) ->
           process.send(
             control,
-            TaskCrashed(node_id, seq, node.Crash(ffi.ErrorClass, reason)),
+            TaskCrashed(node_id, seq, node.Crash(class, reason)),
           )
       }
     })
@@ -517,7 +617,7 @@ fn start_attempt(
     state: dict.insert(
       state.state,
       node_id,
-      NodeAttempting(seq, attempt_number, pid, timer),
+      NodeAttempting(seq, attempt_number, pid, timer, ffi.monotonic_time()),
     ),
   )
 }
@@ -606,10 +706,12 @@ fn find_node_for_pid(
   |> list.find_map(fn(entry) {
     let #(node_id, node_state) = entry
     case node_state {
-      NodeAttempting(seq, _attempt, task_pid, _timer) if task_pid == pid ->
-        Ok(#(node_id, seq))
-      NodeCompensating(seq, _attempt, task_pid, _timer) if task_pid == pid ->
-        Ok(#(node_id, seq))
+      NodeAttempting(seq, _attempt, task_pid, _timer, _started_at)
+        if task_pid == pid
+      -> Ok(#(node_id, seq))
+      NodeCompensating(seq, _attempt, task_pid, _timer, _started_at)
+        if task_pid == pid
+      -> Ok(#(node_id, seq))
       _ -> Error(Nil)
     }
   })
@@ -620,7 +722,7 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
   case reason {
     process.Normal -> "normal"
     process.Killed -> "killed"
-    process.Abnormal(_) -> "abnormal"
+    process.Abnormal(reason) -> "abnormal: " <> string.inspect(reason)
   }
 }
 
@@ -634,9 +736,9 @@ fn current_attempt_seq(state: RunState(o, e, u), node_id: Int) -> Option(Int) {
 
 fn cancel_node_timer(state: RunState(o, e, u), node_id: Int) -> Nil {
   case dict.get(state.state, node_id) {
-    Ok(NodeAttempting(_, _, _, Some(timer)))
-    | Ok(NodeCompensating(_, _, _, Some(timer)))
-    | Ok(NodeUndoing(_, _, Some(timer))) -> {
+    Ok(NodeAttempting(_, _, _, Some(timer), _))
+    | Ok(NodeCompensating(_, _, _, Some(timer), _))
+    | Ok(NodeUndoing(_, _, Some(timer), _)) -> {
       let _ = process.cancel_timer(timer)
       Nil
     }
@@ -695,8 +797,9 @@ fn commit_success(
 ) -> RunState(o, e, u) {
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let attempt_number = attempt_number_for(state, node_id)
+  let duration = duration_since_started(state, node_id)
   let undo = commit()
-  emit_step_stopped(state, n.address, attempt_number, step_kind)
+  emit_step_stopped(state, n.address, attempt_number, step_kind, duration)
   let entry = JournalEntry(node_id: node_id, address: n.address, undo: undo)
   let dependent_ids = dict.get(state.dependents, node_id) |> option_unwrap_list
   let state =
@@ -730,6 +833,23 @@ fn attempt_number_for(state: RunState(o, e, u), node_id: Int) -> Int {
   }
 }
 
+/// The elapsed time since `node_id`'s current attempt, compensation, or
+/// undo began, for real `step_stopped`/`compensation_stopped`/
+/// `undo_stopped` durations instead of a hard-coded `0`. `0` here (rather
+/// than a lookup failure) only if `node_id` is already out of its
+/// attempting/compensating/undoing state by the time this is read, which
+/// no caller does — every call site reads this before transitioning the
+/// node's state.
+fn duration_since_started(state: RunState(o, e, u), node_id: Int) -> Int {
+  let started_at = case dict.get(state.state, node_id) {
+    Ok(NodeAttempting(_, _, _, _, started_at)) -> started_at
+    Ok(NodeCompensating(_, _, _, _, started_at)) -> started_at
+    Ok(NodeUndoing(_, _, _, started_at)) -> started_at
+    _ -> ffi.monotonic_time()
+  }
+  ffi.monotonic_time() - started_at
+}
+
 fn option_unwrap_list(result: Result(List(a), Nil)) -> List(a) {
   case result {
     Ok(values) -> values
@@ -759,7 +879,7 @@ fn start_recovery_from_returned(
   failure: AttemptFailure(e),
   prepare_recovery: fn(Attempt) -> fn() -> ErasedRecovery(e, u),
 ) -> RunState(o, e, u) {
-  let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer)) =
+  let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer, _started_at)) =
     dict.get(state.state, node_id)
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let attempt =
@@ -792,10 +912,10 @@ fn spawn_recovery(
       case ffi.rescue(body) {
         ffi.Rescued(recovery) ->
           process.send(control, RecoveryDone(node_id, seq, recovery))
-        ffi.Raised(_class, reason) ->
+        ffi.Raised(class, reason) ->
           process.send(
             control,
-            TaskCrashed(node_id, seq, node.Crash(ffi.ErrorClass, reason)),
+            TaskCrashed(node_id, seq, node.Crash(class, reason)),
           )
       }
     })
@@ -810,7 +930,7 @@ fn spawn_recovery(
     state: dict.insert(
       state.state,
       node_id,
-      NodeCompensating(seq, attempt_number, pid, timer),
+      NodeCompensating(seq, attempt_number, pid, timer, ffi.monotonic_time()),
     ),
   )
 }
@@ -825,14 +945,21 @@ fn handle_recovery_done(
     False -> state
     True -> {
       cancel_node_timer(state, node_id)
-      let assert Ok(NodeCompensating(_seq, attempt_number, _pid, _timer)) =
-        dict.get(state.state, node_id)
+      let assert Ok(NodeCompensating(
+        _seq,
+        attempt_number,
+        _pid,
+        _timer,
+        _started_at,
+      )) = dict.get(state.state, node_id)
       let assert Ok(n) = dict.get(state.nodes, node_id)
+      let duration = duration_since_started(state, node_id)
       emit_compensation_stopped(
         state,
         n.address,
         attempt_number,
         decision_kind(recovery),
+        duration,
       )
       let settling_or_rolling_back = case state.phase {
         PhaseRunning -> False
@@ -846,7 +973,7 @@ fn handle_recovery_done(
         // is simply not retried, and this fact is recorded as a sibling
         // failure using whatever the last observed failure was.
         ERetry, True | ERetryAfter(_), True ->
-          fail_terminal_as_sibling(state, node_id)
+          fail_retry_superseded_as_sibling(state, node_id)
         ERetry, False ->
           case attempt_number < n.max_attempts {
             True -> {
@@ -903,12 +1030,20 @@ fn decision_kind(recovery: ErasedRecovery(e, u)) -> observation.DecisionKind {
   }
 }
 
+/// An immediate `Retry` decision: the node is marked ready and handed to
+/// `admit`, which starts it only if a concurrency slot is free — never
+/// unconditionally, so an immediate retry can no more exceed
+/// `max_concurrency` than a fresh node's first attempt can.
 fn retry_now(
   state: RunState(o, e, u),
   node_id: Int,
   next_attempt: Int,
 ) -> RunState(o, e, u) {
-  start_attempt(state, node_id, next_attempt) |> admit
+  RunState(
+    ..state,
+    state: dict.insert(state.state, node_id, NodeReadyForRetry(next_attempt)),
+  )
+  |> admit
 }
 
 fn retry_after(
@@ -924,16 +1059,28 @@ fn retry_after(
   let seq = ffi.unique_integer()
   let control = state.control
   process.send_after(control, delay, RetryFire(node_id, seq))
-  RunState(
-    ..state,
-    state: dict.insert(
-      state.state,
-      node_id,
-      NodeRetryScheduled(seq, next_attempt),
-    ),
-  )
+  let state =
+    RunState(
+      ..state,
+      state: dict.insert(
+        state.state,
+        node_id,
+        NodeRetryScheduled(seq, next_attempt),
+      ),
+    )
+  // The attempt that just failed already freed its `running` slot (the
+  // caller decremented it before calling `retry_after`); this node itself
+  // won't reclaim that slot until its backoff fires, so nudge `admit` now
+  // in case a *different* ready node can use the freed slot in the
+  // meantime, rather than leaving it idle until `RetryFire`.
+  admit(state)
 }
 
+/// The backoff timer for a `RetryAfter` decision fired: the node becomes
+/// ready, and — exactly like `retry_now` — is hedged through `admit` rather
+/// than started unconditionally, so a fired retry can never itself exceed
+/// `max_concurrency`; it simply joins the ready queue and waits its turn
+/// for a free slot like any other ready node.
 fn handle_retry_fire(
   state: RunState(o, e, u),
   node_id: Int,
@@ -941,7 +1088,15 @@ fn handle_retry_fire(
 ) -> RunState(o, e, u) {
   case dict.get(state.state, node_id) {
     Ok(NodeRetryScheduled(current_seq, next_attempt)) if current_seq == seq ->
-      start_attempt(state, node_id, next_attempt) |> admit
+      RunState(
+        ..state,
+        state: dict.insert(
+          state.state,
+          node_id,
+          NodeReadyForRetry(next_attempt),
+        ),
+      )
+      |> admit
     _ -> state
   }
 }
@@ -988,7 +1143,7 @@ fn start_crash_recovery(
   prepare: fn(AttemptFailure(e), Attempt) -> fn() -> ErasedRecovery(e, u),
   failure: AttemptFailure(e),
 ) -> RunState(o, e, u) {
-  let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer)) =
+  let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer, _started_at)) =
     dict.get(state.state, node_id)
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let attempt =
@@ -1011,7 +1166,14 @@ fn start_crash_recovery(
 /// decider it is asked to decide on a `TimedOut` failure, otherwise the
 /// failure is terminal. This never touches `settlement.interrupted` — that
 /// is reserved for tasks still running when the *settle* window closes, not
-/// for a step's own configured timeout.
+/// for a step's own configured timeout — but the killed attempt is always
+/// recorded into `state.timed_out_attempts` regardless of what the
+/// recovery decider (if any) subsequently decides: even a `Retry` or
+/// `Continue` that lets the run proceed leaves this one attempt's effect
+/// permanently unknown, and that fact must survive to the final `Outcome`
+/// (see `Outcome.Completed`'s doc comment; a terminal failure instead
+/// carries it via `settlement.interrupted`, folded in by
+/// `fold_timed_out_attempts_into_settlement`).
 fn handle_step_timeout_fired(
   state: RunState(o, e, u),
   node_id: Int,
@@ -1021,7 +1183,7 @@ fn handle_step_timeout_fired(
     False -> state
     True ->
       case dict.get(state.state, node_id) {
-        Ok(NodeAttempting(_seq, attempt_number, pid, _timer)) -> {
+        Ok(NodeAttempting(_seq, attempt_number, pid, _timer, _started_at)) -> {
           process.kill(pid)
           let assert Ok(n) = dict.get(state.nodes, node_id)
           let state =
@@ -1032,8 +1194,15 @@ fn handle_step_timeout_fired(
                 node_id,
                 // Bump to a fresh (unreachable) seq so a stray late message
                 // from the killed task cannot be mistaken for this attempt.
-                NodeAttempting(ffi.unique_integer(), attempt_number, pid, None),
+                NodeAttempting(
+                  ffi.unique_integer(),
+                  attempt_number,
+                  pid,
+                  None,
+                  ffi.monotonic_time(),
+                ),
               ),
+              timed_out_attempts: [n.address, ..state.timed_out_attempts],
             )
           case n.prepare_crash_recovery {
             None ->
@@ -1064,7 +1233,7 @@ fn handle_cleanup_timeout_fired(
     False -> state
     True ->
       case dict.get(state.state, node_id) {
-        Ok(NodeCompensating(_seq, _attempt, pid, _timer)) -> {
+        Ok(NodeCompensating(_seq, _attempt, pid, _timer, _started_at)) -> {
           process.kill(pid)
           let compensation_failure =
             CompensationTimedOut(node_address(state, node_id))
@@ -1132,7 +1301,8 @@ fn fail_terminal(
 ) -> RunState(o, e, u) {
   let address = node_address(state, node_id)
   let attempt_number = attempt_number_for(state, node_id)
-  emit_step_stopped(state, address, attempt_number, step_kind)
+  let duration = duration_since_started(state, node_id)
+  emit_step_stopped(state, address, attempt_number, step_kind, duration)
   let cause = case failure {
     Returned(error) -> StepFailed(address, error)
     Crashed(crash) -> StepCrashed(address, crash)
@@ -1159,13 +1329,19 @@ fn fail_terminal(
   }
 }
 
-fn fail_terminal_as_sibling(
+/// A `Retry`/`RetryAfter` decision arrived after settling had already begun
+/// for a different trigger: the node cannot be retried (it would race the
+/// settle window), so its last observed failure is recorded as a sibling
+/// failure — as `RetrySuperseded`, since its attempt budget was never
+/// necessarily exhausted; that is a separate condition from
+/// `RetryLimitReached`.
+fn fail_retry_superseded_as_sibling(
   state: RunState(o, e, u),
   node_id: Int,
 ) -> RunState(o, e, u) {
   let address = node_address(state, node_id)
   let assert Ok(last) = dict.get(state.last_failure, node_id)
-  let cause = RetryLimitReached(address, last)
+  let cause = RetrySuperseded(address, last)
   let state =
     RunState(
       ..state,
@@ -1248,6 +1424,7 @@ fn begin_settling(
           case dict.get(state.state, id) {
             Ok(NodeWaiting(_)) -> True
             Ok(NodeRetryScheduled(..)) -> True
+            Ok(NodeReadyForRetry(..)) -> True
             _ -> False
           }
         })
@@ -1329,8 +1506,8 @@ fn handle_settle_fired(
         |> list.filter_map(fn(entry) {
           let #(node_id, node_state) = entry
           case node_state {
-            NodeAttempting(_, _, pid, _) -> Ok(#(node_id, pid))
-            NodeCompensating(_, _, pid, _) -> Ok(#(node_id, pid))
+            NodeAttempting(_, _, pid, _, _) -> Ok(#(node_id, pid))
+            NodeCompensating(_, _, pid, _, _) -> Ok(#(node_id, pid))
             _ -> Error(Nil)
           }
         })
@@ -1339,6 +1516,15 @@ fn handle_settle_fired(
           let #(node_id, pid) = entry
           process.kill(pid)
           let address = node_address(acc, node_id)
+          let attempt_number = attempt_number_for(acc, node_id)
+          let duration = duration_since_started(acc, node_id)
+          emit_step_stopped(
+            acc,
+            address,
+            attempt_number,
+            observation.AttemptInterrupted,
+            duration,
+          )
           let acc =
             RunState(
               ..acc,
@@ -1405,14 +1591,10 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
                   process.send(control, UndoDone(node_id, seq, UndoOk))
                 ffi.Rescued(Error(error)) ->
                   process.send(control, UndoDone(node_id, seq, UndoErr(error)))
-                ffi.Raised(_class, reason) ->
+                ffi.Raised(class, reason) ->
                   process.send(
                     control,
-                    UndoDone(
-                      node_id,
-                      seq,
-                      UndoCrash(node.Crash(ffi.ErrorClass, reason)),
-                    ),
+                    UndoDone(node_id, seq, UndoCrash(node.Crash(class, reason))),
                   )
               }
             })
@@ -1428,7 +1610,7 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
             state: dict.insert(
               state.state,
               node_id,
-              NodeUndoing(seq, pid, timer),
+              NodeUndoing(seq, pid, timer, ffi.monotonic_time()),
             ),
           )
         }
@@ -1452,7 +1634,9 @@ fn handle_undo_done(
   outcome: UndoOutcome(u),
 ) -> RunState(o, e, u) {
   case dict.get(state.state, node_id) {
-    Ok(NodeUndoing(current_seq, _pid, timer)) if current_seq == seq -> {
+    Ok(NodeUndoing(current_seq, _pid, timer, _started_at))
+      if current_seq == seq
+    -> {
       case timer {
         None -> Nil
         Some(t) -> {
@@ -1462,12 +1646,13 @@ fn handle_undo_done(
       }
       let address = node_address(state, node_id)
       let attempt_number = 1
+      let duration = duration_since_started(state, node_id)
       let new_state = case outcome {
         UndoOk -> NodeUndone
         UndoErr(_) -> NodeUndoFailedTerminal
         UndoCrash(_) -> NodeUndoFailedTerminal
       }
-      emit_undo_stopped(state, address, undo_outcome_kind(outcome))
+      emit_undo_stopped(state, address, undo_outcome_kind(outcome), duration)
       let state =
         RunState(..state, state: dict.insert(state.state, node_id, new_state))
       let _ = attempt_number
@@ -1500,10 +1685,13 @@ fn handle_undo_timeout(
   seq: Int,
 ) -> RunState(o, e, u) {
   case dict.get(state.state, node_id) {
-    Ok(NodeUndoing(current_seq, pid, _timer)) if current_seq == seq -> {
+    Ok(NodeUndoing(current_seq, pid, _timer, _started_at))
+      if current_seq == seq
+    -> {
       process.kill(pid)
       let address = node_address(state, node_id)
-      emit_undo_stopped(state, address, observation.UndoTimedOutKind)
+      let duration = duration_since_started(state, node_id)
+      emit_undo_stopped(state, address, observation.UndoTimedOutKind, duration)
       let state =
         RunState(
           ..state,
@@ -1554,9 +1742,10 @@ fn build_progress(state: RunState(o, e, u)) -> Progress {
       let assert Ok(n) = dict.get(state.nodes, id)
       let node_state = case dict.get(state.state, id) {
         Ok(NodeWaiting(_)) -> Waiting
-        Ok(NodeAttempting(_, attempt, _, _)) -> Attempting(attempt)
-        Ok(NodeCompensating(_, attempt, _, _)) -> Compensating(attempt)
+        Ok(NodeAttempting(_, attempt, _, _, _)) -> Attempting(attempt)
+        Ok(NodeCompensating(_, attempt, _, _, _)) -> Compensating(attempt)
         Ok(NodeRetryScheduled(_, next_attempt)) -> RetryScheduled(next_attempt)
+        Ok(NodeReadyForRetry(next_attempt)) -> RetryScheduled(next_attempt)
         Ok(NodeDone) -> Succeeded
         Ok(NodeFailedTerminal) -> FailedStep
         Ok(NodeInterrupted) -> Interrupted
@@ -1605,7 +1794,12 @@ fn emit_run_stopped(
 ) -> Nil {
   let duration = ffi.monotonic_time() - state.start_time
   let #(undone, undo_failures, interrupted) = case outcome {
-    Completed(_) -> #(0, 0, 0)
+    Completed(_output) -> #(0, 0, 0)
+    CompletedWithUnknownEffects(_output, unknown_effects) -> #(
+      0,
+      0,
+      list.length(unknown_effects),
+    )
     Failed(_, settlement)
     | Cancelled(_, settlement)
     | Unresolved(_, _, settlement) -> #(
@@ -1616,6 +1810,7 @@ fn emit_run_stopped(
   }
   let kind = case outcome {
     Completed(_) -> observation.OutcomeCompleted
+    CompletedWithUnknownEffects(_, _) -> observation.OutcomeCompleted
     Failed(_, _) -> observation.OutcomeFailed
     Cancelled(_, _) -> observation.OutcomeCancelled
     Unresolved(_, _, _) -> observation.OutcomeUnresolved
@@ -1664,12 +1859,13 @@ fn emit_step_stopped(
   address: StepAddress,
   attempt: Int,
   result: observation.AttemptKind,
+  duration: Int,
 ) -> Nil {
   let event = observation.step_stopped()
   let _ =
     sinal.emit(
       event,
-      observation.StepStopMeasurements(duration: 0),
+      observation.StepStopMeasurements(duration: duration),
       observation.StepStopMetadata(
         workflow: state.workflow_name,
         run: state.run_id,
@@ -1686,12 +1882,13 @@ fn emit_compensation_stopped(
   address: StepAddress,
   attempt: Int,
   decision: observation.DecisionKind,
+  duration: Int,
 ) -> Nil {
   let event = observation.compensation_stopped()
   let _ =
     sinal.emit(
       event,
-      observation.StepStopMeasurements(duration: 0),
+      observation.StepStopMeasurements(duration: duration),
       observation.CompensationMetadata(
         workflow: state.workflow_name,
         run: state.run_id,
@@ -1707,12 +1904,13 @@ fn emit_undo_stopped(
   state: RunState(o, e, u),
   address: StepAddress,
   result: observation.UndoKind,
+  duration: Int,
 ) -> Nil {
   let event = observation.undo_stopped()
   let _ =
     sinal.emit(
       event,
-      observation.StepStopMeasurements(duration: 0),
+      observation.StepStopMeasurements(duration: duration),
       observation.UndoMetadata(
         workflow: state.workflow_name,
         run: state.run_id,

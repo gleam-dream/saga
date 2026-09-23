@@ -313,3 +313,23 @@ pub fn with_run(
 
 @external(erlang, "probe_ffi", "ensure")
 fn ensure(body: fn() -> a, after: fn() -> Nil) -> a
+
+// ---------------------------------------------------------------------------
+// Mailbox and native-exception probes
+// ---------------------------------------------------------------------------
+
+/// The calling process's own mailbox length. Used to assert that
+/// `run`/`await` never leak a coordinator monitor's `Down` message into the
+/// caller's mailbox.
+@external(erlang, "probe_ffi", "mailbox_length")
+pub fn mailbox_length() -> Int
+
+/// Drains every message currently queued in the calling process's mailbox.
+@external(erlang, "probe_ffi", "flush_mailbox")
+pub fn flush_mailbox() -> Nil
+
+/// Raises a native `throw` (not `error`/`exit`), for asserting a step
+/// body's crash class is reported as `ThrowClass` rather than folded into
+/// `ErrorClass`.
+@external(erlang, "probe_ffi", "native_throw")
+pub fn native_throw() -> a

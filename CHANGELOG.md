@@ -25,6 +25,32 @@ increments toward the first local-execution release.
   modules.
 - `CAPABILITIES.md`: the full implemented/deferred/excluded capability
   inventory against the design's retained scope.
+- Orphan / unreachable-output rejection at `define` time: a step whose
+  output is never consumed by the workflow's declared output is now
+  reported as `DefinitionError.OrphanStep`, naming the step, instead of
+  silently never running.
+- Scoped embed addresses: `saga.embed` now pushes a nested scope (the
+  embedded workflow's own name) for every step it introduces, so repeated
+  `embed` calls of the same workflow (or a name collision with an outer
+  step) are addressed distinctly (e.g. `inner/charge`, `inner/charge#2`)
+  instead of colliding at the root scope.
+- `saga.DefinitionError.EmptyAll`: `saga.all([])` no longer panics: an
+  empty list is reported as an ordinary definition error instead.
+- `execution.Outcome.CompletedWithUnknownEffects(output, unknown_effects)`:
+  a new outcome variant for the case a plain `Completed` cannot honestly
+  report — a step whose attempt was killed by its own `timeout` but whose
+  recovery decider chose `Retry`/`RetryAfter`/`Continue` anyway. The killed
+  attempt's own effect is still unknown and was never journaled or undone,
+  even though the run otherwise completed; existing exhaustive `case`
+  expressions over `Outcome` must add this arm.
+- `execution.Cause.RetrySuperseded(step, last)`: a retry decision refused
+  only because the run had already begun settling for a different trigger
+  is now reported distinctly from `RetryLimitReached` (which means the
+  step's own attempt budget was exhausted).
+- `saga/observation`'s `step_stopped` now reports a settle-sweep kill as
+  `AttemptInterrupted`, and every `step_stopped`/`compensation_stopped`/
+  `undo_stopped` event's `duration` is a real elapsed measurement instead
+  of a hard-coded `0`.
 
 ### Changed
 
@@ -34,6 +60,43 @@ increments toward the first local-execution release.
   finishes rollback, so `progress` never observed a window in which
   `Finishing` could be returned; keeping an unreachable public variant in
   an exhaustive `case` was misleading rather than future-proofing.
+- `execution.start`'s error type changed from `List(ConfigError)` to
+  `RunError`: a coordinator that fails to complete its startup handshake
+  within 5 seconds is now reported as `ExecutionLost` instead of a `let
+assert` panic.
+- `execution.progress` on a run that has already ended now returns
+  `Error(ExecutionEnded)` promptly instead of always timing out.
+
+### Fixed
+
+- A panicking or slow `saga.map` placed between two steps ran unprotected
+  in the coordinator process itself, able to crash the whole run's
+  scheduler (losing rollback) or block cancellation/deadline handling for
+  every run. Both the value read and any pending `map` transform are now
+  deferred into the consuming step's own attempt task, under the same
+  `rescue` as the step body, so a panicking or slow `map` is an ordinary
+  attempt crash/duration.
+- `embed(map_errors(inner))` deadlocked: `map_errors`'s shadow input port
+  dropped the real input's dependency set and accumulated definition
+  errors. Both are now carried through.
+- A `RetryAfter` backoff firing (and an immediate `Retry` decision) could
+  push the number of concurrently-attempting steps above
+  `Config.max_concurrency`, since a fired retry started unconditionally
+  rather than through the normal admission gate. Fired retries now join
+  the ready queue and are admitted like any other node; a node entering
+  backoff also nudges admission so a freed concurrency slot is not left
+  idle until the backoff fires.
+- A monitor `Down` message could leak into the caller's mailbox after
+  `run`/`await` (and, separately, into `define`'s caller's mailbox from
+  an internal orphan-tracking registry) — both are now demonitored/drained
+  before returning.
+- A step body's native `throw` was reported as `ErrorClass` instead of
+  `ThrowClass`; every rescued-crash site now passes through the real
+  crash class. An `Abnormal` exit reason's payload is now included in the
+  formatted crash reason instead of being replaced with the bare word
+  "abnormal".
+- `lifecycle_test.gleam`'s coordinator-kill test no longer polls
+  `process.is_alive` in a sleep loop; it waits on a monitor instead.
 
 ## Increment 2
 

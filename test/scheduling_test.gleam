@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleeunit/should
 import saga
 import saga/execution
@@ -144,3 +145,68 @@ fn int_to_string(value: Int) -> String {
 
 @external(erlang, "erlang", "integer_to_binary")
 fn erlang_integer_to_binary(value: Int) -> String
+
+/// A `RetryAfter` backoff firing must re-enter the ready queue and go
+/// through the same concurrency gate as any other admission — it must
+/// never push the number of concurrently-attempting steps above
+/// `max_concurrency`. Ported from the independent review's REPRO3.
+///
+/// `a` (compensated) and `d` (gated) are admitted first (`max_concurrency:
+/// 2`); `b`/`c` (sharing another gate) stay queued. `a` fails immediately
+/// and schedules a 300ms `RetryAfter`; `d` is released quickly afterwards,
+/// freeing a slot that admission fills with *both* `b` and `c` (only one
+/// other attempt — `a`'s in-flight recovery decision — was occupying a
+/// slot at that moment). By the time the 300ms backoff fires, `b` and `c`
+/// are already both concurrently blocked, holding the run's entire
+/// `max_concurrency: 2` budget: if the fired retry bypassed admission, the
+/// high-water mark would reach 3.
+pub fn retry_after_backoff_honors_max_concurrency_test() {
+  let dgate = probe.new_gate()
+  let gate = probe.new_gate()
+  let counter = probe.new_counter()
+  let gated = fn(name: String, g: probe.Gate) {
+    saga.step(name, fn(x: Int) -> Result(Int, Nil) {
+      probe.counter_enter(counter)
+      probe.enter(g)
+      probe.counter_leave(counter)
+      Ok(x)
+    })
+  }
+  let assert Ok(wf) =
+    saga.define("rc", fn(input) {
+      let a =
+        input
+        |> saga.perform(
+          saga.step("a", fn(_x: Int) -> Result(Int, Nil) {
+            probe.counter_enter(counter)
+            probe.counter_leave(counter)
+            Error(Nil)
+          })
+          |> saga.compensate(max_attempts: 2, with: fn(_i, _f, attempt) {
+            case attempt.number {
+              1 -> saga.RetryAfter(300)
+              _ -> saga.Continue(0, saga.NoUndo)
+            }
+          }),
+        )
+      let d = input |> saga.perform(gated("d", dgate))
+      let b = input |> saga.perform(gated("b", gate))
+      let c = input |> saga.perform(gated("c", gate))
+      saga.all([a, d, b, c])
+    })
+  let cfg = execution.Config(..execution.config(), max_concurrency: 2)
+
+  probe.with_run(wf, 1, cfg, fn(exec) {
+    let assert Ok(_pid) = probe.wait_entered(dgate, 2000)
+    process.sleep(50)
+    probe.open(dgate)
+    process.sleep(500)
+    probe.high_water(counter) |> should.equal(2)
+
+    probe.open(gate)
+    probe.open(gate)
+    let assert Ok(execution.Completed(_)) = execution.await(exec, 3000)
+    probe.high_water(counter) |> should.equal(2)
+    Nil
+  })
+}

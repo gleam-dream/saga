@@ -5,7 +5,9 @@
     schedulers_online/0,
     unique_integer/0,
     monotonic_time/0,
-    system_time/0
+    system_time/0,
+    put_flag/1,
+    check_flag/1
 ]).
 
 %% Runs `Fun` and calls back into exactly one of the supplied continuations:
@@ -39,3 +41,21 @@ monotonic_time() ->
 
 system_time() ->
     erlang:system_time(millisecond).
+
+%% Sets a boolean flag in the *calling process's* own process dictionary,
+%% keyed by `Key` (an opaque per-instance reference, never a shared atom, so
+%% two unrelated flags can never collide). Used for purely local,
+%% no-mailbox-message state, such as "has this Execution's outcome already
+%% been consumed" — a message-based flag would otherwise leave a stray
+%% message in the owning process's mailbox forever whenever the flag is
+%% never subsequently checked.
+put_flag(Key) ->
+    erlang:put(Key, true),
+    nil.
+
+%% Reads the flag set by `put_flag/1`, leaving it set; `false` if it was
+%% never set. Only ever called by the same process that could have called
+%% `put_flag/1` (process dictionaries are per-process), so no cross-process
+%% synchronization is implied or needed.
+check_flag(Key) ->
+    erlang:get(Key) =:= true.

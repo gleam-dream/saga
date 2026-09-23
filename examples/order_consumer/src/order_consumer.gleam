@@ -175,6 +175,9 @@ fn describe_cause(cause: execution.Cause(domain.CheckoutError)) -> String {
     execution.StepTimedOut(step) -> saga.address_to_string(step) <> " timed out"
     execution.RetryLimitReached(step, _last) ->
       saga.address_to_string(step) <> " exhausted its retry budget"
+    execution.RetrySuperseded(step, _last) ->
+      saga.address_to_string(step)
+      <> " could not retry: the run was already settling"
     execution.OutputCrashed(_crash) -> "an output transform crashed"
     execution.DeadlineExceeded -> "the run's deadline was exceeded"
     execution.DefinitionChanged -> "the workflow builder was nondeterministic"

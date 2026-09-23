@@ -21,8 +21,10 @@
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import saga.{type Workflow}
 import saga/internal/coordinator
+import saga/internal/ffi
 
 /// Bounds and pacing for one run.
 pub type Config {
@@ -108,6 +110,11 @@ pub type Cause(e) {
   StepCrashed(step: StepAddress, crash: Crash)
   StepTimedOut(step: StepAddress)
   RetryLimitReached(step: StepAddress, last: saga.AttemptFailure(e))
+  /// A `Retry`/`RetryAfter` decision was refused because settling had
+  /// already begun for a different, unrelated trigger, not because this
+  /// step's own attempt budget was exhausted — distinct from
+  /// `RetryLimitReached` for that reason.
+  RetrySuperseded(step: StepAddress, last: saga.AttemptFailure(e))
   OutputCrashed(crash: Crash)
   DeadlineExceeded
   DefinitionChanged
@@ -157,8 +164,21 @@ pub type Settlement(e, u) {
 /// untouched. `Cancelled`'s settlement follows the same rules as `Failed`'s:
 /// completed steps are undone, and interrupted or not-undoable effects are
 /// listed rather than claimed reversed.
+///
+/// `CompletedWithUnknownEffects` is `Completed`'s counterpart for the one
+/// case a plain successful output cannot honestly report: a step whose
+/// attempt was killed by its own `timeout`, but whose recovery decider
+/// chose `Retry`/`RetryAfter`/`Continue` anyway, letting the run reach a
+/// normal output. That step's *killed* attempt's own effect is still
+/// unknown and was never journaled or undone — only the *replacement*
+/// attempt (the retry, or `Continue`'s supplied output) is known-good. Kept
+/// as its own variant (never an always-present field on `Completed`) so a
+/// `case` matching only `Completed` on this closed type must be revisited
+/// once any step declares a `timeout`, rather than silently dropping the
+/// uncertainty. `unknown_effects` is never empty on this variant.
 pub type Outcome(o, e, u) {
   Completed(output: o)
+  CompletedWithUnknownEffects(output: o, unknown_effects: List(StepAddress))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
   Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
@@ -215,12 +235,22 @@ pub type AwaitError {
 
 /// A started run. Only the process that called `start` may `await` it.
 ///
-/// `await`'s monitor on the coordinator is what makes `AlreadyAwaited` and
-/// `Lost` distinguishable after the fact: the coordinator always sends the
-/// outcome before it exits, and message order from one process to another
-/// is preserved, so the owner's `result` mailbox always has the outcome
-/// waiting (or already consumed) strictly before the monitor's `Down`
-/// message for a normal exit could arrive.
+/// `await`'s monitor on the coordinator is what makes `Lost` observable: if
+/// the coordinator is killed before it can send an outcome, the monitor's
+/// `Down` is the only signal that will ever arrive. Once an outcome *has*
+/// been consumed, though, the monitor has served its purpose and is
+/// demonitored (with `[flush]`, via `process.demonitor_process`) right
+/// away — otherwise its `Down` message for the coordinator's (now
+/// imminent, always-normal) exit would sit in the owner's mailbox forever,
+/// since nothing else ever consumes it. `already_awaited_key` identifies a
+/// boolean flag in the owner's own process dictionary (see
+/// `saga/internal/ffi.put_flag`/`check_flag`) — deliberately *not* a
+/// `Subject`-based marker, which would have the same mailbox-leak problem
+/// as the monitor itself whenever the flag is set but never subsequently
+/// checked (an `Execution` that is awaited once and then simply dropped,
+/// the common case) — so a second `await` can report `AlreadyAwaited`
+/// without needing the monitor to still be armed, and without leaving
+/// anything behind in the owner's mailbox either way.
 pub opaque type Execution(o, e, u) {
   Execution(
     pid: Pid,
@@ -229,7 +259,16 @@ pub opaque type Execution(o, e, u) {
     monitor: process.Monitor,
     control: Subject(coordinator.Control(o, e, u)),
     result: Subject(coordinator.Outcome(o, e, u)),
+    already_awaited_key: Int,
   )
+}
+
+fn mark_already_awaited(execution: Execution(o, e, u)) -> Nil {
+  ffi.put_flag(execution.already_awaited_key)
+}
+
+fn was_already_awaited(execution: Execution(o, e, u)) -> Bool {
+  ffi.check_flag(execution.already_awaited_key)
 }
 
 /// Runs `workflow` with `input` to completion, validating `config` first.
@@ -240,7 +279,7 @@ pub fn run(
   config: Config,
 ) -> Result(Outcome(o, e, u), RunError) {
   case start(workflow, input, config) {
-    Error(errors) -> Error(InvalidConfig(errors))
+    Error(error) -> Error(error)
     Ok(execution) ->
       case await_forever(execution) {
         Ok(outcome) -> Ok(outcome)
@@ -255,13 +294,21 @@ pub fn run(
 }
 
 /// Starts a run without blocking, returning an `Execution` handle. Only the
-/// calling process may `await` it.
+/// calling process may `await` it. Returns `Error(InvalidConfig(_))` if
+/// `config` fails `validate`, or `Error(ExecutionLost(_))` if the
+/// coordinator process fails to complete its startup handshake within 5
+/// seconds (it should not normally take anywhere near that long; this
+/// guards against a wedged or unschedulable coordinator rather than
+/// reporting it as a caller configuration error).
 pub fn start(
   workflow: Workflow(i, o, e, u),
   input: i,
   config: Config,
-) -> Result(Execution(o, e, u), List(ConfigError)) {
-  use validated <- result_try(validate(config))
+) -> Result(Execution(o, e, u), RunError) {
+  use validated <- result_try(case validate(config) {
+    Ok(validated) -> Ok(validated)
+    Error(errors) -> Error(InvalidConfig(errors))
+  })
   let owner = process.self()
   let result_subject = process.new_subject()
   let control_subject_out = process.new_subject()
@@ -277,16 +324,27 @@ pub fn start(
       result_subject: result_subject,
       control_subject_out: control_subject_out,
     )
-  let assert Ok(control) = process.receive(control_subject_out, 5000)
-  let monitor = process.monitor(pid)
-  Ok(Execution(
-    pid: pid,
-    run_id: run_id,
-    owner: owner,
-    monitor: monitor,
-    control: control,
-    result: result_subject,
-  ))
+  case process.receive(control_subject_out, 5000) {
+    Error(_) ->
+      Error(
+        ExecutionLost(saga.Crash(
+          saga.ExitClass,
+          "coordinator did not complete its startup handshake within 5000ms",
+        )),
+      )
+    Ok(control) -> {
+      let monitor = process.monitor(pid)
+      Ok(Execution(
+        pid: pid,
+        run_id: run_id,
+        owner: owner,
+        monitor: monitor,
+        control: control,
+        result: result_subject,
+        already_awaited_key: ffi.unique_integer(),
+      ))
+    }
+  }
 }
 
 fn result_try(
@@ -317,18 +375,33 @@ fn await_selector(
   })
 }
 
+/// `signal`'s monitor is always demonitored here, with `[flush]` (see
+/// `process.demonitor_process`), regardless of which branch matched: once
+/// `await`/`await_forever` return, the coordinator has either already
+/// exited or is about to (it always sends its outcome immediately before
+/// exiting), so its `Down` message — due imminently if not already
+/// delivered — would otherwise sit in the owner's mailbox forever after
+/// being observed here. Demonitoring with flush both stops any further
+/// `Down` from arriving and removes one already queued, so a caller that
+/// calls `run`/`await` repeatedly never accumulates stale monitor messages
+/// in its own mailbox.
 fn await_signal(
+  execution: Execution(o, e, u),
   signal: AwaitSignal(o, e, u),
 ) -> Result(Outcome(o, e, u), AwaitError) {
+  process.demonitor_process(execution.monitor)
   case signal {
-    GotOutcome(outcome) -> Ok(to_public_outcome(outcome))
-    // The coordinator always sends the outcome before it exits; a `Down`
-    // observed here (rather than the outcome above) means either no
-    // outcome was ever sent (the coordinator was killed: `Lost`), or this
-    // is a second `await` after the first already consumed the outcome
-    // message and the coordinator has since exited normally
-    // (`AlreadyAwaited`).
-    CoordinatorDown(process.Normal) -> Error(AlreadyAwaited)
+    GotOutcome(outcome) -> {
+      mark_already_awaited(execution)
+      Ok(to_public_outcome(outcome))
+    }
+    // `was_already_awaited` (checked by both `await` and `await_forever`
+    // before this is ever reached) is what normally reports a second
+    // `await`; a `Normal` `Down` observed here instead would mean the
+    // coordinator exited without ever sending an outcome, which the
+    // coordinator's own contract rules out — kept as `Lost` rather than
+    // panicking, since it is cheaper to report defensively than to prove
+    // unreachable.
     CoordinatorDown(reason) ->
       Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
   }
@@ -338,7 +411,7 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
   case reason {
     process.Normal -> "normal"
     process.Killed -> "killed"
-    process.Abnormal(_) -> "abnormal"
+    process.Abnormal(reason) -> "abnormal: " <> string.inspect(reason)
   }
 }
 
@@ -356,9 +429,15 @@ pub fn await(
   case process.self() == execution.owner {
     False -> Error(NotOwner)
     True ->
-      case process.selector_receive(await_selector(execution), milliseconds) {
-        Ok(signal) -> await_signal(signal)
-        Error(_) -> Error(AwaitTimedOut)
+      case was_already_awaited(execution) {
+        True -> Error(AlreadyAwaited)
+        False ->
+          case
+            process.selector_receive(await_selector(execution), milliseconds)
+          {
+            Ok(signal) -> await_signal(execution, signal)
+            Error(_) -> Error(AwaitTimedOut)
+          }
       }
   }
 }
@@ -369,7 +448,14 @@ fn await_forever(
   case process.self() == execution.owner {
     False -> Error(NotOwner)
     True ->
-      await_signal(process.selector_receive_forever(await_selector(execution)))
+      case was_already_awaited(execution) {
+        True -> Error(AlreadyAwaited)
+        False ->
+          await_signal(
+            execution,
+            process.selector_receive_forever(await_selector(execution)),
+          )
+      }
   }
 }
 
@@ -383,17 +469,38 @@ pub fn cancel(execution: Execution(o, e, u)) -> Nil {
   process.send(execution.control, coordinator.CancelRequest)
 }
 
+type ProgressSignal {
+  GotProgress(coordinator.Progress)
+  ProgressCoordinatorDown
+}
+
 /// Synchronously inspects the run's current phase and per-step states.
+/// Once the run has already ended, the coordinator process is gone and
+/// `control` is a dead subject: sending a request to it is a silent no-op,
+/// so without a monitor this would always time out rather than report
+/// `ExecutionEnded` promptly. A short-lived monitor (armed only for this
+/// one call, always demonitored with `[flush]` before returning) races the
+/// reply against the coordinator's exit instead.
 pub fn progress(
   execution: Execution(o, e, u),
   timeout milliseconds: Int,
 ) -> Result(Progress, ProgressError) {
   let reply = process.new_subject()
+  let monitor = process.monitor(execution.pid)
   process.send(execution.control, coordinator.ProgressRequest(reply))
-  case process.receive(reply, milliseconds) {
-    Ok(progress) -> Ok(to_public_progress(progress))
+  let selector =
+    process.new_selector()
+    |> process.select_map(reply, GotProgress)
+    |> process.select_specific_monitor(monitor, fn(_down) {
+      ProgressCoordinatorDown
+    })
+  let outcome = case process.selector_receive(selector, milliseconds) {
+    Ok(GotProgress(progress)) -> Ok(to_public_progress(progress))
+    Ok(ProgressCoordinatorDown) -> Error(ExecutionEnded)
     Error(_) -> Error(ProgressTimedOut)
   }
+  process.demonitor_process(monitor)
+  outcome
 }
 
 /// The coordinator's pid, for monitoring.
@@ -415,6 +522,11 @@ fn to_public_outcome(
 ) -> Outcome(o, e, u) {
   case outcome {
     coordinator.Completed(output) -> Completed(output)
+    coordinator.CompletedWithUnknownEffects(output, unknown_effects) ->
+      CompletedWithUnknownEffects(
+        output,
+        list.map(unknown_effects, saga.address_from_node),
+      )
     coordinator.Failed(cause, settlement) ->
       Failed(to_public_cause(cause), to_public_settlement(settlement))
     coordinator.Unresolved(step, evidence, settlement) ->
@@ -447,6 +559,11 @@ fn to_public_cause(cause: coordinator.Cause(e)) -> Cause(e) {
     coordinator.StepTimedOut(step) -> StepTimedOut(saga.address_from_node(step))
     coordinator.RetryLimitReached(step, last) ->
       RetryLimitReached(
+        saga.address_from_node(step),
+        saga.failure_from_node(last),
+      )
+    coordinator.RetrySuperseded(step, last) ->
+      RetrySuperseded(
         saga.address_from_node(step),
         saga.failure_from_node(last),
       )
