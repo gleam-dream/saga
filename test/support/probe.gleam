@@ -328,8 +328,67 @@ pub fn mailbox_length() -> Int
 @external(erlang, "probe_ffi", "flush_mailbox")
 pub fn flush_mailbox() -> Nil
 
+/// The number of entries in the calling process's own process dictionary.
+/// Used to assert that starting and awaiting runs never grows it.
+@external(erlang, "probe_ffi", "dictionary_size")
+pub fn dictionary_size() -> Int
+
 /// Raises a native `throw` (not `error`/`exit`), for asserting a step
 /// body's crash class is reported as `ThrowClass` rather than folded into
 /// `ErrorClass`.
 @external(erlang, "probe_ffi", "native_throw")
 pub fn native_throw() -> a
+
+// ---------------------------------------------------------------------------
+// Progress polling
+// ---------------------------------------------------------------------------
+
+/// Polls `execution.progress` until `matches` accepts a snapshot, or
+/// `timeout_ms` elapses overall. Each poll is a real (short) message
+/// round-trip with the coordinator via `execution.progress` — never a
+/// `process.sleep` — so this returns as soon as `matches` is satisfied
+/// rather than waiting out any fixed guess at how long a transition takes.
+/// Used to synchronize a test with a run's phase or a step's state instead
+/// of sleeping a hopefully-long-enough duration.
+pub fn wait_until_progress(
+  execution: Execution(o, e, u),
+  timeout_ms: Int,
+  matches: fn(execution.Progress) -> Bool,
+) -> Result(execution.Progress, Nil) {
+  let deadline = ffi_deadline(timeout_ms)
+  wait_until_progress_loop(execution, deadline, matches)
+}
+
+fn wait_until_progress_loop(
+  execution: Execution(o, e, u),
+  deadline: Int,
+  matches: fn(execution.Progress) -> Bool,
+) -> Result(execution.Progress, Nil) {
+  let remaining = deadline - ffi_now()
+  case remaining <= 0 {
+    True -> Error(Nil)
+    False -> {
+      let poll_timeout = case remaining < 50 {
+        True -> remaining
+        False -> 50
+      }
+      case execution.progress(execution, poll_timeout) {
+        Ok(snapshot) ->
+          case matches(snapshot) {
+            True -> Ok(snapshot)
+            False -> wait_until_progress_loop(execution, deadline, matches)
+          }
+        Error(execution.ExecutionEnded) -> Error(Nil)
+        Error(execution.ProgressTimedOut) ->
+          wait_until_progress_loop(execution, deadline, matches)
+      }
+    }
+  }
+}
+
+@external(erlang, "probe_ffi", "monotonic_time_ms")
+fn ffi_now() -> Int
+
+fn ffi_deadline(timeout_ms: Int) -> Int {
+  ffi_now() + timeout_ms
+}
