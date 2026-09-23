@@ -59,36 +59,20 @@ Every capability below carries a status:
   build it belongs to (`DefinitionError.ForeignPort`).
 - Scoped step addresses as representation: `StepAddress(scope, name,
 occurrence)` distinguishes repeated occurrences of the same step name at
-  one scope. `saga.embed` does not yet push a fresh nested scope for the
-  embedded workflow (see Deferred); today every direct step shares the
-  root scope, so `scope` is exercised by occurrence disambiguation, not
-  yet by embed nesting.
+  one scope. `saga.embed` pushes a fresh nested scope path (the embedded
+  workflow's own name) for every step it introduces, so two `embed` calls
+  of the same workflow — or an embedded step whose name collides with an
+  outer step — are addressed distinctly (e.g. `inner/charge`,
+  `inner/charge#2`) rather than colliding at the root scope.
+- Orphan / unreachable-output rejection: `define` tracks every node
+  `perform` creates during one builder evaluation (including ones later
+  discarded rather than threaded into the returned port) and rejects any
+  that never reach the workflow's own output, as `DefinitionError.OrphanStep`
+  — a step that would otherwise silently never run (e.g. a side-effecting
+  step whose port is built but never consumed) is caught at `define` time.
 
 ## Deferred
 
-- **Orphan / unreachable-output rejection.** `define`'s validation
-  (`DefinitionError`) currently checks step names, attempt budgets,
-  timeouts, and foreign-port usage, but does not reject a step whose
-  output is never consumed by the workflow's declared output or any other
-  step (an orphan node), or a builder that leaves part of its graph
-  unreachable from the output port. The design's shared-graph requirement
-  (`saga-design.md`, "Fabric graph requirements accepted by Saga") calls
-  for rejecting unreachable outputs alongside cycles, missing producers,
-  and undeclared duplicate writers (the last two tracked separately
-  below); cycles and missing producers are already unrepresentable by
-  Saga's `Port`-threading builder, but orphan/unreachable-output rejection
-  is not yet implemented. **In progress in this release** — being
-  implemented in `src/saga.gleam` in parallel with this documentation
-  pass; confirm against `git log`/`CHANGELOG.md` before relying on this
-  being shipped.
-- **Scoped embed addresses.** `saga.embed` shares the parent's `scope`
-  rather than pushing a fresh nested scope path for the embedded
-  workflow's steps, so an embedded step's address does not yet record
-  which `embed` call it came from the way the design's "nested choice
-  scope" language implies. **In progress in this release** — being
-  implemented in `src/saga.gleam` in parallel with this documentation
-  pass; confirm against `git log`/`CHANGELOG.md` before relying on this
-  being shipped.
 - **Step labels and metadata beyond name.** `StepDescriptor` exposes
   `address`, `depends_on`, `undoable`, `compensates`, `max_attempts`, and
   `timeout`, but there is no free-text label or arbitrary metadata
