@@ -56,26 +56,30 @@ the run finishes and returns `Completed`, `Failed(cause, settlement)`,
 
 ## The advanced path
 
-Configure concurrency, a run deadline, and cleanup bounds; start without
-blocking; inspect progress; cancel:
+Configure concurrency, a run deadline, and cleanup bounds by updating the
+default config's record fields rather than constructing one from scratch;
+start without blocking; inspect progress; cancel:
 
 ```gleam
 import gleam/option.{Some}
 import saga/execution
 
 let config =
-  execution.Config(
-    max_concurrency: 4,
-    deadline: Some(30_000),
-    settle_timeout: 5000,
-    cleanup_timeout: 5000,
-  )
+  execution.Config(..execution.config(), max_concurrency: 4, deadline: Some(5000))
 
 let assert Ok(exec) = execution.start(workflow, order_id, config)
 let assert Ok(progress) = execution.progress(exec, 1000)
 execution.cancel(exec)
 let assert Ok(outcome) = execution.await(exec, 10_000)
 ```
+
+`execution.config()` defaults to one attempt/compensation task per
+scheduler core (`max_concurrency`), no run `deadline`, a 5 second
+`settle_timeout`, and a 5 second `cleanup_timeout` — the record-update
+(`..execution.config()`) is the advanced-config path; it changes only the
+fields you name and keeps the library's defaults for the rest, so a new
+`Config` field added later does not silently reset every existing caller's
+untouched settings back to a stale literal.
 
 Adapt a workflow's error and undo-error types to your own application
 vocabulary with `saga.map_errors` (whole workflow) or
@@ -110,6 +114,14 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   attempts and compensations get up to `settle_timeout` to finish on
   their own before being killed, and each individual compensation
   decision or undo action is bounded by `cleanup_timeout`.
+- **No deadline and no step timeout are enabled by default.**
+  `execution.config()`'s `deadline` is `None`, and `saga.step` gives a
+  step no `timeout` unless you call `saga.timeout` on it. Without either
+  one set, a step body that never returns — a genuine hang, not a crash —
+  blocks `execution.run`/`execution.await` forever; nothing in Saga times
+  it out for you. This is current behavior, not a documentation gap: set
+  `deadline` and/or per-step `timeout` explicitly wherever a hang must be
+  bounded.
 - **The workflow builder must be pure and deterministic.** `define`
   evaluates it once to validate and compute static descriptors; every run
   evaluates it again, fresh. If a real run's graph shape differs from what

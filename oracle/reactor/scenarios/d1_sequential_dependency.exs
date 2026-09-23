@@ -47,3 +47,9 @@ result = Reactor.run(Oracle.D1, %{agent: agent}, %{}, async?: false)
 
 Oracle.Trace.print("d1.trace", Agent.get(agent, &Enum.reverse/1))
 Oracle.Trace.print("d1.result", elem(result, 0))
+
+# Normalized lines: what scripts/oracle.sh actually diffs against the
+# Gleam side's test/oracle_test.gleam:main/0 output (see
+# oracle/differences/README.md for the format).
+Oracle.Trace.print_normalized("normalized.d1.trace", Agent.get(agent, &Enum.reverse/1))
+Oracle.Trace.print_normalized("normalized.d1.result", elem(result, 0))

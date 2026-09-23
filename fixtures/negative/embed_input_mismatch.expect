@@ -1,3 +1,5 @@
 # embed must reject an inner workflow whose declared input type does not
 # match the outer port's value type.
 Type mismatch
+saga.Workflow(String,
+saga.Workflow(Int, Int,

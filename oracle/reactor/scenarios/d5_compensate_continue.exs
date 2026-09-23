@@ -41,3 +41,6 @@ result = Reactor.run(Oracle.D5, %{agent: agent}, %{}, async?: false)
 
 Oracle.Trace.print("d5.trace", Agent.get(agent, &Enum.reverse/1))
 Oracle.Trace.print("d5.result", result)
+
+Oracle.Trace.print_normalized("normalized.d5.trace", Agent.get(agent, &Enum.reverse/1))
+Oracle.Trace.print_normalized("normalized.d5.result", result)

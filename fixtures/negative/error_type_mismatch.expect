@@ -1,3 +1,5 @@
 # Mixing two steps with different error types in saga.both, without going
 # through map_step_errors first, must be a compile-time type mismatch.
 Type mismatch
+saga.Step(Int, Int, ErrA,
+saga.Step(Int, Int, ErrB,

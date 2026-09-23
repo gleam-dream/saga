@@ -52,3 +52,6 @@ attempts = Enum.count(events, &(&1 == :attempt))
 Oracle.Trace.print("d4.trace", events)
 Oracle.Trace.print("d4.attempts", attempts)
 Oracle.Trace.print("d4.result", result)
+
+Oracle.Trace.print_normalized("normalized.d4.attempts", attempts)
+Oracle.Trace.print_normalized("normalized.d4.result", elem(result, 0))
