@@ -2,6 +2,12 @@
 /// `gleam test` -- this is a separate package (`bench/`), a path dependency
 /// on saga using only its public modules, run with `gleam run`. Prints a
 /// Markdown table to stdout; redirect it into a file to record results.
+///
+/// Every timed run asserts `execution.Completed` with the shape's own
+/// expected output (see `shapes.chain_expected_output`/
+/// `fan_expected_output`/`wide_expected_output`), not just that a run
+/// finished: a completed-but-wrong-value run would otherwise silently
+/// contaminate the benchmark instead of failing loudly.
 import bench_ffi
 import counter.{type Counter}
 import gleam/int
@@ -19,14 +25,16 @@ const sizes = [10, 50, 100, 250, 500, 1000, 2000]
 /// Wall-clock budget per one bench cell (one shape at one N): once a single
 /// iteration's own run time exceeds this, larger sizes for that shape are
 /// skipped rather than run, and the skip is reported in the table.
-const max_iteration_ms = 60_000
+const max_iteration_us = 60_000_000
 
 /// Warm-up iterations before measurement, then this many measured runs per
-/// shape/N (fewer for very large N, to keep the whole suite's wall time
-/// reasonable).
+/// shape/N. N >= 1000 still gets a larger sample than a naive "fewer for
+/// big N" rule might suggest, since each run is now cheap enough (single-
+/// digit milliseconds, post build-once/admission fixes) that more samples
+/// cost little wall time.
 const measured_runs = 20
 
-const measured_runs_huge = 5
+const measured_runs_huge = 15
 
 const huge_n_threshold = 1000
 
@@ -45,8 +53,8 @@ fn range_acc(from: Int, to: Int, acc: List(Int)) -> List(Int) {
 pub type Row {
   Row(
     n: Int,
-    define_ms: Int,
-    warmup_ms: Int,
+    define_us: Int,
+    warmup_us: Int,
     summary: Summary,
     build_invocations: Int,
     skipped: Bool,
@@ -55,10 +63,22 @@ pub type Row {
 
 pub fn main() {
   io.println("# saga run-cost benchmark\n")
+  io.println("All timings in microseconds (µs) unless noted otherwise.\n")
 
-  let chain_rows = bench_shape(fn(n, c) { shapes.chain(n, c) })
-  let fan_rows = bench_shape(fn(n, c) { shapes.fan(n, c) })
-  let wide_rows = bench_shape(fn(n, c) { shapes.wide(n, c) })
+  let bench_input = 7
+
+  let chain_rows =
+    bench_shape(fn(n, c) { shapes.chain(n, c) }, bench_input, fn(n, output) {
+      output == shapes.chain_expected_output(n, bench_input)
+    })
+  let fan_rows =
+    bench_shape(fn(n, c) { shapes.fan(n, c) }, bench_input, fn(n, output) {
+      output == shapes.fan_expected_output(n, bench_input)
+    })
+  let wide_rows =
+    bench_shape(fn(n, c) { shapes.wide(n, c) }, bench_input, fn(n, output) {
+      output == shapes.wide_expected_output(n, bench_input)
+    })
 
   print_table("Chain (N sequential steps, each reads the previous)", chain_rows)
   print_table(
@@ -74,12 +94,14 @@ pub fn main() {
 fn bench_shape(
   build: fn(Int, Counter) ->
     Result(Workflow(Int, o, BenchError, Nil), List(DefinitionError)),
+  input: Int,
+  output_correct: fn(Int, o) -> Bool,
 ) -> List(Row) {
   list_fold_until(sizes, [], fn(acc, n) {
     let build_count = counter.new()
     let define_start = bench_ffi.monotonic_time()
     let built = build(n, build_count)
-    let define_ms = bench_ffi.monotonic_time() - define_start
+    let define_us = bench_ffi.monotonic_time() - define_start
     // `define` itself invokes the builder once; that invocation is part of
     // this cell's own build-invocation count like any other.
     case built {
@@ -96,18 +118,21 @@ fn bench_shape(
             deadline: None,
           )
         // One warm-up run, timed and reported separately, then `run_count`
-        // measured runs.
+        // measured runs. Every run is checked for correctness, not just
+        // timed: a run that fails to complete with the expected output
+        // panics the bench immediately rather than silently recording a
+        // bogus timing.
         let warmup_start = bench_ffi.monotonic_time()
-        let _ = execution.run(workflow, n, config)
-        let warmup_ms = bench_ffi.monotonic_time() - warmup_start
+        assert_run_correct(workflow, input, config, n, output_correct)
+        let warmup_us = bench_ffi.monotonic_time() - warmup_start
 
-        case warmup_ms > max_iteration_ms {
+        case warmup_us > max_iteration_us {
           True ->
             Stop([
               Row(
                 n: n,
-                define_ms: define_ms,
-                warmup_ms: warmup_ms,
+                define_us: define_us,
+                warmup_us: warmup_us,
                 summary: stats.summarize([]),
                 build_invocations: counter.read(build_count),
                 skipped: True,
@@ -119,14 +144,14 @@ fn bench_shape(
               range(1, run_count)
               |> list.map(fn(_i) {
                 let start = bench_ffi.monotonic_time()
-                let _ = execution.run(workflow, n, config)
+                assert_run_correct(workflow, input, config, n, output_correct)
                 bench_ffi.monotonic_time() - start
               })
             let row =
               Row(
                 n: n,
-                define_ms: define_ms,
-                warmup_ms: warmup_ms,
+                define_us: define_us,
+                warmup_us: warmup_us,
                 summary: stats.summarize(samples),
                 build_invocations: counter.read(build_count),
                 skipped: False,
@@ -138,6 +163,27 @@ fn bench_shape(
     }
   })
   |> list.reverse
+}
+
+fn assert_run_correct(
+  workflow: Workflow(Int, o, BenchError, Nil),
+  input: Int,
+  config: execution.Config,
+  n: Int,
+  output_correct: fn(Int, o) -> Bool,
+) -> Nil {
+  case execution.run(workflow, input, config) {
+    Ok(execution.Completed(output)) ->
+      case output_correct(n, output) {
+        True -> Nil
+        False ->
+          panic as "bench: run completed with an unexpected output (see shapes.*_expected_output)"
+      }
+    other -> {
+      io.println(string.inspect(other))
+      panic as "bench: run did not complete as expected"
+    }
+  }
 }
 
 // A tiny local fold-until (gleam_stdlib's `list.fold_until` uses
@@ -166,7 +212,7 @@ fn list_fold_until(
 fn print_table(title: String, rows: List(Row)) -> Nil {
   io.println("## " <> title <> "\n")
   io.println(
-    "| N | define (ms) | warmup (ms) | median (ms) | p95 (ms) | min (ms) | max (ms) | build invocations | measured runs |",
+    "| N | define (µs) | warmup (µs) | median (µs) | p95 (µs) | min (µs) | max (µs) | build invocations | measured runs |",
   )
   io.println("|---|---|---|---|---|---|---|---|---|")
   list.each(rows, fn(r) {
@@ -176,12 +222,12 @@ fn print_table(title: String, rows: List(Row)) -> Nil {
           "| "
           <> int.to_string(r.n)
           <> " | "
-          <> int.to_string(r.define_ms)
+          <> int.to_string(r.define_us)
           <> " | "
-          <> int.to_string(r.warmup_ms)
+          <> int.to_string(r.warmup_us)
           <> " (SKIPPED: exceeded "
-          <> int.to_string(max_iteration_ms)
-          <> "ms budget) | - | - | - | "
+          <> int.to_string(max_iteration_us)
+          <> "µs budget) | - | - | - | "
           <> int.to_string(r.build_invocations)
           <> " | 0 |",
         )
@@ -190,9 +236,9 @@ fn print_table(title: String, rows: List(Row)) -> Nil {
           "| "
           <> int.to_string(r.n)
           <> " | "
-          <> int.to_string(r.define_ms)
+          <> int.to_string(r.define_us)
           <> " | "
-          <> int.to_string(r.warmup_ms)
+          <> int.to_string(r.warmup_us)
           <> " | "
           <> int.to_string(r.summary.median)
           <> " | "
@@ -227,8 +273,12 @@ fn print_growth(rows: List(Row)) -> Nil {
       case list.find(by_n, fn(other) { other.0 == n * 2 }) {
         Ok(#(double_n, double_median)) -> {
           let ratio_str = case median {
-            0 -> "n/a (baseline 0ms)"
+            0 -> "below timer resolution"
             _ -> ratio_string(double_median, median)
+          }
+          let suffix = case median {
+            0 -> ""
+            _ -> "x"
           }
           Ok(
             "- "
@@ -237,7 +287,7 @@ fn print_growth(rows: List(Row)) -> Nil {
             <> int.to_string(double_n)
             <> ": "
             <> ratio_str
-            <> "x",
+            <> suffix,
           )
         }
         Error(_) -> Error(Nil)
