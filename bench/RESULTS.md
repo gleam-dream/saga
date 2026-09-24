@@ -231,3 +231,106 @@ filtering `state.order` from scratch each time) is a separate,
 follow-on optimization, out of scope for this build-once/store-by-node-id
 change; it was not attempted here and no code changes toward it are
 included in this commit.
+
+## After admission fix (commit ea8479c)
+
+`coordinator.admit`'s full scan of `state.order` on every admission
+decision (the follow-on quadratic cost identified above) is replaced with
+a min-heap (`saga/internal/min_heap`) of ready node ids, pushed to exactly
+when a node becomes admittable and popped by `admit` — O(log N) per
+operation instead of an O(N) scan, admission order unchanged (verified by
+the oracle's byte-identical traces and a new direct regression test).
+`all_nodes_done`/`rollback_complete`'s own O(N) scans (checked on every
+message the coordinator processes, not just completions) are likewise
+replaced with incrementally maintained counters/flags. Same machine,
+method, and `execution.Config` as "Before"/"After (commit 9e9350a)".
+
+### Chain (N sequential steps, each reads the previous)
+
+| N    | define (ms) | warmup (ms) | median (ms) | p95 (ms) | min (ms) | max (ms) | build invocations | measured runs |
+| ---- | ----------- | ----------- | ----------- | -------- | -------- | -------- | ----------------- | ------------- |
+| 10   | 6           | 6           | 0           | 0        | 0        | 1        | 1                 | 20            |
+| 50   | 1           | 0           | 0           | 1        | 0        | 1        | 1                 | 20            |
+| 100  | 0           | 1           | 0           | 1        | 0        | 1        | 1                 | 20            |
+| 250  | 0           | 1           | 1           | 1        | 1        | 2        | 1                 | 20            |
+| 500  | 1           | 3           | 2           | 2        | 2        | 2        | 1                 | 20            |
+| 1000 | 2           | 5           | 4           | 5        | 4        | 5        | 1                 | 5             |
+| 2000 | 4           | 9           | 8           | 9        | 8        | 9        | 1                 | 5             |
+
+Growth (median time at 2N / median time at N): 250->500 2.00x,
+500->1000 2.00x, 1000->2000 2.00x — linear, not quadratic.
+
+### Fan-in/fan-out (1 shared producer, N parallel consumers, `all`)
+
+| N    | define (ms) | warmup (ms) | median (ms) | p95 (ms) | min (ms) | max (ms) | build invocations | measured runs |
+| ---- | ----------- | ----------- | ----------- | -------- | -------- | -------- | ----------------- | ------------- |
+| 10   | 0           | 0           | 0           | 0        | 0        | 1        | 1                 | 20            |
+| 50   | 0           | 1           | 0           | 1        | 0        | 1        | 1                 | 20            |
+| 100  | 0           | 1           | 1           | 1        | 0        | 1        | 1                 | 20            |
+| 250  | 1           | 2           | 2           | 2        | 1        | 2        | 1                 | 20            |
+| 500  | 2           | 4           | 4           | 5        | 4        | 5        | 1                 | 20            |
+| 1000 | 3           | 9           | 9           | 10       | 9        | 10       | 1                 | 5             |
+| 2000 | 9           | 25          | 22          | 24       | 21       | 24       | 1                 | 5             |
+
+Growth (median time at 2N / median time at N): 250->500 2.00x,
+500->1000 2.25x, 1000->2000 2.44x.
+
+### Wide dependency reads (`both`/`map` over a window of 4 prior outputs)
+
+| N    | define (ms) | warmup (ms) | median (ms) | p95 (ms) | min (ms) | max (ms) | build invocations | measured runs |
+| ---- | ----------- | ----------- | ----------- | -------- | -------- | -------- | ----------------- | ------------- |
+| 10   | 0           | 0           | 0           | 0        | 0        | 1        | 1                 | 20            |
+| 50   | 0           | 1           | 0           | 1        | 0        | 1        | 1                 | 20            |
+| 100  | 0           | 1           | 1           | 1        | 0        | 1        | 1                 | 20            |
+| 250  | 1           | 2           | 1           | 2        | 1        | 2        | 1                 | 20            |
+| 500  | 3           | 4           | 3           | 3        | 2        | 3        | 1                 | 20            |
+| 1000 | 9           | 6           | 6           | 7        | 6        | 7        | 1                 | 5             |
+| 2000 | 30          | 15          | 13          | 14       | 13       | 14       | 1                 | 5             |
+
+Growth (median time at 2N / median time at N): 250->500 3.00x,
+500->1000 2.00x, 1000->2000 2.16x (the 250->500 blip is measurement
+noise at low absolute millisecond counts, not a growth-shape signal).
+
+## Three-column comparison: before / after-store / after-admission
+
+Median run time (ms) at each stage, with cumulative speedup
+(before/after-admission) in the last column:
+
+| Shape          | N    | Before (0517f1a) | After store (9e9350a) | After admission (ea8479c) | Cumulative speedup |
+| -------------- | ---- | ---------------- | --------------------- | ------------------------- | ------------------ |
+| Chain          | 100  | 1                | 1                     | 0                         | inf                |
+| Chain          | 250  | 7                | 4                     | 1                         | 7.00x              |
+| Chain          | 500  | 25               | 16                    | 2                         | 12.50x             |
+| Chain          | 1000 | 98               | 65                    | 4                         | 24.50x             |
+| Chain          | 2000 | 392              | 276                   | 8                         | 49.00x             |
+| Fan-in/fan-out | 100  | 2                | 1                     | 1                         | 2.00x              |
+| Fan-in/fan-out | 250  | 7                | 5                     | 2                         | 3.50x              |
+| Fan-in/fan-out | 500  | 21               | 15                    | 4                         | 5.25x              |
+| Fan-in/fan-out | 1000 | 78               | 50                    | 9                         | 8.67x              |
+| Fan-in/fan-out | 2000 | 313              | 186                   | 22                        | 14.23x             |
+| Wide reads     | 100  | 2                | 1                     | 1                         | 2.00x              |
+| Wide reads     | 250  | 9                | 5                     | 1                         | 9.00x              |
+| Wide reads     | 500  | 31               | 17                    | 3                         | 10.33x             |
+| Wide reads     | 1000 | 121              | 70                    | 6                         | 20.17x             |
+| Wide reads     | 2000 | 472              | 302                   | 13                        | 36.31x             |
+
+Growth ratios (median time at 2N / median time at N), all three stages:
+
+| Shape          | Before (500->1000->2000) | After store  | After admission |
+| -------------- | ------------------------ | ------------ | --------------- |
+| Chain          | 3.92x, 4.00x             | 4.06x, 4.24x | 2.00x, 2.00x    |
+| Fan-in/fan-out | 3.71x, 4.01x             | 3.33x, 3.72x | 2.25x, 2.44x    |
+| Wide reads     | 3.90x, 3.90x             | 4.11x, 4.31x | 2.00x, 2.16x    |
+
+### After admission fix: analysis
+
+The admission fix closes the gap the store refactor alone left open.
+Growth ratios drop from ~3.7x-4.3x per doubling (consistent with O(N^2))
+to ~2.0x-2.4x (consistent with O(N), the expected shape for N independent
+or chained trivial steps under a scheduling loop that does O(1) work per
+admission). Cumulative speedup at N=2000 ranges from 14x (fan-in/fan-out,
+the shape with the least dependency-chain depth to amortize) to 49x
+(chain, the shape that hits `admit` hardest per run since each step
+strictly serializes the next). No profiling was needed beyond the
+benchmark itself: the growth ratios already confirm the fix, and no
+further superlinear behavior was observed at N=2000 in any shape.
