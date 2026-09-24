@@ -328,7 +328,13 @@ pub fn start(
   settle_timeout settle_timeout: Int,
   cleanup_timeout cleanup_timeout: Int,
   build_graph build_graph: fn() ->
-    #(Dict(Int, Node(e, u)), List(Int), Store, fn(Store) -> ffi.RescueResult(o)),
+    #(
+      Dict(Int, Node(e, u)),
+      List(Int),
+      Dict(Int, List(Int)),
+      Store,
+      fn(Store) -> ffi.RescueResult(o),
+    ),
   result_subject result_subject: Subject(Outcome(o, e, u)),
   control_subject_out control_subject_out: Subject(Subject(Control(o, e, u))),
 ) -> #(Pid, Int) {
@@ -371,7 +377,13 @@ fn run(
   settle_timeout: Int,
   cleanup_timeout: Int,
   build_graph: fn() ->
-    #(Dict(Int, Node(e, u)), List(Int), Store, fn(Store) -> ffi.RescueResult(o)),
+    #(
+      Dict(Int, Node(e, u)),
+      List(Int),
+      Dict(Int, List(Int)),
+      Store,
+      fn(Store) -> ffi.RescueResult(o),
+    ),
   result_subject: Subject(Outcome(o, e, u)),
   control_subject_out: Subject(Subject(Control(o, e, u))),
   ready: Subject(Nil),
@@ -381,8 +393,7 @@ fn run(
   let owner_monitor = process.monitor(owner)
   process.send(control_subject_out, control)
   process.send(ready, Nil)
-  let #(nodes, order, run_store, fetch_output) = build_graph()
-  let dependents = build_dependents(nodes)
+  let #(nodes, order, dependents, run_store, fetch_output) = build_graph()
   let node_state =
     dict.map_values(nodes, fn(_id, n) { NodeWaiting(list.length(n.deps)) })
   // Every node with no dependencies is ready from the start. Pushed in
@@ -435,19 +446,6 @@ fn run(
     )
   let admitted = admit(initial)
   loop(admitted, fetch_output, result_subject)
-}
-
-fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
-  dict.fold(nodes, dict.new(), fn(acc, id, n) {
-    list.fold(n.deps, acc, fn(acc2, dep_id) {
-      dict.upsert(acc2, dep_id, fn(existing) {
-        case existing {
-          Some(ids) -> list.append(ids, [id])
-          None -> [id]
-        }
-      })
-    })
-  })
 }
 
 fn loop(
@@ -532,9 +530,22 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
           // already look for "effects never journaled or undone". See
           // `Outcome.Completed`'s doc comment for the parallel case where
           // the run *did* complete.
+          //
+          // `undone`/`undo_failures`/`not_undoable`/`held` were all built
+          // newest-first (prepended, not appended — see
+          // `record_undone`/`record_undo_failure`/`record_not_undoable`/
+          // `record_held`'s own doc comment) precisely so accumulating them
+          // across up to N journal entries during rollback stays O(N) total
+          // instead of O(N^2); this is the one place they are reversed back
+          // into their documented (completion/processing) order, since this
+          // `Settlement` is now final and externally observed.
           let settlement =
             Settlement(
               ..settlement,
+              undone: list.reverse(settlement.undone),
+              undo_failures: list.reverse(settlement.undo_failures),
+              not_undoable: list.reverse(settlement.not_undoable),
+              held: list.reverse(settlement.held),
               interrupted: list.append(
                 list.reverse(state.timed_out_attempts),
                 settlement.interrupted,
@@ -1478,7 +1489,7 @@ fn begin_unresolved(
   case is_terminal(state.phase) {
     True ->
       update_settlement(state, fn(s) {
-        Settlement(..s, held: list.append(s.held, [address]))
+        Settlement(..s, held: [address, ..s.held])
       })
       |> maybe_finish_settling
     False -> begin_settling(state, TriggerUnresolved(address, evidence))
@@ -1641,9 +1652,7 @@ fn record_held(
   state: RunState(o, e, u),
   address: StepAddress,
 ) -> RunState(o, e, u) {
-  update_settlement(state, fn(s) {
-    Settlement(..s, held: list.append(s.held, [address]))
-  })
+  update_settlement(state, fn(s) { Settlement(..s, held: [address, ..s.held]) })
 }
 
 /// `state.undoing` (an O(1) flag, not a scan — see `RunState`'s doc
@@ -1786,12 +1795,23 @@ fn handle_undo_timeout(
   }
 }
 
+// `record_undone`/`record_undo_failure`/`record_not_undoable`/`record_held`
+// (below) all prepend rather than `list.append` (which is O(k) per call,
+// O(k^2) total across k calls accumulating into the same list — and
+// rollback can call these once per journal entry, i.e. up to N times).
+// Each field is therefore built newest-first internally and reversed
+// exactly once, at `run_finished`'s single point where a `Settlement`
+// becomes the final, externally observed value — nowhere else reads these
+// fields' order before then (`build_progress` never reads `Settlement` at
+// all, and the one other read, `emit_run_stopped`'s `list.length`, is
+// order-independent).
+
 fn record_undone(
   state: RunState(o, e, u),
   address: StepAddress,
 ) -> RunState(o, e, u) {
   update_settlement(state, fn(s) {
-    Settlement(..s, undone: list.append(s.undone, [address]))
+    Settlement(..s, undone: [address, ..s.undone])
   })
 }
 
@@ -1800,7 +1820,7 @@ fn record_undo_failure(
   failure: UndoFailure(u),
 ) -> RunState(o, e, u) {
   update_settlement(state, fn(s) {
-    Settlement(..s, undo_failures: list.append(s.undo_failures, [failure]))
+    Settlement(..s, undo_failures: [failure, ..s.undo_failures])
   })
 }
 
@@ -1809,7 +1829,7 @@ fn record_not_undoable(
   address: StepAddress,
 ) -> RunState(o, e, u) {
   update_settlement(state, fn(s) {
-    Settlement(..s, not_undoable: list.append(s.not_undoable, [address]))
+    Settlement(..s, not_undoable: [address, ..s.not_undoable])
   })
 }
 

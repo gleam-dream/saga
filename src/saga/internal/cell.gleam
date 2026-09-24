@@ -1,47 +1,27 @@
-/// A per-node mailbox cell: a `Subject(a)` owned by whichever process
-/// evaluates a `Workflow`'s builder (the caller during `define`'s dry run,
-/// the coordinator during a real run). Writing sends the value to the
-/// owning process's own mailbox; reading is a selective receive that leaves
-/// the message in place so every dependent read observes the same value.
+/// An append-only list accumulator (`Registry`), synchronously owned by the
+/// single process evaluating one `Workflow` builder (the caller during
+/// `define`'s one evaluation). Used to track every node `perform` creates
+/// during that one evaluation — including ones later discarded by the
+/// builder (never merged into the final output port) — so orphaned steps
+/// can be reported at `define` time. Built on the mailbox-as-mutable-cell
+/// trick: a `Subject` owned by the calling process, holding the
+/// accumulator's current value as the one message in its own mailbox,
+/// read-modify-written on each `register`.
+///
+/// This module used to also provide `Cell` (a single-value version of the
+/// same trick, `new`/`write`/`read`), which every node's per-run output
+/// once lived in. Per-run values now live in a single, run-scoped
+/// `saga/internal/store.Store` instead (see that module's doc comment for
+/// why), so `Cell` had no remaining caller and was removed; `Registry`
+/// alone remains, since it is still how `define` accumulates the nodes one
+/// builder evaluation creates.
 import gleam/erlang/process.{type Subject}
-
-pub type Cell(a) {
-  Cell(subject: Subject(a))
-}
-
-/// Allocates a fresh cell owned by the calling process. Nothing is sent
-/// until `write` is called; during a `define`-time dry run this subject is
-/// never written to or read from and is simply discarded.
-pub fn new() -> Cell(a) {
-  Cell(process.new_subject())
-}
-
-/// Writes `value` into the cell. Must be called by the cell's owning
-/// process. Only one write per cell is expected per run.
-pub fn write(cell: Cell(a), value: a) -> Nil {
-  process.send(cell.subject, value)
-}
-
-/// Reads the value from the cell without consuming it, so that multiple
-/// dependents can each read the same completed value. Must be called by the
-/// cell's owning process, strictly after `write`.
-pub fn read(cell: Cell(a)) -> a {
-  let value = process.receive_forever(cell.subject)
-  process.send(cell.subject, value)
-  value
-}
-
-// ---------------------------------------------------------------------------
-// Registry: an append-only accumulator for one builder evaluation.
-// ---------------------------------------------------------------------------
 
 /// An append-only list accumulator, synchronously owned by the single
 /// process evaluating one `Workflow` builder (the caller during `define`'s
-/// dry run, the coordinator during `for_run`). Used to track every node
-/// created during that one evaluation — including ones later discarded by
-/// the builder (never merged into the final output port) — so orphaned
-/// steps can be reported. Built on the same mailbox trick as `Cell`, but
-/// mutated (read-modify-write) rather than written once.
+/// one evaluation). Used to track every node created during that one
+/// evaluation — including ones later discarded by the builder (never
+/// merged into the final output port) — so orphaned steps can be reported.
 pub type Registry(a) {
   Registry(subject: Subject(List(a)))
 }
@@ -71,10 +51,10 @@ pub fn register(registry: Registry(a), item: a) -> Nil {
 }
 
 /// Every item registered so far, in registration order. Must be called by
-/// the registry's owning process. Leaves the registry unchanged (like
-/// `Cell.read`) so a still-in-scope registry may keep being registered
-/// into — see `close`, which is what actually retires a registry once its
-/// owning evaluation is done.
+/// the registry's owning process. Leaves the registry unchanged so a
+/// still-in-scope registry may keep being registered into — see `close`,
+/// which is what actually retires a registry once its owning evaluation is
+/// done.
 pub fn all_registered(registry: Registry(a)) -> List(a) {
   let existing = process.receive_forever(registry.subject)
   process.send(registry.subject, existing)
@@ -84,12 +64,9 @@ pub fn all_registered(registry: Registry(a)) -> List(a) {
 /// Retires a registry once its owning builder evaluation is fully done
 /// (after `all_registered` has already been read for the last time):
 /// drains its one outstanding message so it is not left sitting in the
-/// owning process's mailbox forever. Unlike `Cell`, whose `define`-time
-/// subjects are never written to at all (a dry run never calls
-/// `write`/`read`), a registry's whole purpose is to be written to and
-/// read *during* `define`'s dry run (to catch orphaned steps), so its
-/// owning process — typically the long-lived caller of `define`, not a
-/// coordinator that exits and takes its mailbox with it — needs this
+/// owning process's mailbox forever — the registry's whole purpose is to be
+/// written to and read *during* `define`'s one evaluation, so its owning
+/// process (typically the long-lived caller of `define`) needs this
 /// explicit cleanup. Safe to call even if nothing was ever registered (the
 /// registry always holds exactly one message, written by `new_registry`).
 pub fn close(registry: Registry(a)) -> Nil {
