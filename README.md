@@ -124,22 +124,34 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   bounded.
 - **The workflow builder runs once, at `define` time.** `define` evaluates
   it to validate the workflow and to build its node graph; no run ever
-  evaluates the builder again. The builder no longer needs to be pure or
-  reproducible run to run — it runs exactly once, period — though it
-  should still be a straightforward description of the workflow's shape,
-  since whatever graph it produces at `define` time is what every future
-  run replays. Per-run values live in a store keyed by node id, isolated
-  per run, so concurrent or successive runs of the same `Workflow` never
-  see each other's data despite sharing the same built graph. A value read
-  is a single map lookup (not a scan proportional to how many steps have
-  completed), and admitting a ready step is a single min-heap operation
-  (not a scan over every step in the workflow), so total scheduling work
-  for a run is linear in the number of steps rather than quadratic. Run
-  cost is now dominated by the step work itself. See `bench/RESULTS.md`
-  for measurements (both changes together: roughly 14x-49x faster median
-  run time at 2000 steps, depending on shape, versus per-run builder
-  re-evaluation with per-node mailbox reads and full-graph admission
-  scans).
+  evaluates the builder again (see `saga.Workflow`'s doc comment for
+  precisely the two situations — `define` and `embed` — a builder is ever
+  invoked at all). The builder no longer needs to be pure or reproducible
+  run to run — it runs exactly once, period — though it should still be a
+  straightforward description of the workflow's shape, since whatever
+  graph it produces at `define` time is what every future run replays.
+  Per-run values live in a store keyed by node id, isolated per run, so
+  concurrent or successive runs of the same `Workflow` never see each
+  other's data despite sharing the same built graph (see "Design
+  decisions" below for the trade this makes).
+  **What is linear in the number of steps, per run:** a dependency value
+  read (a single map lookup, not a scan proportional to how many steps
+  have completed); admitting a ready step (a single min-heap operation,
+  not a scan over every step); the reverse-dependency index and
+  `saga.all`'s combined-list construction (each built once, in one linear
+  pass, not by repeated appends). Total scheduling work for a run is
+  therefore linear overall, not quadratic — see `bench/RESULTS.md` (roughly
+  14x-49x faster median run time at 2000 steps, depending on shape, versus
+  per-run builder re-evaluation with per-node mailbox reads and full-graph
+  admission scans, with growth per doubling dropping from ~4x to ~2x).
+  **What stays O(N) per call, deliberately, because it is not a per-step
+  hot path:** `execution.progress` (a caller-driven snapshot, not
+  triggered by run progress itself); the settle-window sweep and the
+  waiting-node skip on a run's first terminal trigger (each happens at
+  most once per run); and the search for which node a task pid belongs to
+  on an abnormal (non-`ffi.rescue`d) task exit (bounded by concurrently
+  in-flight tasks, not by total step count, and only reached on an
+  externally-killed task, not a normal completion).
 - **A step whose output port is never consumed is rejected at `define`
   time**, as `DefinitionError.OrphanStep(step)`, instead of silently never
   running: every step created via `perform`/`embed` must have its output
@@ -201,6 +213,57 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   whether the first `await` consumed a normal outcome or already reported
   `Lost`. If you need to know which one actually happened, keep the first
   `await`'s own result — do not rely on a second call to re-derive it.
+
+## Design decisions
+
+**The scheduler keeps a central per-run value store, departing from
+saga-design.md's original stance (see "Typed DAG construction" /
+saga-design.md:197-215, which reads "The scheduler must not use a central
+native-value structure like `Dict(NodeId, Dynamic)`").**
+
+Local execution (this repo's scope, before durable execution) originally
+gave every node its own single-value mailbox cell, allocated fresh each
+time the workflow's builder ran. That kept the scheduler's own state
+free of any central heterogeneous map — each node's result lived only in
+that node's own typed `Subject`. It also meant every run re-evaluated the
+builder from scratch, and every dependency read was a selective receive
+whose cost grew with how many prior messages already sat in that mailbox:
+O(N) per read, O(N^2) total per run for a workflow whose reads scale with
+N.
+`bench/RESULTS.md` measured this directly — before this change, a 2000-step
+chain's median run time was ~392ms and grew roughly 4x every time the step
+count doubled.
+
+The fix builds a workflow's graph exactly once, at `define`, and moves
+per-run values into `saga/internal/store` — one `Dict(Int, Native)` keyed
+by node id, `Native` being that module's own opaque, type-erased carrier
+(never `gleam/dynamic.Dynamic`, never inspected or decoded — only ever
+cast back to the exact type it was stored as). This is, structurally,
+exactly the central `Dict(NodeId, Dynamic)` shape saga-design.md ruled
+out. The trade was made deliberately: `store.get`'s one native identity
+coercion is sound _by construction_, not by convention or caller
+discipline — see `saga/internal/store`'s own doc comment for the full
+argument, summarized here:
+
+> A node id and its element type are bound together exactly once, in the
+> same `perform` call that both allocates the id and returns the typed,
+> opaque `Port` whose `fetch` closure reads that id back. No other code
+> path can construct a `Port` for one node id typed differently than the
+> `perform` call that created it, so no caller can ever read a node's
+> value at the wrong type.
+
+With that invariant holding, centralizing per-run storage turned an O(N)
+mailbox read into an O(1) map lookup, and a follow-on fix
+(`saga/internal/min_heap`, replacing a full node-order scan in the
+admission loop) turned an O(N) admission decision into an O(log N) one.
+Together these took the same 2000-step chain from ~392ms median to ~8ms
+(roughly 49x), and flattened the growth curve from ~4x per doubling
+(quadratic) to ~2x per doubling (linear) — see `bench/RESULTS.md` for the
+full before/after tables. The scheduler's _authoring_-time API is
+unaffected: no caller-facing type ever becomes `Dynamic`, no step looks up
+a dependency by name, and the one unsafe cast is confined to a single
+internal module with a stated soundness invariant, not spread through the
+scheduler or exposed to callers.
 
 ## Development
 

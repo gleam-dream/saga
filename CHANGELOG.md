@@ -17,16 +17,31 @@ increments toward the first local-execution release.
   built once and shared, unchanged, across every run of a `Workflow`;
   per-run values live in a run-scoped store (`saga/internal/store`) keyed
   by node id, with exactly one unsafe (but sound-by-construction) coercion
-  in the whole package, isolated to that module. See `bench/RESULTS.md`
-  for before/after measurements (roughly 4x median run-time reduction at
-  N=2000 across the benchmarked shapes, with build invocations dropping
-  from one per run to one per `Workflow`).
+  in the whole package, isolated to that module. See `bench/RESULTS.md` and
+  the "Design decisions" section of README.md for before/after
+  measurements and the trade this makes: the store change alone measured
+  1.42x-1.68x faster median run time at N=2000 (not "roughly 4x" — that
+  figure was the _growth-ratio_ ceiling that still remained, not the
+  speedup); combined with the admission fix below, the two together
+  measured 14x-49x faster median run time at N=2000, depending on shape,
+  with build invocations dropping from one per run to one per `Workflow`.
+- **Performance: `coordinator.admit` no longer scans every node on every
+  admission decision.** A min-heap of ready node ids
+  (`saga/internal/min_heap`) is pushed to exactly when a node becomes
+  admittable and popped by `admit`, in the same ascending (builder-call)
+  order a full scan always yielded — verified unchanged against the
+  Reactor differential oracle and a new direct regression test. This
+  closed the remaining growth-ratio gap the store change alone left open:
+  median run time now grows ~2x per doubling (linear) instead of ~4x
+  (quadratic).
 - Relaxed the workflow builder's purity/determinism requirement
-  accordingly: it is evaluated exactly once, so nothing about running a
-  `Workflow` depends on calling the builder again and getting the same
-  answer (composing it into another workflow via `embed`/`map_errors`
-  still evaluates it again, at that _other_ workflow's own one-time
-  `define`-time graph construction — never at run time).
+  accordingly: it is evaluated exactly once by `define`, and only ever
+  evaluated again — once — by `embed`, when composing it into a different,
+  unrelated workflow's own `define` evaluation. `map_errors` does **not**
+  evaluate the builder again: it reuses the already-built, already-
+  validated graph directly (see `saga.Workflow`'s and `saga.map_errors`'s
+  own doc comments for exactly which two situations ever invoke a
+  builder).
 
 ### Removed
 
@@ -119,6 +134,22 @@ assert` panic.
 
 ### Fixed
 
+- `map_errors` re-ran a workflow's build function a second time (with no
+  validation at all) to compute its own graph, instead of reusing the
+  already-built, already-validated graph `define` produced. Found by
+  independent review: a builder that was not a pure function of its input
+  could, under this second evaluation, produce a graph shape `define`
+  never checked (`describe(mapped)` could then disagree with what
+  `execution.run` actually executed) or hand back a `Port` stashed from a
+  different evaluation, panicking `store.get` and losing the run instead
+  of completing it. `map_errors` now reuses `workflow`'s own `nodes`/
+  `order`/`root_input_id`/`fetch_output` directly, translating only the
+  node closures (`node.map_errors`); its `build` field is retained solely
+  so a _later_ `embed` of the mapped workflow has a validated builder to
+  call, per the invariant `saga.Workflow`'s doc comment now states
+  precisely: a builder is invoked in exactly two situations (once by its
+  own `define`, once more per `embed` into another workflow), never any
+  other way.
 - A panicking or slow `saga.map` placed between two steps ran unprotected
   in the coordinator process itself, able to crash the whole run's
   scheduler (losing rollback) or block cancellation/deadline handling for
