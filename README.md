@@ -122,12 +122,19 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   it out for you. This is current behavior, not a documentation gap: set
   `deadline` and/or per-step `timeout` explicitly wherever a hang must be
   bounded.
-- **The workflow builder must be pure and deterministic.** `define`
-  evaluates it once to validate and compute static descriptors; every run
-  evaluates it again, fresh. If a real run's graph shape differs from what
-  `define` recorded, the run fails immediately with `DefinitionChanged`
-  before any step is admitted — nothing partially executes against a
-  builder that cannot be trusted to reproduce its own shape.
+- **The workflow builder runs once, at `define` time.** `define` evaluates
+  it to validate the workflow and to build its node graph; no run ever
+  evaluates the builder again. The builder no longer needs to be pure or
+  reproducible run to run — it runs exactly once, period — though it
+  should still be a straightforward description of the workflow's shape,
+  since whatever graph it produces at `define` time is what every future
+  run replays. Per-run values live in a store keyed by node id, isolated
+  per run, so concurrent or successive runs of the same `Workflow` never
+  see each other's data despite sharing the same built graph. Run cost is
+  now dominated by the step work itself and admission bookkeeping, not by
+  re-running the builder or by per-read scheduling overhead: a value read
+  is a single map lookup, not a scan proportional to how many steps have
+  completed. See `bench/RESULTS.md` for measurements.
 - **A step whose output port is never consumed is rejected at `define`
   time**, as `DefinitionError.OrphanStep(step)`, instead of silently never
   running: every step created via `perform`/`embed` must have its output

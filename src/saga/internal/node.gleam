@@ -1,11 +1,17 @@
-/// Erased per-node representation built while a `Workflow`'s builder is
-/// evaluated for one run. A `Node(e, u)` hides the concrete input/output
-/// types of one step behind closures bound at construction time, so the
-/// coordinator's node table can be a homogeneous `Dict(Int, Node(e, u))`
-/// without `Dynamic` or unsafe casts: the erased type parameters `e`/`u` are
-/// still the caller's own workflow error and undo-error types.
+/// Erased per-node representation, built once when a `Workflow`'s builder is
+/// evaluated at `define` time and replayed unchanged for every run of that
+/// definition. A `Node(e, u)` hides the concrete input/output types of one
+/// step behind closures bound at construction time, so the coordinator's
+/// node table can be a homogeneous `Dict(Int, Node(e, u))` without `Dynamic`
+/// or unsafe casts in *this* module: the erased type parameters `e`/`u` are
+/// still the caller's own workflow error and undo-error types. Per-run
+/// values themselves live in a `saga/internal/store.Store`, threaded
+/// through `prepare_attempt`/`prepare_crash_recovery`/`commit` below — the
+/// one unsafe coercion in the whole package lives in that module, never
+/// here.
 import gleam/option.{type Option}
 import saga/internal/ffi.{type CrashClass}
+import saga/internal/store.{type Store}
 
 /// A step's recorded location: nested scope (from `embed`), a name, and the
 /// 1-based occurrence rank among nodes sharing the same scope + name.
@@ -33,7 +39,7 @@ pub type Crash {
 pub type ErasedRecovery(e, u) {
   ERetry
   ERetryAfter(milliseconds: Int)
-  EContinue(commit: fn() -> Option(fn() -> Result(Nil, u)))
+  EContinue(commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))))
   EAbort(error: e)
   EAbortCleanup(error: e, cleanup_error: u)
   EHold(evidence: e)
@@ -55,7 +61,9 @@ pub type ErasedRecovery(e, u) {
 /// — variants that carry no `e`-typed payload, so no inversion is needed
 /// there either.
 pub type AttemptResult(e, u) {
-  AttemptSucceeded(commit: fn() -> Option(fn() -> Result(Nil, u)))
+  AttemptSucceeded(
+    commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
+  )
   AttemptFailed(
     failure: AttemptFailure(e),
     recover: Option(fn(Attempt) -> fn() -> ErasedRecovery(e, u)),
@@ -80,14 +88,14 @@ pub fn map_errors(
     timeout: a_node.timeout,
     undoable: a_node.undoable,
     compensates: a_node.compensates,
-    prepare_attempt: fn(attempt) {
-      let body = a_node.prepare_attempt(attempt)
+    prepare_attempt: fn(attempt, run_store) {
+      let body = a_node.prepare_attempt(attempt, run_store)
       fn() { map_attempt_result(body(), map_error, map_undo_error) }
     },
     prepare_crash_recovery: option.map(
       a_node.prepare_crash_recovery,
       fn(prepare) {
-        fn(failure: AttemptFailure(e2), attempt: Attempt) {
+        fn(failure: AttemptFailure(e2), attempt: Attempt, run_store: Store) {
           // `failure` only ever carries `Crashed`/`TimedOut` here (never
           // `Returned`, see `AttemptResult`'s doc comment), so re-tagging it
           // as `AttemptFailure(e1)` never touches an `e`-typed payload.
@@ -97,7 +105,7 @@ pub fn map_errors(
             Returned(_) ->
               panic as "saga: Returned failure reached prepare_crash_recovery"
           }
-          let body = prepare(untagged, attempt)
+          let body = prepare(untagged, attempt, run_store)
           fn() { map_erased_recovery(body(), map_error, map_undo_error) }
         }
       },
@@ -106,18 +114,22 @@ pub fn map_errors(
 }
 
 fn map_undo_thunk(
-  commit: fn() -> Option(fn() -> Result(Nil, u1)),
+  commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u1))),
   map_undo_error: fn(u1) -> u2,
-) -> fn() -> Option(fn() -> Result(Nil, u2)) {
-  fn() {
-    option.map(commit(), fn(undo_run) {
-      fn() {
-        case undo_run() {
-          Ok(Nil) -> Ok(Nil)
-          Error(error) -> Error(map_undo_error(error))
+) -> fn(Store) -> #(Store, Option(fn() -> Result(Nil, u2))) {
+  fn(run_store) {
+    let #(next_store, undo_option) = commit(run_store)
+    #(
+      next_store,
+      option.map(undo_option, fn(undo_run) {
+        fn() {
+          case undo_run() {
+            Ok(Nil) -> Ok(Nil)
+            Error(error) -> Error(map_undo_error(error))
+          }
         }
-      }
-    })
+      }),
+    )
   }
 }
 
@@ -188,9 +200,9 @@ pub type Node(e, u) {
     timeout: Option(Int),
     undoable: Bool,
     compensates: Bool,
-    prepare_attempt: fn(Attempt) -> fn() -> AttemptResult(e, u),
+    prepare_attempt: fn(Attempt, Store) -> fn() -> AttemptResult(e, u),
     prepare_crash_recovery: Option(
-      fn(AttemptFailure(e), Attempt) -> fn() -> ErasedRecovery(e, u),
+      fn(AttemptFailure(e), Attempt, Store) -> fn() -> ErasedRecovery(e, u),
     ),
   )
 }
