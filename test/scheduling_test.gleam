@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/list
 import gleeunit/should
 import saga
@@ -261,4 +262,44 @@ fn is_compensating(state: execution.StepState) -> Bool {
     execution.Compensating(_) -> True
     _ -> False
   }
+}
+
+/// Several independent, immediately-ready siblings, all admitted at
+/// `max_concurrency: 1` so they can only start one at a time: admission
+/// must pick them in builder-call (ascending node id) order, never in
+/// registration/hash order or any other incidental order. This locks in
+/// the tie-break `saga/internal/coordinator.admit`'s ready-heap must
+/// preserve (the same order a full scan of `state.order` always yielded)
+/// as a first-class regression test, independent of the Reactor
+/// differential oracle's own byte-for-byte trace checks (`oracle_d6`,
+/// `oracle_d7`) that exercise the same guarantee incidentally.
+pub fn siblings_admitted_in_builder_order_test() {
+  let started = process.new_subject()
+
+  let make_step = fn(name: String) {
+    saga.step(name, fn(_x: Int) {
+      process.send(started, name)
+      Ok(Nil)
+    })
+  }
+
+  let assert Ok(workflow) =
+    saga.define("fanout_order", fn(input) {
+      let steps =
+        ["first", "second", "third", "fourth", "fifth"]
+        |> list.map(fn(name) { input |> saga.perform(make_step(name)) })
+      let assert [first, ..rest] = steps
+      saga.all(first, rest)
+    })
+
+  let config = execution.Config(..execution.config(), max_concurrency: 1)
+  let assert Ok(execution.Completed(_)) = execution.run(workflow, 0, config)
+
+  let order =
+    list_range(1, 5)
+    |> list.map(fn(_i) {
+      let assert Ok(name) = process.receive(started, 1000)
+      name
+    })
+  order |> should.equal(["first", "second", "third", "fourth", "fifth"])
 }
