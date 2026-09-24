@@ -49,10 +49,6 @@ Every capability below carries a status:
   `saga.map_step_errors` (single step) and `saga.map_errors` (whole
   workflow) — saga never requires an application to adopt a saga-owned
   error type.
-- Definition-shape validation at run start (`DefinitionChanged`): a
-  workflow builder that produces a different graph shape on a real run
-  than it did at `define` time is rejected before any work is admitted,
-  enforcing the pure-builder requirement.
 - Sequential composition (`saga.embed`) of one workflow into another's
   port graph, sharing the same run and journal.
 - Foreign-port rejection: `define` rejects a `Port` used from outside the

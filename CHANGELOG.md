@@ -6,6 +6,41 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
+### Changed
+
+- **Performance: the workflow build function now runs exactly once, at
+  `define`, never again per run.** Previously every `execution.run`/`start`
+  re-evaluated the builder fresh and checked its shape against the
+  define-time descriptors; per-run values also lived in per-node mailbox
+  cells read via selective receive, which cost O(N) per read and up to
+  O(N^2) per run for a workflow whose reads scale with N. The graph is now
+  built once and shared, unchanged, across every run of a `Workflow`;
+  per-run values live in a run-scoped store (`saga/internal/store`) keyed
+  by node id, with exactly one unsafe (but sound-by-construction) coercion
+  in the whole package, isolated to that module. See `bench/RESULTS.md`
+  for before/after measurements (roughly 4x median run-time reduction at
+  N=2000 across the benchmarked shapes, with build invocations dropping
+  from one per run to one per `Workflow`).
+- Relaxed the workflow builder's purity/determinism requirement
+  accordingly: it is evaluated exactly once, so nothing about running a
+  `Workflow` depends on calling the builder again and getting the same
+  answer (composing it into another workflow via `embed`/`map_errors`
+  still evaluates it again, at that _other_ workflow's own one-time
+  `define`-time graph construction — never at run time).
+
+### Removed
+
+- `execution.Cause.DefinitionChanged` and the definition-shape check it
+  reported: with the build function evaluated exactly once, there is no
+  later re-evaluation whose shape could ever diverge from what `define`
+  recorded, so the variant became permanently unreachable. Removed rather
+  than kept for compatibility, since this package is pre-release and an
+  unreachable public variant in an exhaustive `case` is misleading rather
+  than future-proofing (the same precedent as this changelog's earlier
+  removal of `execution.Phase`'s unreachable `Finishing` variant). Any
+  exhaustive `case` over `execution.Cause` must drop its `DefinitionChanged`
+  arm.
+
 ### Added
 
 - External acceptance package at `examples/order_consumer`: a separate

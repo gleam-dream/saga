@@ -1,11 +1,12 @@
 /// The per-run coordinator process: scheduler, journal, settlement,
 /// deadlines, timeouts, and cancellation.
 ///
-/// One coordinator is spawned per run. It evaluates the workflow's builder
-/// fresh (see `saga.gleam`'s per-run evaluation model), checks it against
-/// the define-time descriptor shape, then runs a bounded admission loop
-/// over the node graph until every node is done or the run has a terminal
-/// cause.
+/// One coordinator is spawned per run. `saga.for_run` hands it the
+/// workflow's already-built node graph (built once, at `define` — see that
+/// module's doc comments) plus a fresh, run-scoped `Store` seeded with this
+/// run's input; the coordinator never evaluates the workflow's builder
+/// itself. It then runs a bounded admission loop over the node graph until
+/// every node is done or the run has a terminal cause.
 ///
 /// A terminal trigger — a step's own terminal failure, a run deadline, or a
 /// cancellation request (explicit, or the owner's exit) — moves the run
@@ -35,6 +36,7 @@ import saga/internal/node.{
   EAbort, EAbortCleanup, EContinue, EHold, ERetry, ERetryAfter, Returned,
   TimedOut,
 }
+import saga/internal/store.{type Store}
 import saga/observation
 import sinal
 
@@ -77,7 +79,6 @@ pub type Cause(e) {
   RetrySuperseded(step: StepAddress, last: AttemptFailure(e))
   OutputCrashed(crash: node.Crash)
   DeadlineExceeded
-  DefinitionChanged
 }
 
 pub type CancelReason {
@@ -242,6 +243,12 @@ type RunState(o, e, u) {
     order: List(Int),
     dependents: Dict(Int, List(Int)),
     state: Dict(Int, NodeRunState),
+    // This run's own value store (`saga/internal/store`): every completed
+    // node's output, keyed by node id, and nothing else — no other run,
+    // concurrent or otherwise, of the same `Workflow` ever touches this
+    // value. See `saga.for_run`'s doc comment for why the shared, built-once
+    // node graph does not compromise run isolation.
+    store: Store,
     // The failure that triggered the currently in-flight (or most recently
     // finished) recovery decision for a node, kept so `RetryLimitReached`
     // can report which failure exhausted the budget.
@@ -284,10 +291,10 @@ type Trigger(e) {
 
 /// Spawns a coordinator for one run and returns once it is alive, with its
 /// pid, the subject the outcome will be sent to, and the run's id.
-/// `build_graph` evaluates the workflow's builder fresh, inside the
-/// coordinator, and must return `Error(Nil)` if the resulting graph doesn't
-/// match the define-time shape (nondeterministic builder). `owner` is
-/// monitored: its exit is treated as a cancellation with `OwnerExited`.
+/// `build_graph` calls `saga.for_run` for this one run: the workflow's
+/// already-built node graph (built once, at `define`) plus a fresh
+/// run-scoped `Store` and the output-fetch thunk. `owner` is monitored: its
+/// exit is treated as a cancellation with `OwnerExited`.
 pub fn start(
   workflow_name workflow_name: String,
   owner owner: Pid,
@@ -296,10 +303,7 @@ pub fn start(
   settle_timeout settle_timeout: Int,
   cleanup_timeout cleanup_timeout: Int,
   build_graph build_graph: fn() ->
-    Result(
-      #(Dict(Int, Node(e, u)), List(Int), fn() -> ffi.RescueResult(o)),
-      Nil,
-    ),
+    #(Dict(Int, Node(e, u)), List(Int), Store, fn(Store) -> ffi.RescueResult(o)),
   result_subject result_subject: Subject(Outcome(o, e, u)),
   control_subject_out control_subject_out: Subject(Subject(Control(o, e, u))),
 ) -> #(Pid, Int) {
@@ -342,10 +346,7 @@ fn run(
   settle_timeout: Int,
   cleanup_timeout: Int,
   build_graph: fn() ->
-    Result(
-      #(Dict(Int, Node(e, u)), List(Int), fn() -> ffi.RescueResult(o)),
-      Nil,
-    ),
+    #(Dict(Int, Node(e, u)), List(Int), Store, fn(Store) -> ffi.RescueResult(o)),
   result_subject: Subject(Outcome(o, e, u)),
   control_subject_out: Subject(Subject(Control(o, e, u))),
   ready: Subject(Nil),
@@ -355,53 +356,44 @@ fn run(
   let owner_monitor = process.monitor(owner)
   process.send(control_subject_out, control)
   process.send(ready, Nil)
-  case build_graph() {
-    Error(Nil) -> {
-      process.send(
-        result_subject,
-        Failed(DefinitionChanged, empty_settlement()),
-      )
-      Nil
-    }
-    Ok(#(nodes, order, fetch_output)) -> {
-      let dependents = build_dependents(nodes)
-      let node_state =
-        dict.map_values(nodes, fn(_id, n) { NodeWaiting(list.length(n.deps)) })
-      let deadline_timer = case deadline {
-        None -> None
-        Some(ms) -> {
-          let seq = ffi.unique_integer()
-          Some(process.send_after(control, ms, DeadlineFired(seq)))
-        }
-      }
-      let start_time = ffi.monotonic_time()
-      emit_run_started(workflow_name, run_id)
-      let initial =
-        RunState(
-          workflow_name: workflow_name,
-          run_id: run_id,
-          control: control,
-          nodes: nodes,
-          order: order,
-          dependents: dependents,
-          state: node_state,
-          last_failure: dict.new(),
-          running: 0,
-          max_concurrency: max_concurrency,
-          deadline: deadline,
-          settle_timeout: settle_timeout,
-          cleanup_timeout: cleanup_timeout,
-          deadline_timer: deadline_timer,
-          owner_monitor: owner_monitor,
-          journal: [],
-          phase: PhaseRunning,
-          start_time: start_time,
-          timed_out_attempts: [],
-        )
-      let admitted = admit(initial)
-      loop(admitted, fetch_output, result_subject)
+  let #(nodes, order, run_store, fetch_output) = build_graph()
+  let dependents = build_dependents(nodes)
+  let node_state =
+    dict.map_values(nodes, fn(_id, n) { NodeWaiting(list.length(n.deps)) })
+  let deadline_timer = case deadline {
+    None -> None
+    Some(ms) -> {
+      let seq = ffi.unique_integer()
+      Some(process.send_after(control, ms, DeadlineFired(seq)))
     }
   }
+  let start_time = ffi.monotonic_time()
+  emit_run_started(workflow_name, run_id)
+  let initial =
+    RunState(
+      workflow_name: workflow_name,
+      run_id: run_id,
+      control: control,
+      nodes: nodes,
+      order: order,
+      dependents: dependents,
+      state: node_state,
+      store: run_store,
+      last_failure: dict.new(),
+      running: 0,
+      max_concurrency: max_concurrency,
+      deadline: deadline,
+      settle_timeout: settle_timeout,
+      cleanup_timeout: cleanup_timeout,
+      deadline_timer: deadline_timer,
+      owner_monitor: owner_monitor,
+      journal: [],
+      phase: PhaseRunning,
+      start_time: start_time,
+      timed_out_attempts: [],
+    )
+  let admitted = admit(initial)
+  loop(admitted, fetch_output, result_subject)
 }
 
 fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
@@ -419,7 +411,7 @@ fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
 
 fn loop(
   state: RunState(o, e, u),
-  fetch_output: fn() -> ffi.RescueResult(o),
+  fetch_output: fn(Store) -> ffi.RescueResult(o),
   result_subject: Subject(Outcome(o, e, u)),
 ) -> Nil {
   case run_finished(state) {
@@ -432,7 +424,7 @@ fn loop(
     None ->
       case all_nodes_done(state) {
         True ->
-          case fetch_output() {
+          case fetch_output(state.store) {
             ffi.Rescued(output) -> {
               cancel_deadline_timer(state)
               // `timed_out_attempts` is accumulated oldest-last (each new
@@ -591,7 +583,7 @@ fn start_attempt(
   let seq = ffi.unique_integer()
   let attempt =
     Attempt(number: attempt_number, remaining: n.max_attempts - attempt_number)
-  let body = n.prepare_attempt(attempt)
+  let body = n.prepare_attempt(attempt, state.store)
   let control = state.control
   let pid =
     process.spawn(fn() {
@@ -792,13 +784,13 @@ fn attempt_result_kind(failure: AttemptFailure(e)) -> observation.AttemptKind {
 fn commit_success(
   state: RunState(o, e, u),
   node_id: Int,
-  commit: fn() -> Option(fn() -> Result(Nil, u)),
+  commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
   step_kind: observation.AttemptKind,
 ) -> RunState(o, e, u) {
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let attempt_number = attempt_number_for(state, node_id)
   let duration = duration_since_started(state, node_id)
-  let undo = commit()
+  let #(next_store, undo) = commit(state.store)
   emit_step_stopped(state, n.address, attempt_number, step_kind, duration)
   let entry = JournalEntry(node_id: node_id, address: n.address, undo: undo)
   let dependent_ids = dict.get(state.dependents, node_id) |> option_unwrap_list
@@ -808,6 +800,7 @@ fn commit_success(
       running: state.running - 1,
       journal: [entry, ..state.journal],
       state: dict.insert(state.state, node_id, NodeDone),
+      store: next_store,
     )
   let state = decrement_dependents(state, dependent_ids)
   // While running, a success may unblock new admissions. While settling or
@@ -1140,7 +1133,7 @@ fn handle_task_crashed(
 fn start_crash_recovery(
   state: RunState(o, e, u),
   node_id: Int,
-  prepare: fn(AttemptFailure(e), Attempt) -> fn() -> ErasedRecovery(e, u),
+  prepare: fn(AttemptFailure(e), Attempt, Store) -> fn() -> ErasedRecovery(e, u),
   failure: AttemptFailure(e),
 ) -> RunState(o, e, u) {
   let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer, _started_at)) =
@@ -1153,7 +1146,7 @@ fn start_crash_recovery(
     node_id,
     attempt_number,
     failure,
-    prepare(failure, attempt),
+    prepare(failure, attempt, state.store),
   )
 }
 

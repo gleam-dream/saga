@@ -413,16 +413,28 @@ pub fn completion_processed_before_cancel_is_undone_test() {
 /// The owning process exits: the coordinator treats this as a cancellation
 /// (`OwnerExited`), settles, rolls back completed steps, and exits itself
 /// (observed here via a monitor on `execution.pid`, from a third process).
+///
+/// The step is gated so it cannot complete until this test has confirmed
+/// (via its own monitor on the owner process) that the owner has actually
+/// exited first. Without this, the step's own trivial work has no forced
+/// ordering against the owner's exit: nothing stops the coordinator from
+/// admitting and completing "s" before it ever processes `OwnerDown`, in
+/// which case the run legitimately completes with nothing to roll back and
+/// `undo_counter` never reaches 1 — a race the build-once refactor's speedup
+/// made easy to lose, not a behavior this test should depend on winning.
 pub fn owner_exit_cancels_and_rolls_back_test() {
   let undo_counter = probe.new_counter()
-  let outcome_subject = process.new_subject()
   let coordinator_pid_subject = process.new_subject()
+  let step_gate = probe.new_gate()
 
   let assert Ok(workflow) =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
-        saga.step("s", fn(x: Int) { Ok(x) })
+        saga.step("s", fn(x: Int) {
+          probe.enter(step_gate)
+          Ok(x)
+        })
         |> saga.undo(fn(_i, _o) {
           probe.counter_enter(undo_counter)
           Ok(Nil)
@@ -430,25 +442,38 @@ pub fn owner_exit_cancels_and_rolls_back_test() {
       )
     })
 
+  let owner_done = process.new_subject()
   let owner_pid =
     process.spawn(fn() {
       let assert Ok(exec) = execution.start(workflow, 0, execution.config())
       process.send(coordinator_pid_subject, execution.pid(exec))
       // Exit immediately without awaiting, simulating an owner crash.
+      process.send(owner_done, Nil)
       Nil
     })
-  let _ = owner_pid
 
   let assert Ok(coordinator_pid) =
     process.receive(coordinator_pid_subject, 10_000)
+
+  // Wait for the owner process to have genuinely exited before letting "s"
+  // proceed, so `OwnerDown` is guaranteed to reach the coordinator ahead of
+  // the step's own completion.
+  let owner_monitor = process.monitor(owner_pid)
+  let owner_down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(owner_monitor, fn(down) { down })
+  let _owner_down = process.selector_receive_forever(owner_down_selector)
+  let _ = process.receive(owner_done, 1000)
+
   let monitor = process.monitor(coordinator_pid)
   let selector =
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(down) { down })
-  let _down = process.selector_receive_forever(selector)
 
+  probe.open(step_gate)
+
+  let _down = process.selector_receive_forever(selector)
   probe.await_total_entries(undo_counter, 1, 10_000)
-  process.send(outcome_subject, Nil)
 }
 
 /// If the coordinator itself is killed externally, `await` returns `Lost`,

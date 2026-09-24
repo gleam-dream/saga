@@ -180,7 +180,6 @@ fn describe_cause(cause: execution.Cause(domain.CheckoutError)) -> String {
       <> " could not retry: the run was already settling"
     execution.OutputCrashed(_crash) -> "an output transform crashed"
     execution.DeadlineExceeded -> "the run's deadline was exceeded"
-    execution.DefinitionChanged -> "the workflow builder was nondeterministic"
   }
 }
 

@@ -5,7 +5,8 @@
     schedulers_online/0,
     unique_integer/0,
     monotonic_time/0,
-    system_time/0
+    system_time/0,
+    identity/1
 ]).
 
 %% Runs `Fun` and calls back into exactly one of the supplied continuations:
@@ -39,3 +40,11 @@ monotonic_time() ->
 
 system_time() ->
     erlang:system_time(millisecond).
+
+%% A native no-op, used only by `saga/internal/store`'s single unsafe coerce
+%% to change a value's Gleam-tracked type without touching the value itself
+%% (BEAM erases parametric types at runtime, so this never inspects or
+%% rebuilds anything -- see that module's doc comment for the soundness
+%% argument).
+identity(X) ->
+    X.

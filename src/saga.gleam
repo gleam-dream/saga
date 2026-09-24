@@ -19,6 +19,7 @@ import saga/internal/ffi
 import saga/internal/node.{
   type ErasedRecovery, type Node, AttemptSucceeded, Node,
 }
+import saga/internal/store.{type Store}
 
 /// A step's recorded location: nested scope (from `embed`), a name, and the
 /// 1-based occurrence rank among nodes sharing the same scope + name.
@@ -427,28 +428,37 @@ fn root_scope() -> ScopeToken {
 ///
 /// `fetch` has three levels, each meant to run in a different place:
 ///
-///  1. The outer call happens while the graph is being built (in `perform`,
-///     `both`, `all`, `map`, and `for_run`'s final output read): purely
-///     structural, composing closures, never touching a cell.
+///  1. The outer call happens while the graph is being built, exactly once
+///     per `Workflow` (in `perform`, `both`, `all`, `map`, and `define`'s
+///     final output read): purely structural, composing closures, never
+///     touching a run's values.
 ///  2. The middle call happens in the coordinator, once per attempt
 ///     (`perform`'s `prepare_attempt`/`prepare_crash_recovery`) or once for
-///     the final output (`for_run`'s `fetch_output`): it performs every
-///     underlying cell read (`cell.read` is a selective receive, which only
-///     the coordinator — the cell's owning process — may perform) and
-///     returns a *pure* thunk with the raw dependency value(s) already
-///     captured.
+///     the final output (`for_run`'s `fetch_output`), and is given that
+///     run's `Store`: it performs every underlying dependency read
+///     (`store.get`, only ever called by the coordinator — the process that
+///     owns this run's `Store`) and returns a *pure* thunk with the raw
+///     dependency value(s) already captured.
 ///  3. The inner call happens wherever that pure thunk is actually run: for
 ///     `perform`, inside the spawned attempt/recovery task, under `rescue`.
 ///     This is the only level `map`'s `with` function is ever invoked from,
 ///     so a panicking or slow `map` becomes an ordinary attempt
 ///     crash/duration instead of reaching the coordinator.
+///
+/// Because the graph is now built once at `define` (see `Workflow`'s doc
+/// comment) and every subsequent run of the same definition replays the
+/// same node closures, `fetch`'s outer (level 1) call happens only once,
+/// ever, per `Workflow` value -- not once per run as it did when the
+/// builder was re-evaluated fresh for every run. What *is* per-run is the
+/// `Store` threaded into level 2, which is why a value read can never leak
+/// between two runs of the same definition despite sharing one build.
 pub opaque type Port(a, e, u) {
   Port(
     scope: ScopeToken,
     nodes: Dict(Int, Node(e, u)),
     deps: Set(Int),
     errors: List(DefinitionError),
-    fetch: fn() -> fn() -> fn() -> a,
+    fetch: fn() -> fn(store.Store) -> fn() -> a,
   )
 }
 
@@ -456,7 +466,7 @@ fn merge_ports(
   scope: ScopeToken,
   first: Port(a, e, u),
   second: Port(b, e, u),
-  fetch: fn() -> fn() -> fn() -> c,
+  fetch: fn() -> fn(store.Store) -> fn() -> c,
 ) -> Port(c, e, u) {
   let foreign_errors =
     list.append(
@@ -496,8 +506,8 @@ fn foreign_error_for(
 pub fn map(port: Port(a, e, u), with: fn(a) -> b) -> Port(b, e, u) {
   Port(..port, fetch: fn() {
     let capture_a = port.fetch()
-    fn() {
-      let produce_a = capture_a()
+    fn(store) {
+      let produce_a = capture_a(store)
       fn() { with(produce_a()) }
     }
   })
@@ -512,9 +522,9 @@ pub fn both(
   merge_ports(first.scope, first, second, fn() {
     let capture_a = first.fetch()
     let capture_b = second.fetch()
-    fn() {
-      let produce_a = capture_a()
-      let produce_b = capture_b()
+    fn(store) {
+      let produce_a = capture_a(store)
+      let produce_b = capture_b(store)
       fn() { #(produce_a(), produce_b()) }
     }
   })
@@ -553,8 +563,6 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   let deps = set.to_list(input.deps)
   let capture_input = input.fetch()
 
-  let output_cell = cell.new()
-
   let to_erased_recovery = fn(recovery: Recovery(o, e, u)) -> ErasedRecovery(
     e,
     u,
@@ -563,12 +571,11 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       Retry -> node.ERetry
       RetryAfter(ms) -> node.ERetryAfter(ms)
       Continue(output, undo_choice) ->
-        node.EContinue(commit: fn() {
-          cell.write(output_cell, output)
-          case undo_choice {
+        node.EContinue(commit: fn(run_store) {
+          #(store.put(run_store, id, output), case undo_choice {
             NoUndo -> None
             UndoWith(run) -> Some(fn() { run() })
-          }
+          })
         })
       Abort(error) -> node.EAbort(error)
       AbortAfterCleanupFailure(error, cleanup_error) ->
@@ -579,30 +586,29 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
 
   // `prepare_attempt`/`prepare_crash_recovery` are themselves called by the
   // coordinator, so this is where `capture_input` (the port's fetch,
-  // level 2 — see `Port`'s doc comment) is invoked: every underlying cell
-  // read it performs (a selective receive, which only a cell's owning
-  // process — the coordinator — may perform) happens here, in the
-  // coordinator. Its result, `produce_value`, is the pure level-3 thunk:
-  // for a plain dependency it just returns the already-read value, but for
-  // a `map`med port it also closes over the caller-supplied (potentially
-  // panicking, potentially slow) transformation function. `produce_value`
-  // is therefore only ever invoked from inside the spawned task body below,
-  // under `rescue`, never here — so a panicking or slow `map` becomes an
-  // ordinary attempt crash/duration instead of taking the coordinator down
-  // or blocking its mailbox.
-  let prepare_attempt = fn(_node_attempt: node.Attempt) -> fn() ->
+  // level 2 — see `Port`'s doc comment) is invoked: every underlying
+  // dependency read it performs (`store.get`, which only the coordinator —
+  // the process that owns this run's `Store` — may call) happens here, in
+  // the coordinator. Its result, `produce_value`, is the pure level-3
+  // thunk: for a plain dependency it just returns the already-read value,
+  // but for a `map`med port it also closes over the caller-supplied
+  // (potentially panicking, potentially slow) transformation function.
+  // `produce_value` is therefore only ever invoked from inside the spawned
+  // task body below, under `rescue`, never here — so a panicking or slow
+  // `map` becomes an ordinary attempt crash/duration instead of taking the
+  // coordinator down or blocking it.
+  let prepare_attempt = fn(_node_attempt: node.Attempt, run_store: Store) -> fn() ->
     node.AttemptResult(e, u) {
-    let produce_value = capture_input()
+    let produce_value = capture_input(run_store)
     fn() {
       let value = produce_value()
       case step.attempt(value) {
         Succeeded(output, undo_choice) ->
-          AttemptSucceeded(commit: fn() {
-            cell.write(output_cell, output)
-            case undo_choice {
+          AttemptSucceeded(commit: fn(commit_store) {
+            #(store.put(commit_store, id, output), case undo_choice {
               NoUndo -> None
               UndoWith(run) -> Some(fn() { run() })
-            }
+            })
           })
         Failed(failure, recover_returned) ->
           node.AttemptFailed(
@@ -625,16 +631,19 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   // never returned an `AttemptResult` at all, so `AttemptFailed.recover` was
   // never bound). This calls `decide_crash` directly with the input value
   // for this attempt — not a re-run of the step's effect, so nothing is
-  // repeated. As with `prepare_attempt` above, `capture_input()` (every
-  // underlying cell read) runs here, in the coordinator, while the
-  // resulting `produce_value` thunk is only invoked inside the returned
+  // repeated. As with `prepare_attempt` above, `capture_input(run_store)`
+  // (every underlying dependency read) runs here, in the coordinator, while
+  // the resulting `produce_value` thunk is only invoked inside the returned
   // inner thunk (run inside the recovery task, under `rescue`), so a
   // panicking or slow upstream `map` cannot crash or block the coordinator.
   let prepare_crash_recovery =
     option.map(step.decide_crash, fn(decide_fn) {
-      fn(node_failure: node.AttemptFailure(e), node_attempt: node.Attempt) -> fn() ->
-        ErasedRecovery(e, u) {
-        let produce_value = capture_input()
+      fn(
+        node_failure: node.AttemptFailure(e),
+        node_attempt: node.Attempt,
+        run_store: Store,
+      ) -> fn() -> ErasedRecovery(e, u) {
+        let produce_value = capture_input(run_store)
         let crash_or_timeout = case node_failure {
           node.Crashed(crash) -> StepCrashed(crash_from_node(crash))
           node.TimedOut -> StepTimedOut
@@ -691,8 +700,8 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       timeout_error,
     ]),
     fetch: fn() {
-      fn() {
-        let value = cell.read(output_cell)
+      fn(run_store) {
+        let value = store.get(run_store, id)
         fn() { value }
       }
     },
@@ -716,12 +725,27 @@ fn failure_to_node(failure: AttemptFailure(e)) -> node.AttemptFailure(e) {
 // ---------------------------------------------------------------------------
 
 /// A pure, named workflow description with input, output, business error,
-/// and undo-error types. `define` evaluates `build` once to validate it;
-/// `saga/execution` evaluates it again, fresh, at the start of every run.
+/// and undo-error types. `define` evaluates `build` exactly once — in the
+/// calling process, before any run exists — to validate the workflow and
+/// to compute this static, immutable graph (`nodes`/`order`/
+/// `fetch_output`). `build` itself is retained only so `embed`/
+/// `map_errors` can splice this workflow's port graph into another
+/// workflow's *own* single `define`-time evaluation (graph composition,
+/// not a run); no run ever calls `build` again. Every run of this
+/// `Workflow` (however many, however concurrent) replays the *same* node
+/// closures against its own fresh `saga/internal/store.Store`, created by
+/// `for_run` — see that function's doc comment for why this is safe
+/// despite the graph being shared: nothing about a node's closures is
+/// mutated by running them, and every value a run produces lives in that
+/// run's own `Store`, never in the shared graph.
 pub opaque type Workflow(i, o, e, u) {
   Workflow(
     name: String,
     build: fn(Port(i, e, u)) -> Port(o, e, u),
+    root_input_id: Int,
+    nodes: Dict(Int, Node(e, u)),
+    order: List(Int),
+    fetch_output: fn(Store) -> fn() -> o,
     descriptors: List(StepDescriptor),
   )
 }
@@ -729,13 +753,23 @@ pub opaque type Workflow(i, o, e, u) {
 /// Builds and validates a named workflow. Validation runs the builder once,
 /// in the calling process, before any runtime resource exists: it checks
 /// step names, attempt budgets, timeouts, and that every port used belongs
-/// to this evaluation. All errors are collected, not just the first.
+/// to this evaluation. All errors are collected, not just the first. This
+/// one evaluation also *is* the workflow's graph construction for running
+/// it — no run ever evaluates `build` again (see `Workflow`'s doc comment),
+/// so the former "must be pure and deterministic because a real run
+/// re-evaluates it" requirement is gone: nothing about running this
+/// `Workflow` depends on calling `build` a second time and getting the
+/// same answer. (`build` is still called again *at another workflow's own
+/// `define` time* if this one is later composed in with `embed` or
+/// `map_errors` — that is graph construction, not a run, and happens at
+/// most once per composing `define` call, same as any other node.)
 pub fn define(
   name: String,
   build: fn(Port(i, e, u)) -> Port(o, e, u),
 ) -> Result(Workflow(i, o, e, u), List(DefinitionError)) {
   let scope = root_scope()
-  let root_input = fresh_root_port(scope)
+  let root_input_id = ffi.unique_integer()
+  let root_input = fresh_root_port(scope, root_input_id)
   let output = build(root_input)
 
   let name_errors = case name {
@@ -753,12 +787,24 @@ pub fn define(
     list.flatten([name_errors, output.errors, root_scope_errors, orphan_errors])
 
   case all_errors {
-    [] ->
+    [] -> {
+      let #(ordered_ids, nodes) = resolved_nodes(output.nodes)
+      // Called once, here, ever: this is the *only* place `output.fetch()`
+      // (level 1 — see `Port`'s doc comment) is invoked for this
+      // `Workflow`'s final output. The resulting level-2 closure is stored
+      // on the `Workflow` and re-invoked fresh (with a new `Store`) by
+      // every run in `for_run`.
+      let fetch_output = output.fetch()
       Ok(Workflow(
         name: name,
         build: build,
+        root_input_id: root_input_id,
+        nodes: nodes,
+        order: ordered_ids,
+        fetch_output: fetch_output,
         descriptors: descriptors_for(output),
       ))
+    }
     _ -> Error(all_errors)
   }
 }
@@ -793,16 +839,21 @@ fn orphan_errors_for(
   }
 }
 
-fn fresh_root_port(scope: ScopeToken) -> Port(i, e, u) {
-  let input_cell = cell.new()
+/// The workflow's own input port, keyed by `root_input_id` in the same
+/// per-run `Store` every other node's value lives in. This is the *only*
+/// port with no corresponding `Node` in the graph (nothing schedules or
+/// admits it — its value is seeded directly by `for_run`, before any node
+/// is admitted), so it uses `store.get`/`store.put` on that reserved id
+/// exactly like an ordinary node's output would.
+fn fresh_root_port(scope: ScopeToken, root_input_id: Int) -> Port(i, e, u) {
   Port(
     scope: scope,
     nodes: dict.new(),
     deps: set.new(),
     errors: [],
     fetch: fn() {
-      fn() {
-        let value = cell.read(input_cell)
+      fn(run_store) {
+        let value = store.get(run_store, root_input_id)
         fn() { value }
       }
     },
@@ -874,61 +925,55 @@ fn resolved_nodes(
   #(ordered_ids, with_resolved_addresses)
 }
 
-/// Evaluates `workflow`'s builder fresh, for one run, and returns the
-/// resolved node graph in builder-call order plus a thunk that fetches the
-/// final output (must be called only after every node is done). Used only
-/// by `saga/execution`, which owns process/run lifecycle; this function
-/// performs no I/O and starts no process itself.
+/// Prepares one fresh run of `workflow`: a brand-new `Store` seeded with
+/// `input` at the workflow's reserved root-input id, alongside the
+/// workflow's already-built node graph (shared, unchanged, across every
+/// run — see `Workflow`'s doc comment) and a thunk that fetches the final
+/// output once every node is done. Used only by `saga/execution`/
+/// `saga/internal/coordinator`, which own process/run lifecycle; this
+/// function performs no I/O and starts no process itself.
 ///
-/// Returns `Error(Nil)` if the freshly evaluated graph's descriptor shape
-/// (addresses and dependencies, in node-id order) differs from the
-/// define-time shape — a nondeterministic builder, which `saga/execution`
-/// reports as `DefinitionChanged` before admitting any work.
+/// Every run gets its own initial `Store`, returned here so the coordinator
+/// can pass it (and every later, updated version it produces via
+/// `store.put` as nodes commit) to each node's `prepare_attempt`/
+/// `prepare_crash_recovery` (see `saga/internal/node`) as it admits that
+/// node — so concurrent or successive runs of the same `Workflow` never
+/// observe each other's values despite replaying the identical node
+/// closures.
+///
+/// The returned fetch-output thunk deliberately takes the `Store` as a
+/// parameter, supplied by the caller at the moment every node is actually
+/// done, rather than closing over the initial `run_store` above: `Store` is
+/// immutable, so the coordinator's own, current, fully-committed store
+/// (threaded through its `RunState` as each node's `commit` returns an
+/// updated value) is a *different* value from the one seeded here, and is
+/// the one that must be read from.
 @internal
 pub fn for_run(
   workflow: Workflow(i, o, e, u),
   input: i,
-) -> Result(
-  #(Dict(Int, node.Node(e, u)), List(Int), fn() -> ffi.RescueResult(o)),
-  Nil,
+) -> #(
+  Dict(Int, node.Node(e, u)),
+  List(Int),
+  Store,
+  fn(Store) -> ffi.RescueResult(o),
 ) {
-  let scope = root_scope()
-  let input_cell = cell.new()
-  cell.write(input_cell, input)
-  let root_input =
-    Port(
-      scope: scope,
-      nodes: dict.new(),
-      deps: set.new(),
-      errors: [],
-      fetch: fn() {
-        fn() {
-          let value = cell.read(input_cell)
-          fn() { value }
-        }
-      },
-    )
-  let output = workflow.build(root_input)
-  let #(ordered_ids, nodes) = resolved_nodes(output.nodes)
-  let live_descriptors = descriptors_for(output)
-  case live_descriptors == workflow.descriptors {
-    False -> Error(Nil)
-    True -> {
-      // Called only from the coordinator's own loop, never from a task —
-      // there is no further step to hand a final `map` off to — so both
-      // the cell reads (level 2) and any pending pure transform (level 3)
-      // are rescued together here.
-      let capture_output = output.fetch()
-      Ok(
-        #(nodes, ordered_ids, fn() {
-          ffi.rescue(fn() {
-            let produce_output = capture_output()
-            produce_output()
-          })
-        }),
-      )
-    }
-  }
+  let run_store = store.new() |> store.put(workflow.root_input_id, input)
+  // `workflow.fetch_output` (level 2 — see `Port`'s doc comment) must not be
+  // called until every node is actually done: it is what performs the
+  // dependency reads (`store.get`) for the workflow's final output, and
+  // those values only exist once their producing nodes have committed. The
+  // coordinator's own loop only invokes the thunk returned here once
+  // `all_nodes_done`, passing its own current `Store` at that moment, so the
+  // level-2 call is deferred to happen *inside* that thunk, alongside the
+  // level-3 call and its `rescue` — never eagerly, here, at run setup,
+  // before a single node has run.
+  #(workflow.nodes, workflow.order, run_store, fn(current_store) {
+    ffi.rescue(fn() {
+      let produce_output = workflow.fetch_output(current_store)
+      produce_output()
+    })
+  })
 }
 
 /// The workflow's declared name.
@@ -971,29 +1016,45 @@ pub fn embed(
   Port(..output, scope: input.scope)
 }
 
-/// Adapts a whole workflow's error and undo-error types.
+/// Adapts a whole workflow's error and undo-error types. Like `define`,
+/// this evaluates the resulting workflow's composed builder exactly once,
+/// here, to compute its own static graph (the mapped workflow is a
+/// first-class `Workflow` in its own right, with its own `root_input_id`
+/// and precomputed `nodes`/`order`/`fetch_output` — not a lazy wrapper
+/// re-evaluated per run).
 pub fn map_errors(
   workflow: Workflow(i, o, e1, u1),
   error map_error: fn(e1) -> e2,
   undo_error map_undo_error: fn(u1) -> u2,
 ) -> Workflow(i, o, e2, u2) {
+  let mapped_build = fn(input: Port(i, e2, u2)) -> Port(o, e2, u2) {
+    let shadow_input = retype_empty_port(input)
+    let shadow_output = workflow.build(shadow_input)
+    let mapped_nodes =
+      dict.map_values(shadow_output.nodes, fn(_id, a_node) {
+        node.map_errors(a_node, map_error, map_undo_error)
+      })
+    Port(
+      scope: shadow_output.scope,
+      nodes: dict.merge(input.nodes, mapped_nodes),
+      deps: shadow_output.deps,
+      errors: shadow_output.errors,
+      fetch: shadow_output.fetch,
+    )
+  }
+  let scope = root_scope()
+  let root_input_id = ffi.unique_integer()
+  let root_input = fresh_root_port(scope, root_input_id)
+  let output = mapped_build(root_input)
+  cell.close(scope.registry)
+  let #(ordered_ids, nodes) = resolved_nodes(output.nodes)
   Workflow(
     name: workflow.name,
-    build: fn(input: Port(i, e2, u2)) -> Port(o, e2, u2) {
-      let shadow_input = retype_empty_port(input)
-      let shadow_output = workflow.build(shadow_input)
-      let mapped_nodes =
-        dict.map_values(shadow_output.nodes, fn(_id, a_node) {
-          node.map_errors(a_node, map_error, map_undo_error)
-        })
-      Port(
-        scope: shadow_output.scope,
-        nodes: dict.merge(input.nodes, mapped_nodes),
-        deps: shadow_output.deps,
-        errors: shadow_output.errors,
-        fetch: shadow_output.fetch,
-      )
-    },
+    build: mapped_build,
+    root_input_id: root_input_id,
+    nodes: nodes,
+    order: ordered_ids,
+    fetch_output: output.fetch(),
     descriptors: workflow.descriptors,
   )
 }

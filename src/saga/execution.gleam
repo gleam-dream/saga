@@ -101,9 +101,9 @@ pub type StepAddress =
 
 /// The run-ending cause behind a `Failed` or a sibling failure recorded in
 /// a `Settlement`. Keeps an application failure (`StepFailed`), an
-/// execution failure (`StepCrashed`/`StepTimedOut`), retry exhaustion, an
-/// output-transform crash, and a nondeterministic builder as distinct
-/// variants, so no report can conflate them.
+/// execution failure (`StepCrashed`/`StepTimedOut`), retry exhaustion, and
+/// an output-transform crash as distinct variants, so no report can
+/// conflate them.
 pub type Cause(e) {
   StepFailed(step: StepAddress, error: e)
   StepCrashed(step: StepAddress, crash: Crash)
@@ -116,7 +116,6 @@ pub type Cause(e) {
   RetrySuperseded(step: StepAddress, last: saga.AttemptFailure(e))
   OutputCrashed(crash: Crash)
   DeadlineExceeded
-  DefinitionChanged
 }
 
 /// One completed step's undo did not succeed, during rollback.
@@ -694,7 +693,6 @@ fn to_public_cause(cause: coordinator.Cause(e)) -> Cause(e) {
     coordinator.OutputCrashed(crash) ->
       OutputCrashed(saga.crash_from_node(crash))
     coordinator.DeadlineExceeded -> DeadlineExceeded
-    coordinator.DefinitionChanged -> DefinitionChanged
   }
 }
 

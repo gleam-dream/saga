@@ -191,26 +191,43 @@ fn atom_kill() -> a {
   atom_kill_ffi("kill")
 }
 
-pub fn nondeterministic_builder_rejected_test() {
+/// The workflow's build function is evaluated exactly once, at `define` —
+/// never again, no matter how many runs (successive or concurrent) follow.
+/// Before the build-once refactor, `execution.run` re-evaluated the builder
+/// fresh on every call and rejected a graph-shape mismatch as
+/// `DefinitionChanged`; that variant and the re-evaluation it detected are
+/// both gone now; this test proves the replacement invariant directly by
+/// counting builder invocations across many runs of the same definition,
+/// run both sequentially and concurrently.
+pub fn build_function_runs_exactly_once_test() {
   let call_count = probe.new_counter()
   let assert Ok(workflow) =
     saga.define("wf", fn(input) {
       probe.counter_enter(call_count)
-      case probe.total_entries(call_count) {
-        1 ->
-          // The define-time dry run: one step.
-          input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }))
-        _ ->
-          // Every later (real-run) evaluation: two steps. The shape no
-          // longer matches what `define` recorded.
-          input
-          |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }))
-          |> saga.perform(saga.step("b", fn(x: Int) { Ok(x) }))
-      }
+      input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))
     })
 
-  case execution.run(workflow, 0, execution.config()) {
-    Ok(execution.Failed(execution.DefinitionChanged, _settlement)) -> Nil
-    _other -> panic as "expected Failed(DefinitionChanged, _), got other outcome"
-  }
+  let assert 1 = probe.total_entries(call_count)
+
+  // Several sequential runs.
+  let assert Ok(execution.Completed(2)) =
+    execution.run(workflow, 1, execution.config())
+  let assert Ok(execution.Completed(6)) =
+    execution.run(workflow, 5, execution.config())
+  let assert Ok(execution.Completed(11)) =
+    execution.run(workflow, 10, execution.config())
+  let assert 1 = probe.total_entries(call_count)
+
+  // Several concurrent runs of the same definition.
+  let executions =
+    [100, 200, 300, 400]
+    |> list.map(fn(input) {
+      let assert Ok(exec) = execution.start(workflow, input, execution.config())
+      exec
+    })
+  list.each(executions, fn(exec) {
+    let assert Ok(execution.Completed(_)) = execution.await(exec, 10_000)
+  })
+
+  let assert 1 = probe.total_entries(call_count)
 }
