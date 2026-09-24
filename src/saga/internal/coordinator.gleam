@@ -30,6 +30,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import saga/internal/ffi
+import saga/internal/min_heap.{type MinHeap}
 import saga/internal/node.{
   type Attempt, type AttemptFailure, type AttemptResult, type ErasedRecovery,
   type Node, type StepAddress, Attempt, AttemptFailed, AttemptSucceeded, Crashed,
@@ -241,8 +242,32 @@ type RunState(o, e, u) {
     control: Subject(Control(o, e, u)),
     nodes: Dict(Int, Node(e, u)),
     order: List(Int),
+    total_nodes: Int,
     dependents: Dict(Int, List(Int)),
     state: Dict(Int, NodeRunState),
+    // Node ids currently eligible for admission (dependency count reached
+    // zero, or a retry became ready) but not yet started, ordered by node
+    // id — i.e. by builder-call order, matching what a full scan of `order`
+    // would have yielded. Pushed to in `mark_ready`, popped in `admit`, so
+    // an admission decision is O(log total_nodes) instead of an O(N) scan
+    // over `order` on every call. See `saga/internal/min_heap`'s doc
+    // comment for why a full scan's *worst-case* total cost across a whole
+    // run (O(N) per admission decision, O(N) decisions) is what this
+    // replaces, not merely a constant-factor speedup.
+    ready: MinHeap,
+    // Nodes that have permanently left the running/waiting lifecycle
+    // (`NodeDone`), maintained incrementally so `all_nodes_done` (checked
+    // on every message processed) is an O(1) comparison against
+    // `total_nodes` instead of an O(N) scan over `state.state`'s values.
+    done_count: Int,
+    // Whether some node is currently `NodeUndoing`. Undo is strictly
+    // sequential (`undo_next` never starts a second undo while one is
+    // active — see `has_active_undo`'s call site), so this is a plain
+    // `Bool`, not a count; maintained incrementally so `rollback_complete`
+    // and `undo_next` (both checked on every message processed, or once
+    // per journal entry during rollback) are O(1) instead of an O(N) scan
+    // over `state.state`'s values.
+    undoing: Bool,
     // This run's own value store (`saga/internal/store`): every completed
     // node's output, keyed by node id, and nothing else — no other run,
     // concurrent or otherwise, of the same `Workflow` ever touches this
@@ -360,6 +385,18 @@ fn run(
   let dependents = build_dependents(nodes)
   let node_state =
     dict.map_values(nodes, fn(_id, n) { NodeWaiting(list.length(n.deps)) })
+  // Every node with no dependencies is ready from the start. Pushed in
+  // ascending node-id order (`order` is already sorted ascending — see
+  // `saga.gleam`'s `resolve_addresses`), matching what a full scan of
+  // `order` would have yielded, so the heap-based `admit` below picks
+  // exactly the same first candidate a linear scan always did.
+  let initial_ready =
+    list.fold(order, min_heap.new(), fn(heap, id) {
+      case dict.get(node_state, id) {
+        Ok(NodeWaiting(0)) -> min_heap.insert(heap, id)
+        _ -> heap
+      }
+    })
   let deadline_timer = case deadline {
     None -> None
     Some(ms) -> {
@@ -376,8 +413,12 @@ fn run(
       control: control,
       nodes: nodes,
       order: order,
+      total_nodes: dict.size(nodes),
       dependents: dependents,
       state: node_state,
+      ready: initial_ready,
+      done_count: 0,
+      undoing: False,
       store: run_store,
       last_failure: dict.new(),
       running: 0,
@@ -510,27 +551,25 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
   }
 }
 
+/// O(1): `state.running` already excludes `NodeUndoing` (only attempts and
+/// compensations increment it — see its own doc comment), and `state.
+/// undoing` is the only other lifecycle state `rollback_complete` must rule
+/// out (undo is strictly sequential, so a `Bool` suffices — see `RunState`'s
+/// doc comment). Equivalent to the previous O(N) scan over every node's
+/// current state, checked here on every message processed.
 fn rollback_complete(state: RunState(o, e, u)) -> Bool {
-  state.journal == []
-  && state.running == 0
-  && list.all(dict.values(state.state), fn(s) {
-    case s {
-      NodeAttempting(..) | NodeCompensating(..) | NodeUndoing(..) -> False
-      _ -> True
-    }
-  })
+  state.journal == [] && state.running == 0 && !state.undoing
 }
 
+/// O(1): `state.done_count` is incremented exactly once per node, in
+/// `commit_success` (the only place a node ever becomes `NodeDone`), so
+/// comparing it against `state.total_nodes` is equivalent to the previous
+/// O(N) scan over every node's current state — checked here on every
+/// message processed while `PhaseRunning`.
 fn all_nodes_done(state: RunState(o, e, u)) -> Bool {
   case state.phase {
     PhaseSettling(..) | PhaseRollingBack(..) -> False
-    PhaseRunning ->
-      list.all(dict.values(state.state), fn(s) {
-        case s {
-          NodeDone -> True
-          _ -> False
-        }
-      })
+    PhaseRunning -> state.done_count == state.total_nodes
   }
 }
 
@@ -538,30 +577,29 @@ fn all_nodes_done(state: RunState(o, e, u)) -> Bool {
 // Admission
 // ---------------------------------------------------------------------------
 
+/// Admits ready nodes up to `max_concurrency`, one at a time, recursing
+/// until either the bound is hit or nothing is left ready. Pops the
+/// smallest node id off `state.ready` (a min-heap — see `RunState`'s doc
+/// comment) rather than scanning `state.order` for every decision: since
+/// `mark_ready`/`retry_now`/`handle_retry_fire` push a node the *moment* it
+/// becomes eligible (dependency count reaches zero, or a retry's backoff
+/// fires), the heap's minimum is always the same node a full ascending scan
+/// of `order` would have found first. A node ready to retry is exactly as
+/// eligible as a node whose dependencies just became ready — neither may
+/// start ahead of `max_concurrency`, and this is the one place that bound
+/// is enforced, so a fired retry is granted a slot here rather than at
+/// `RetryFire`/decision time.
 fn admit(state: RunState(o, e, u)) -> RunState(o, e, u) {
   case state.phase {
     PhaseSettling(..) | PhaseRollingBack(..) -> state
     PhaseRunning ->
       case state.running >= state.max_concurrency {
         True -> state
-        False -> {
-          // A node ready to retry (its backoff already fired, or an
-          // immediate `Retry` was just decided) is exactly as eligible as
-          // a node whose dependencies just became ready — neither may
-          // start ahead of `max_concurrency`, and this is the one place
-          // that bound is enforced, so a fired retry is granted a slot
-          // here rather than at `RetryFire`/decision time.
-          let ready_ids =
-            list.filter(state.order, fn(id) {
-              case dict.get(state.state, id) {
-                Ok(NodeWaiting(0)) -> True
-                Ok(NodeReadyForRetry(_)) -> True
-                _ -> False
-              }
-            })
-          case ready_ids {
-            [] -> state
-            [next, ..] -> {
+        False ->
+          case min_heap.extract_min(state.ready) {
+            Error(Nil) -> state
+            Ok(#(next, remaining_ready)) -> {
+              let state = RunState(..state, ready: remaining_ready)
               let attempt_number = case dict.get(state.state, next) {
                 Ok(NodeReadyForRetry(attempt)) -> attempt
                 _ -> 1
@@ -569,9 +607,20 @@ fn admit(state: RunState(o, e, u)) -> RunState(o, e, u) {
               admit(start_attempt(state, next, attempt_number))
             }
           }
-        }
       }
   }
+}
+
+/// Pushes `node_id` onto the ready heap. Called exactly at the moment a
+/// node becomes eligible for admission: its last outstanding dependency
+/// commits (`decrement_dependents`), an immediate `Retry` is decided
+/// (`retry_now`), or a `RetryAfter` backoff timer fires
+/// (`handle_retry_fire`). Never called twice for the same "becoming ready"
+/// event — each of those call sites transitions the node's own
+/// `NodeRunState` in the same step, so a node cannot be pushed while
+/// already pending in the heap.
+fn mark_ready(state: RunState(o, e, u), node_id: Int) -> RunState(o, e, u) {
+  RunState(..state, ready: min_heap.insert(state.ready, node_id))
 }
 
 fn start_attempt(
@@ -801,6 +850,7 @@ fn commit_success(
       journal: [entry, ..state.journal],
       state: dict.insert(state.state, node_id, NodeDone),
       store: next_store,
+      done_count: state.done_count + 1,
     )
   let state = decrement_dependents(state, dependent_ids)
   // While running, a success may unblock new admissions. While settling or
@@ -856,11 +906,18 @@ fn decrement_dependents(
 ) -> RunState(o, e, u) {
   list.fold(dependent_ids, state, fn(acc, id) {
     case dict.get(acc.state, id) {
-      Ok(NodeWaiting(remaining)) ->
-        RunState(
-          ..acc,
-          state: dict.insert(acc.state, id, NodeWaiting(remaining - 1)),
-        )
+      Ok(NodeWaiting(remaining)) -> {
+        let next_remaining = remaining - 1
+        let acc =
+          RunState(
+            ..acc,
+            state: dict.insert(acc.state, id, NodeWaiting(next_remaining)),
+          )
+        case next_remaining {
+          0 -> mark_ready(acc, id)
+          _ -> acc
+        }
+      }
       _ -> acc
     }
   })
@@ -1036,6 +1093,7 @@ fn retry_now(
     ..state,
     state: dict.insert(state.state, node_id, NodeReadyForRetry(next_attempt)),
   )
+  |> mark_ready(node_id)
   |> admit
 }
 
@@ -1089,6 +1147,7 @@ fn handle_retry_fire(
           NodeReadyForRetry(next_attempt),
         ),
       )
+      |> mark_ready(node_id)
       |> admit
     _ -> state
   }
@@ -1587,8 +1646,13 @@ fn record_held(
   })
 }
 
+/// `state.undoing` (an O(1) flag, not a scan — see `RunState`'s doc
+/// comment) is the guard for "one undo at a time"; it is set `True` exactly
+/// where a node enters `NodeUndoing` below, and cleared by
+/// `handle_undo_done`/`handle_undo_timeout`, the only two places a node
+/// ever leaves it.
 fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
-  case has_active_undo(state) {
+  case state.undoing {
     True -> state
     False ->
       case state.journal {
@@ -1633,19 +1697,11 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
               node_id,
               NodeUndoing(seq, pid, timer, ffi.monotonic_time()),
             ),
+            undoing: True,
           )
         }
       }
   }
-}
-
-fn has_active_undo(state: RunState(o, e, u)) -> Bool {
-  list.any(dict.values(state.state), fn(s) {
-    case s {
-      NodeUndoing(..) -> True
-      _ -> False
-    }
-  })
 }
 
 fn handle_undo_done(
@@ -1675,7 +1731,11 @@ fn handle_undo_done(
       }
       emit_undo_stopped(state, address, undo_outcome_kind(outcome), duration)
       let state =
-        RunState(..state, state: dict.insert(state.state, node_id, new_state))
+        RunState(
+          ..state,
+          state: dict.insert(state.state, node_id, new_state),
+          undoing: False,
+        )
       let _ = attempt_number
       let state = case outcome {
         UndoOk -> record_undone(state, address)
@@ -1717,6 +1777,7 @@ fn handle_undo_timeout(
         RunState(
           ..state,
           state: dict.insert(state.state, node_id, NodeUndoFailedTerminal),
+          undoing: False,
         )
       let state = record_undo_failure(state, UndoTimedOut(address))
       undo_next(state)
