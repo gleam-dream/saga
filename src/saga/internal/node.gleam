@@ -9,6 +9,8 @@
 /// through `prepare_attempt`/`prepare_crash_recovery`/`commit` below — the
 /// one unsafe coercion in the whole package lives in that module, never
 /// here.
+import gleam/dict.{type Dict}
+import gleam/list
 import gleam/option.{type Option}
 import saga/internal/ffi.{type CrashClass}
 import saga/internal/store.{type Store}
@@ -182,8 +184,9 @@ fn map_attempt_result(
 }
 
 /// One node in the run's dependency graph. `prepare_attempt` is evaluated in
-/// the coordinator (it only reads dependency cells) and returns a thunk
-/// meant to run inside a task process. `prepare_crash_recovery` is the
+/// the coordinator (it only reads dependency values from that run's
+/// `saga/internal/store.Store`) and returns a thunk meant to run inside a
+/// task process. `prepare_crash_recovery` is the
 /// coordinator's path to a recovery decision when the task itself never
 /// returned a value (killed, timed out) — see the `AttemptResult` doc
 /// comment for why this is a separate field from `AttemptFailed.recover`.
@@ -205,4 +208,29 @@ pub type Node(e, u) {
       fn(AttemptFailure(e), Attempt, Store) -> fn() -> ErasedRecovery(e, u),
     ),
   )
+}
+
+/// The reverse-dependency index: for each node id, every other node that
+/// directly depends on it. Depends only on each node's own fixed `deps`
+/// list, which is itself fixed once a `Workflow`'s graph is built (at
+/// `define` time) — so this is computed once, at `define`, and stored on
+/// the `Workflow`, then reused unchanged across every run of that
+/// definition, rather than recomputed per run. Prepends within each
+/// dependent list and reverses once at the end, rather than
+/// `list.append`ing one element at a time (which would be O(k) per
+/// append, O(k^2) total for a node with k dependents), so building the
+/// whole index is O(N) total, not O(N^2).
+pub fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
+  let reversed =
+    dict.fold(nodes, dict.new(), fn(acc, id, n) {
+      list.fold(n.deps, acc, fn(acc2, dep_id) {
+        dict.upsert(acc2, dep_id, fn(existing) {
+          case existing {
+            option.Some(ids) -> [id, ..ids]
+            option.None -> [id]
+          }
+        })
+      })
+    })
+  dict.map_values(reversed, fn(_dep_id, ids) { list.reverse(ids) })
 }

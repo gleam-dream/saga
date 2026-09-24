@@ -2,12 +2,20 @@
 /// vocabulary, typed ports, composition, and definition validation.
 ///
 /// A `Workflow(input, output, error, undo_error)` is a pure description. Its
-/// builder closure is evaluated once at `define` time (to validate names,
-/// attempts, timeouts, and to compute static descriptors) and again, fresh,
-/// at the start of every run (see `saga/execution`). Dependencies are
-/// expressed through typed `Port` values rather than names, so wiring is
-/// checked by the compiler and the scheduler never touches a central
-/// heterogeneous value map.
+/// builder closure is evaluated exactly once, at `define` time (to validate
+/// names, attempts, timeouts, and to compute the workflow's static node
+/// graph) — never again by any run. Dependencies are expressed through
+/// typed `Port` values rather than names, so wiring is checked by the
+/// compiler: no step ever looks up a dependency by name in a shared map,
+/// and no *authoring*-time value ever passes through `Dynamic` or an
+/// unsafe cast. Per-run values do live in one central, run-scoped store
+/// (`saga/internal/store`) keyed by node id — a deliberate trade for O(1)
+/// reads instead of the O(N) per-node-mailbox reads an earlier design used
+/// (see `bench/RESULTS.md` and the design-decisions note in README.md);
+/// that store is the *only* place in this package with an unsafe coercion,
+/// and it is sound by construction — see `saga/internal/store`'s doc
+/// comment. `Workflow`'s own doc comment states precisely which two
+/// functions are allowed to invoke a builder at all.
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -542,9 +550,17 @@ pub fn all(
   first: Port(a, e, u),
   rest: List(Port(a, e, u)),
 ) -> Port(List(a), e, u) {
+  // Builds the combined list newest-first (prepend, not `list.append`,
+  // inside the fold) and reverses exactly once at the very end, rather
+  // than appending one element at a time across `rest`'s ports: an append
+  // per step is O(k) for a list already k long, so appending across k
+  // ports would cost O(k^2) total (paid once per run, inside the final
+  // `map`'s closure, for every attempt that reads this combined port) —
+  // prepending is O(1) per step, O(k) total, with one final O(k) reverse.
   list.fold(rest, map(first, fn(a) { [a] }), fn(acc, port) {
-    both(acc, port) |> map(fn(pair) { list.append(pair.0, [pair.1]) })
+    both(acc, port) |> map(fn(pair) { [pair.1, ..pair.0] })
   })
+  |> map(list.reverse)
 }
 
 // ---------------------------------------------------------------------------
@@ -725,19 +741,32 @@ fn failure_to_node(failure: AttemptFailure(e)) -> node.AttemptFailure(e) {
 // ---------------------------------------------------------------------------
 
 /// A pure, named workflow description with input, output, business error,
-/// and undo-error types. `define` evaluates `build` exactly once — in the
-/// calling process, before any run exists — to validate the workflow and
-/// to compute this static, immutable graph (`nodes`/`order`/
-/// `fetch_output`). `build` itself is retained only so `embed`/
-/// `map_errors` can splice this workflow's port graph into another
-/// workflow's *own* single `define`-time evaluation (graph composition,
-/// not a run); no run ever calls `build` again. Every run of this
-/// `Workflow` (however many, however concurrent) replays the *same* node
-/// closures against its own fresh `saga/internal/store.Store`, created by
-/// `for_run` — see that function's doc comment for why this is safe
-/// despite the graph being shared: nothing about a node's closures is
-/// mutated by running them, and every value a run produces lives in that
-/// run's own `Store`, never in the shared graph.
+/// and undo-error types.
+///
+/// **A builder function is invoked in exactly two situations, each exactly
+/// once, and never any other way:**
+///
+///  1. `define(name, build)` calls `build` exactly once, in the calling
+///     process, before any run exists, to validate the workflow and to
+///     compute this static, immutable graph (`nodes`/`order`/
+///     `root_input_id`/`fetch_output`).
+///  2. `embed(input, workflow)`, called from *inside* some other,
+///     unrelated `define`'s own builder, calls `workflow`'s `build` field
+///     exactly once — this is that *other* `define`'s one evaluation
+///     validating and incorporating `workflow`'s subgraph at a fresh input
+///     port it owns, not a second evaluation of `workflow` itself.
+///
+/// No other function ever calls a builder. In particular: no run
+/// (`execution.run`/`start`, however many, however concurrent) calls
+/// `build` — `for_run` replays the *already-built* `nodes`/`order`/
+/// `fetch_output` against a fresh `saga/internal/store.Store` instead (see
+/// that function's doc comment for why this is safe despite the graph
+/// being shared). And `map_errors` never calls `build` either: it reuses
+/// `workflow`'s own already-built graph, wrapping only the node closures
+/// (`node.map_errors`) — its own `build` field exists solely so a *later*
+/// `embed` of the mapped workflow has one to call, per case 2 above; it is
+/// never invoked to compute the mapped workflow's own `nodes`/`order`/
+/// `fetch_output`.
 pub opaque type Workflow(i, o, e, u) {
   Workflow(
     name: String,
@@ -745,6 +774,12 @@ pub opaque type Workflow(i, o, e, u) {
     root_input_id: Int,
     nodes: Dict(Int, Node(e, u)),
     order: List(Int),
+    // The reverse-dependency index (`saga/internal/node.build_dependents`),
+    // computed once here since it depends only on `nodes`' own fixed
+    // `deps` lists — themselves fixed once the graph is built — and reused
+    // unchanged by the coordinator across every run, rather than
+    // recomputed per run.
+    dependents: Dict(Int, List(Int)),
     fetch_output: fn(Store) -> fn() -> o,
     descriptors: List(StepDescriptor),
   )
@@ -759,10 +794,11 @@ pub opaque type Workflow(i, o, e, u) {
 /// so the former "must be pure and deterministic because a real run
 /// re-evaluates it" requirement is gone: nothing about running this
 /// `Workflow` depends on calling `build` a second time and getting the
-/// same answer. (`build` is still called again *at another workflow's own
-/// `define` time* if this one is later composed in with `embed` or
-/// `map_errors` — that is graph construction, not a run, and happens at
-/// most once per composing `define` call, same as any other node.)
+/// same answer. (`build` is still called again — exactly once — *at
+/// another workflow's own `define` evaluation* if this one is later
+/// composed in with `embed`; that is that *other* `define`'s own graph
+/// construction, not a run of this one. `map_errors` never calls `build`
+/// at all — see its own doc comment.)
 pub fn define(
   name: String,
   build: fn(Port(i, e, u)) -> Port(o, e, u),
@@ -801,6 +837,7 @@ pub fn define(
         root_input_id: root_input_id,
         nodes: nodes,
         order: ordered_ids,
+        dependents: node.build_dependents(nodes),
         fetch_output: fetch_output,
         descriptors: descriptors_for(output),
       ))
@@ -955,6 +992,7 @@ pub fn for_run(
 ) -> #(
   Dict(Int, node.Node(e, u)),
   List(Int),
+  Dict(Int, List(Int)),
   Store,
   fn(Store) -> ffi.RescueResult(o),
 ) {
@@ -968,12 +1006,18 @@ pub fn for_run(
   // level-2 call is deferred to happen *inside* that thunk, alongside the
   // level-3 call and its `rescue` — never eagerly, here, at run setup,
   // before a single node has run.
-  #(workflow.nodes, workflow.order, run_store, fn(current_store) {
-    ffi.rescue(fn() {
-      let produce_output = workflow.fetch_output(current_store)
-      produce_output()
-    })
-  })
+  #(
+    workflow.nodes,
+    workflow.order,
+    workflow.dependents,
+    run_store,
+    fn(current_store) {
+      ffi.rescue(fn() {
+        let produce_output = workflow.fetch_output(current_store)
+        produce_output()
+      })
+    },
+  )
 }
 
 /// The workflow's declared name.
@@ -1016,45 +1060,70 @@ pub fn embed(
   Port(..output, scope: input.scope)
 }
 
-/// Adapts a whole workflow's error and undo-error types. Like `define`,
-/// this evaluates the resulting workflow's composed builder exactly once,
-/// here, to compute its own static graph (the mapped workflow is a
-/// first-class `Workflow` in its own right, with its own `root_input_id`
-/// and precomputed `nodes`/`order`/`fetch_output` — not a lazy wrapper
-/// re-evaluated per run).
+/// Adapts a whole workflow's error and undo-error types.
+///
+/// **Running the mapped workflow standalone** (`execution.run`/`start`, or
+/// `describe`) never invokes `workflow`'s own builder again: `nodes`,
+/// `order`, `root_input_id`, and `fetch_output` are reused directly from
+/// `workflow`'s already-built, already-validated graph, with only the
+/// node closures themselves translated in place (`node.map_errors`, which
+/// wraps each node's `e1`/`u1`-typed *outputs* on the way out — see that
+/// function's doc comment for why this never needs to re-run, or even
+/// look at, the original builder). This is what fixes a real hazard a
+/// second builder evaluation could hit: a builder that is not a pure
+/// function of its input (closing over mutable state, or returning a
+/// `Port` stashed from an earlier call) could, if re-run, produce a graph
+/// shape `define` never validated — `describe` would then disagree with
+/// what an actual run executes, and a stashed `Port` from a *different*
+/// evaluation could reference a node id the mapped workflow's own graph
+/// never populated, panicking the run instead of completing it.
+///
+/// **Composing the mapped workflow with `embed`** is different: `embed`
+/// splices a workflow's port graph into some *other*, unrelated `define`
+/// call's own one-time builder evaluation, at a fresh input port that
+/// evaluation itself owns — there is no way to reuse a fixed graph for
+/// that (the new embedding site's own dependency wiring did not exist
+/// when `workflow`/`map_errors` first ran). So `build` here still wraps
+/// `workflow.build` (the *original*, already-validated builder) with the
+/// same node-translation, exactly as `embed` needs; this is not a second
+/// evaluation of `map_errors`'s own graph, it is the *one* evaluation
+/// `embed`'s own composing `define` performs, validated there like any
+/// other node that `define` call introduces.
 pub fn map_errors(
   workflow: Workflow(i, o, e1, u1),
   error map_error: fn(e1) -> e2,
   undo_error map_undo_error: fn(u1) -> u2,
 ) -> Workflow(i, o, e2, u2) {
-  let mapped_build = fn(input: Port(i, e2, u2)) -> Port(o, e2, u2) {
+  let mapped_nodes =
+    dict.map_values(workflow.nodes, fn(_id, a_node) {
+      node.map_errors(a_node, map_error, map_undo_error)
+    })
+  let translating_build = fn(input: Port(i, e2, u2)) -> Port(o, e2, u2) {
     let shadow_input = retype_empty_port(input)
     let shadow_output = workflow.build(shadow_input)
-    let mapped_nodes =
+    let shadow_mapped_nodes =
       dict.map_values(shadow_output.nodes, fn(_id, a_node) {
         node.map_errors(a_node, map_error, map_undo_error)
       })
     Port(
       scope: shadow_output.scope,
-      nodes: dict.merge(input.nodes, mapped_nodes),
+      nodes: dict.merge(input.nodes, shadow_mapped_nodes),
       deps: shadow_output.deps,
       errors: shadow_output.errors,
       fetch: shadow_output.fetch,
     )
   }
-  let scope = root_scope()
-  let root_input_id = ffi.unique_integer()
-  let root_input = fresh_root_port(scope, root_input_id)
-  let output = mapped_build(root_input)
-  cell.close(scope.registry)
-  let #(ordered_ids, nodes) = resolved_nodes(output.nodes)
   Workflow(
     name: workflow.name,
-    build: mapped_build,
-    root_input_id: root_input_id,
-    nodes: nodes,
-    order: ordered_ids,
-    fetch_output: output.fetch(),
+    build: translating_build,
+    root_input_id: workflow.root_input_id,
+    nodes: mapped_nodes,
+    order: workflow.order,
+    // Unchanged by error-type mapping: `node.map_errors` only wraps a
+    // node's closures, never its id or `deps`, so the dependency structure
+    // `workflow.dependents` already describes is still exactly correct.
+    dependents: workflow.dependents,
+    fetch_output: workflow.fetch_output,
     descriptors: workflow.descriptors,
   )
 }

@@ -1,15 +1,22 @@
-/// The coordinator's per-run value store: one `Dict(Int, value)` keyed by
-/// node id, holding every node's completed output for the lifetime of one
-/// run. This replaces the previous per-node mailbox `Cell` (a `Subject`
-/// allocated once when the workflow's graph was built): now that a
-/// `Workflow`'s graph is built exactly once, at `define`, the same node
-/// closures run across every subsequent run of that definition, so a value
-/// holder allocated at build time could no longer be run-scoped -- two
-/// concurrent (or successive) runs sharing one `Subject` per node would
-/// corrupt or block on each other's writes. A plain `Dict`, freshly created
-/// per run and threaded through the coordinator's own state, is run-scoped
-/// by construction: nothing here is shared across runs, or across
-/// coroutines beyond the coordinator process that owns one run's `Store`.
+/// The coordinator's per-run value store: one `Dict(Int, Native)` keyed by
+/// node id (`Native` is this module's own opaque, type-erased carrier, not
+/// `gleam/dynamic.Dynamic` — nothing here ever decodes or inspects a
+/// value's shape, it only ever casts a value back to the exact type it was
+/// stored as), holding every node's completed output for the lifetime of
+/// one run. Before the build-once refactor, a node's per-run output lived
+/// in its own single-value mailbox cell (a `Subject`, allocated fresh each
+/// time the workflow's graph was built). Once a `Workflow`'s graph is built
+/// exactly once, at `define`, the same node closures run across every
+/// subsequent run of that definition, so a value holder allocated at build
+/// time can no longer be run-scoped -- two concurrent (or successive) runs
+/// sharing one `Subject` per node would corrupt or block on each other's
+/// writes. A plain `Dict`, freshly created per run and threaded through the
+/// coordinator's own state, is run-scoped by construction: nothing here is
+/// shared across runs, or across processes beyond the coordinator that owns
+/// one run's `Store`. See the design-decisions note in README.md and
+/// `bench/RESULTS.md` for why this centralization was worth making (O(N^2)
+/// scheduling cost collapsing to linear) despite departing from
+/// saga-design.md's original no-central-map stance.
 ///
 /// **Soundness of `get`'s coercion.** `get`'s only unsafe operation in this
 /// entire package is a native identity cast from the value that was
@@ -24,10 +31,10 @@
 /// id can be exchanged for a differently-typed read of the same id, because
 /// `Port` is opaque and its `fetch` closure is built alongside the `put`
 /// call it corresponds to, never reconstructed from a bare `Int`. The same
-/// invariant already justified the previous `cell.Cell`-per-node design
-/// (one `Subject(a)` per node, typed at allocation); `Store` only changes
-/// *where* the value lives (a run-scoped map instead of a build-time
-/// mailbox), not who is allowed to read it as what type.
+/// invariant already justified the previous per-node `Subject`-per-node
+/// mailbox-cell design (typed at allocation); `Store` only changes *where*
+/// the value lives (a run-scoped map instead of a build-time mailbox), not
+/// who is allowed to read it as what type.
 import gleam/dict.{type Dict}
 
 pub opaque type Store {
