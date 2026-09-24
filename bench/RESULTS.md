@@ -125,11 +125,12 @@ current per-run-re-evaluation design requires.
 ## After (commit 9e9350a)
 
 Build function evaluated exactly once, at `define`; per-run outputs held
-in a `Dict(Int, Dynamic)` (`saga/internal/store`) owned by the coordinator,
-read through one internal typed accessor performing a single unsafe
-coerce, sound because the key (a node id) and its element type both come
-from the same `Port`. Same machine, same method, same `execution.Config`
-as "Before".
+in a `Dict(Int, Native)` (`saga/internal/store`, where `Native` is that
+module's own opaque, type-erased carrier -- never `gleam/dynamic.Dynamic`)
+owned by the coordinator, read through one internal typed accessor
+performing a single unsafe coerce, sound because the key (a node id) and
+its element type both come from the same `Port`. Same machine, same
+method, same `execution.Config` as "Before".
 
 ### Chain (N sequential steps, each reads the previous)
 
@@ -296,23 +297,23 @@ noise at low absolute millisecond counts, not a growth-shape signal).
 Median run time (ms) at each stage, with cumulative speedup
 (before/after-admission) in the last column:
 
-| Shape          | N    | Before (0517f1a) | After store (9e9350a) | After admission (ea8479c) | Cumulative speedup |
-| -------------- | ---- | ---------------- | --------------------- | ------------------------- | ------------------ |
-| Chain          | 100  | 1                | 1                     | 0                         | inf                |
-| Chain          | 250  | 7                | 4                     | 1                         | 7.00x              |
-| Chain          | 500  | 25               | 16                    | 2                         | 12.50x             |
-| Chain          | 1000 | 98               | 65                    | 4                         | 24.50x             |
-| Chain          | 2000 | 392              | 276                   | 8                         | 49.00x             |
-| Fan-in/fan-out | 100  | 2                | 1                     | 1                         | 2.00x              |
-| Fan-in/fan-out | 250  | 7                | 5                     | 2                         | 3.50x              |
-| Fan-in/fan-out | 500  | 21               | 15                    | 4                         | 5.25x              |
-| Fan-in/fan-out | 1000 | 78               | 50                    | 9                         | 8.67x              |
-| Fan-in/fan-out | 2000 | 313              | 186                   | 22                        | 14.23x             |
-| Wide reads     | 100  | 2                | 1                     | 1                         | 2.00x              |
-| Wide reads     | 250  | 9                | 5                     | 1                         | 9.00x              |
-| Wide reads     | 500  | 31               | 17                    | 3                         | 10.33x             |
-| Wide reads     | 1000 | 121              | 70                    | 6                         | 20.17x             |
-| Wide reads     | 2000 | 472              | 302                   | 13                        | 36.31x             |
+| Shape          | N    | Before (0517f1a) | After store (9e9350a) | After admission (ea8479c) | Cumulative speedup                                    |
+| -------------- | ---- | ---------------- | --------------------- | ------------------------- | ----------------------------------------------------- |
+| Chain          | 100  | 1                | 1                     | 0                         | below timer resolution (ms) -- see the µs rerun below |
+| Chain          | 250  | 7                | 4                     | 1                         | 7.00x                                                 |
+| Chain          | 500  | 25               | 16                    | 2                         | 12.50x                                                |
+| Chain          | 1000 | 98               | 65                    | 4                         | 24.50x                                                |
+| Chain          | 2000 | 392              | 276                   | 8                         | 49.00x                                                |
+| Fan-in/fan-out | 100  | 2                | 1                     | 1                         | 2.00x                                                 |
+| Fan-in/fan-out | 250  | 7                | 5                     | 2                         | 3.50x                                                 |
+| Fan-in/fan-out | 500  | 21               | 15                    | 4                         | 5.25x                                                 |
+| Fan-in/fan-out | 1000 | 78               | 50                    | 9                         | 8.67x                                                 |
+| Fan-in/fan-out | 2000 | 313              | 186                   | 22                        | 14.23x                                                |
+| Wide reads     | 100  | 2                | 1                     | 1                         | 2.00x                                                 |
+| Wide reads     | 250  | 9                | 5                     | 1                         | 9.00x                                                 |
+| Wide reads     | 500  | 31               | 17                    | 3                         | 10.33x                                                |
+| Wide reads     | 1000 | 121              | 70                    | 6                         | 20.17x                                                |
+| Wide reads     | 2000 | 472              | 302                   | 13                        | 36.31x                                                |
 
 Growth ratios (median time at 2N / median time at N), all three stages:
 
@@ -334,3 +335,107 @@ the shape with the least dependency-chain depth to amortize) to 49x
 strictly serializes the next). No profiling was needed beyond the
 benchmark itself: the growth ratios already confirm the fix, and no
 further superlinear behavior was observed at N=2000 in any shape.
+
+## After independent review fixes
+
+An independent review of the perf work above approved it pending fixes,
+none of which touch the benchmarked shapes' own algorithmic cost, but two
+of which affect this file directly and the bench harness itself:
+
+- The bench's own clock moved from millisecond to **microsecond**
+  resolution (`bench/src/bench_native.erl`'s `monotonic_time/0`), since
+  the millisecond clock under-resolved every small-N cell to 0-1ms (hence
+  the "n/a (baseline 0ms)"/"inf" growth-ratio placeholders in the tables
+  above). All timings below are in µs.
+- Every timed run now asserts `execution.Completed` with the shape's own
+  expected output (`shapes.chain_expected_output`/`fan_expected_output`/
+  `wide_expected_output`), not just that a run finished — a
+  completed-but-wrong-value run panics the bench immediately instead of
+  silently contaminating a timing.
+- N >= 1000 now takes 15 measured runs (up from 5), since each run is
+  cheap enough post-fix (single-digit milliseconds) that more samples cost
+  little additional wall time (the whole three-shape, seven-size sweep
+  still completes in ~2-3 seconds).
+- Two remaining O(N) sources the admission fix had not addressed were
+  fixed in the scheduler itself: `build_dependents` (the reverse-dependency
+  index) is now computed once at `define`, not once per run, and its own
+  per-dependent `list.append` became a prepend + single reverse;
+  `record_undone`/`record_undo_failure`/`record_not_undoable`/
+  `record_held` now prepend and reverse once at the point a `Settlement`
+  becomes final, instead of appending per journal entry; `saga.all`'s
+  per-element `list.append` became a prepend + single reverse. None of
+  these are on the _admission_ hot path the previous section measured, so
+  they were not expected to change the growth ratios materially for these
+  three shapes (none has enough sibling fan-in/fan-out or rollback depth
+  at these N to make the difference visible against admission's own cost)
+  — this section's numbers confirm that: still ~2.0x per doubling, same as
+  "After admission fix" above.
+- `map_errors` no longer re-runs a workflow's build function to compute
+  its own graph (see README's "Design decisions" section and the
+  `perf: reuse the validated graph in map_errors` commit) — this shape
+  never used `map_errors`, so it has no bearing on these numbers, but is
+  recorded here since it was found during the same review pass.
+
+Same machine as all prior sections; `execution.Config` unchanged
+(`max_concurrency: 64`, `deadline: None`).
+
+### Chain (N sequential steps, each reads the previous)
+
+| N    | define (µs) | warmup (µs) | median (µs) | p95 (µs) | min (µs) | max (µs) | build invocations | measured runs |
+| ---- | ----------- | ----------- | ----------- | -------- | -------- | -------- | ----------------- | ------------- |
+| 10   | 8561        | 7025        | 44          | 54       | 40       | 73       | 1                 | 20            |
+| 50   | 177         | 276         | 208         | 249      | 200      | 254      | 1                 | 20            |
+| 100  | 219         | 493         | 433         | 458      | 371      | 519      | 1                 | 20            |
+| 250  | 519         | 1047        | 1029        | 1097     | 957      | 1121     | 1                 | 20            |
+| 500  | 1143        | 2160        | 2092        | 2125     | 2033     | 2131     | 1                 | 20            |
+| 1000 | 2425        | 4444        | 4241        | 4561     | 3966     | 4561     | 1                 | 15            |
+| 2000 | 4706        | 8647        | 8301        | 8504     | 8022     | 8504     | 1                 | 15            |
+
+Growth (median time at 2N / median time at N): 50->100 2.09x, 250->500
+2.03x, 500->1000 2.03x, 1000->2000 1.96x.
+
+### Fan-in/fan-out (1 shared producer, N parallel consumers, `all`)
+
+| N    | define (µs) | warmup (µs) | median (µs) | p95 (µs) | min (µs) | max (µs) | build invocations | measured runs |
+| ---- | ----------- | ----------- | ----------- | -------- | -------- | -------- | ----------------- | ------------- |
+| 10   | 35          | 129         | 73          | 101      | 56       | 121      | 1                 | 20            |
+| 50   | 128         | 341         | 380         | 427      | 340      | 432      | 1                 | 20            |
+| 100  | 221         | 848         | 763         | 856      | 682      | 858      | 1                 | 20            |
+| 250  | 486         | 1800        | 1847        | 2061     | 1720     | 2198     | 1                 | 20            |
+| 500  | 1772        | 4239        | 3867        | 4325     | 3624     | 4416     | 1                 | 20            |
+| 1000 | 3042        | 7892        | 7444        | 7890     | 7150     | 7890     | 1                 | 15            |
+| 2000 | 8010        | 15736       | 16125       | 16861    | 15459    | 16861    | 1                 | 15            |
+
+Growth (median time at 2N / median time at N): 50->100 2.01x, 250->500
+2.09x, 500->1000 1.93x, 1000->2000 2.17x.
+
+### Wide dependency reads (`both`/`map` over a window of 4 prior outputs)
+
+| N    | define (µs) | warmup (µs) | median (µs) | p95 (µs) | min (µs) | max (µs) | build invocations | measured runs |
+| ---- | ----------- | ----------- | ----------- | -------- | -------- | -------- | ----------------- | ------------- |
+| 10   | 32          | 81          | 45          | 62       | 44       | 63       | 1                 | 20            |
+| 50   | 156         | 285         | 256         | 295      | 245      | 324      | 1                 | 20            |
+| 100  | 402         | 597         | 510         | 541      | 500      | 573      | 1                 | 20            |
+| 250  | 1086        | 1385        | 1372        | 1465     | 1261     | 1527     | 1                 | 20            |
+| 500  | 3166        | 2900        | 2853        | 2979     | 2688     | 3049     | 1                 | 20            |
+| 1000 | 9850        | 6152        | 5657        | 5968     | 5463     | 5968     | 1                 | 15            |
+| 2000 | 31904       | 13588       | 12142       | 16969    | 11789    | 16969    | 1                 | 15            |
+
+Growth (median time at 2N / median time at N): 50->100 1.99x, 250->500
+2.08x, 500->1000 1.98x, 1000->2000 2.15x.
+
+### After independent review fixes: analysis
+
+With microsecond resolution and correctness assertions in place, every
+cell down to N=10 now reports a meaningful, non-zero median, and no
+"n/a"/"inf" placeholder remains anywhere in this file. Growth per doubling
+stays consistently ~2.0x-2.2x across all three shapes at every measured N
+(linear), matching "After admission fix" above within measurement noise —
+confirming that fixing `build_dependents`/`Settlement`-field/`saga.all`
+accumulation did not regress the admission fix's own linear scheduling
+cost, as expected (none of those three fixes touch the per-node admission
+path itself; they remove separate, smaller O(N) or O(k^2) costs that
+these particular shapes' N and fan-in/fan-out width do not make visible
+against admission's own cost at these sizes). No panics occurred across
+any shape/N/run, confirming every timed run's output was correct, not
+merely "completed."
