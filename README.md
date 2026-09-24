@@ -130,11 +130,16 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   since whatever graph it produces at `define` time is what every future
   run replays. Per-run values live in a store keyed by node id, isolated
   per run, so concurrent or successive runs of the same `Workflow` never
-  see each other's data despite sharing the same built graph. Run cost is
-  now dominated by the step work itself and admission bookkeeping, not by
-  re-running the builder or by per-read scheduling overhead: a value read
-  is a single map lookup, not a scan proportional to how many steps have
-  completed. See `bench/RESULTS.md` for measurements.
+  see each other's data despite sharing the same built graph. A value read
+  is a single map lookup (not a scan proportional to how many steps have
+  completed), and admitting a ready step is a single min-heap operation
+  (not a scan over every step in the workflow), so total scheduling work
+  for a run is linear in the number of steps rather than quadratic. Run
+  cost is now dominated by the step work itself. See `bench/RESULTS.md`
+  for measurements (both changes together: roughly 14x-49x faster median
+  run time at 2000 steps, depending on shape, versus per-run builder
+  re-evaluation with per-node mailbox reads and full-graph admission
+  scans).
 - **A step whose output port is never consumed is rejected at `define`
   time**, as `DefinitionError.OrphanStep(step)`, instead of silently never
   running: every step created via `perform`/`embed` must have its output
