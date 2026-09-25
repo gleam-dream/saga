@@ -3,6 +3,7 @@ import gleam/list
 import gleeunit/should
 import saga
 import saga/execution
+import saga/testing
 import support/probe
 
 pub type DemoError {
@@ -225,14 +226,19 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
     // that race instead of hoping to catch a window that is not guaranteed
     // to be observable.
     let assert Ok(_progress) =
-      probe.wait_until_progress(exec, generous, fn(p) {
-        list.any(p.steps, fn(sp) {
-          sp.address.name == "a"
-          && {
-            is_compensating(sp.state) || sp.state == execution.RetryScheduled(2)
-          }
-        })
-      })
+      testing.wait_until(
+        exec,
+        matching: fn(p) {
+          list.any(p.steps, fn(sp) {
+            sp.address.name == "a"
+            && {
+              is_compensating(sp.state)
+              || sp.state == execution.RetryScheduled(2)
+            }
+          })
+        },
+        within: generous,
+      )
     probe.open(dgate)
     // Wait until `b` and `c` have both been admitted and are concurrently
     // blocked in `gate` (the state the 300ms `RetryAfter` backoff must not
@@ -242,11 +248,15 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
     // both replaces sleeping past a fixed guess at the backoff delay.
     probe.await_total_entries(counter, 4, generous)
     let assert Ok(_progress) =
-      probe.wait_until_progress(exec, generous, fn(p) {
-        list.any(p.steps, fn(sp) {
-          sp.address.name == "a" && sp.state == execution.RetryScheduled(2)
-        })
-      })
+      testing.wait_until(
+        exec,
+        matching: fn(p) {
+          list.any(p.steps, fn(sp) {
+            sp.address.name == "a" && sp.state == execution.RetryScheduled(2)
+          })
+        },
+        within: generous,
+      )
     probe.high_water(counter) |> should.equal(2)
 
     probe.open(gate)

@@ -107,6 +107,111 @@ gleam run    # prints a readable trace of four scenarios
 gleam test   # asserts the same scenarios
 ```
 
+## Testing workflows
+
+A test that needs to synchronize with a run in progress — waiting for a
+step to reach a particular state before releasing it, cancelling it, or
+asserting on it — should poll `execution.progress` rather than sleep a
+guessed duration. `saga/testing` ships exactly one helper for this:
+
+```gleam
+import saga/testing
+
+let assert Ok(progress) =
+  testing.wait_until(
+    exec,
+    matching: fn(p) { p.phase == execution.Settling },
+    within: 10_000,
+  )
+```
+
+`wait_until` polls `execution.progress` at a short internal interval (never
+a fixed `process.sleep`) until `matching` accepts a snapshot or `within`
+milliseconds elapse overall, using the monotonic clock for the deadline.
+`Error(testing.WaitTimedOut)` means the predicate never matched in time;
+`Error(testing.RunEnded)` means the run's coordinator process was already
+gone (`execution.progress`'s own `ExecutionEnded`).
+
+**Polling can miss a state that passes through quickly.** `matching` only
+ever sees whatever snapshot happens to be current at each poll; a state
+entered and left again between two polls is never observed. Write
+`matching` to accept the target state _or anything at or beyond it_ — for
+example, a predicate waiting for a step to reach `Compensating` should also
+accept `RetryScheduled` (the recovery decision may already have landed and
+scheduled a backoff by the time a poll arrives), or it can time out on a
+perfectly healthy run that simply raced past `Compensating` first.
+
+Saga deliberately does not ship a gate a step body can block on — that is
+generic BEAM concurrency, not anything Saga-specific. The recipe below (a
+small broker process, trimmed from `examples/order_consumer`'s own
+`test/support/gate.gleam`) is enough for most workflow tests: a step calls
+`enter` to block and announce arrival, the test calls `wait_entered` to
+synchronize on that arrival, then `open` to release exactly one blocked
+`enter` call (queuing the release if none is waiting yet):
+
+```gleam
+import gleam/erlang/process.{type Pid, type Subject}
+import gleam/list
+
+pub opaque type Gate {
+  Gate(broker: Subject(GateMessage), arrived: Subject(Pid))
+}
+
+type GateMessage {
+  Register(reply: Subject(Nil))
+  Release
+}
+
+pub fn new_gate() -> Gate {
+  let ready = process.new_subject()
+  process.spawn(fn() {
+    let broker = process.new_subject()
+    process.send(ready, broker)
+    gate_loop(broker, [])
+  })
+  let assert Ok(broker) = process.receive(ready, 1000)
+  Gate(broker: broker, arrived: process.new_subject())
+}
+
+fn gate_loop(broker: Subject(GateMessage), waiters: List(Subject(Nil))) -> Nil {
+  case process.receive_forever(broker) {
+    Register(reply) -> gate_loop(broker, [reply, ..waiters])
+    Release ->
+      case list.reverse(waiters) {
+        [] -> gate_loop(broker, [])
+        [oldest, ..rest] -> {
+          process.send(oldest, Nil)
+          gate_loop(broker, list.reverse(rest))
+        }
+      }
+  }
+}
+
+// A `Subject` may only be received on by the process that created it, and a
+// step's body runs inside a fresh task process on every attempt — so `enter`
+// registers the calling process's own reply subject with the broker rather
+// than the test process handing out one it owns.
+pub fn enter(gate: Gate) -> Nil {
+  process.send(gate.arrived, process.self())
+  let my_reply = process.new_subject()
+  process.send(gate.broker, Register(my_reply))
+  process.receive_forever(my_reply)
+}
+
+pub fn open(gate: Gate) -> Nil {
+  process.send(gate.broker, Release)
+}
+
+pub fn wait_entered(gate: Gate, timeout_ms: Int) -> Result(Pid, Nil) {
+  process.receive(gate.arrived, timeout_ms)
+}
+```
+
+See `examples/order_consumer/test/support/gate.gleam` for the full version
+(handles a `Release` that arrives before anyone is waiting yet) and
+`examples/order_consumer/test/order_consumer_test.gleam`'s cancellation
+scenario for it in use alongside `execution.progress`.
+
 ## Semantics you should know before relying on this
 
 - **Cancellation never reverses an unknown effect.** A step whose attempt

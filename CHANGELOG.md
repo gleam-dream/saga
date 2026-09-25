@@ -26,6 +26,20 @@ increments toward the first local-execution release.
   behalf. A timed-out attempt's semantics are unchanged: its effect is
   unknown, never journaled or undone, and reported exactly as before
   (`StepTimedOut`, `interrupted`, `CompletedWithUnknownEffects`).
+- **New public module `saga/testing`, with one helper:
+  `wait_until(execution, matching:, within:)`.** Polls `execution.progress`
+  at a short internal interval (never a fixed `process.sleep`) until a
+  caller-supplied predicate accepts a `Progress` snapshot, or `within`
+  milliseconds elapse overall, using the monotonic clock for the deadline.
+  Returns `Error(testing.WaitTimedOut)` or `Error(testing.RunEnded)`
+  (mirroring `execution.ProgressError`'s `ExecutionEnded`) on the two ways it
+  can fail to observe a match. Saga's own test suite now dogfoods this
+  helper (`probe.wait_until_progress` is removed in favor of it) instead of
+  keeping a private, near-identical copy. See README.md's "Testing
+  workflows" section for the helper plus a trimmed step-blocking gate
+  recipe — Saga does not ship a gate itself, since blocking a step body on a
+  test-controlled release is generic BEAM concurrency, not anything
+  Saga-specific.
 
 ### Changed
 
