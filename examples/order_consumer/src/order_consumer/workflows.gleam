@@ -179,6 +179,7 @@ pub fn blocking_workflow(
 /// function per field.
 pub fn bounded_config(deadline_ms: Option(Int)) -> Config {
   execution.Config(
+    ..execution.config(),
     max_concurrency: 1,
     deadline: deadline_ms,
     settle_timeout: 200,

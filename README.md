@@ -74,12 +74,23 @@ let assert Ok(outcome) = execution.await(exec, 10_000)
 ```
 
 `execution.config()` defaults to one attempt/compensation task per
-scheduler core (`max_concurrency`), no run `deadline`, a 5 second
-`settle_timeout`, and a 5 second `cleanup_timeout` — the record-update
-(`..execution.config()`) is the advanced-config path; it changes only the
-fields you name and keeps the library's defaults for the rest, so a new
-`Config` field added later does not silently reset every existing caller's
-untouched settings back to a stale literal.
+scheduler core (`max_concurrency`), no run `deadline`, a 60 second default
+per-attempt `step_timeout`, a 5 second `settle_timeout`, and a 5 second
+`cleanup_timeout` — the record-update (`..execution.config()`) is the
+advanced-config path; it changes only the fields you name and keeps the
+library's defaults for the rest, so a new `Config` field added later does
+not silently reset every existing caller's untouched settings back to a
+stale literal.
+
+A step's own `saga.timeout(..)` always overrides `step_timeout`, in either
+direction (shorter or longer than the default). Opt out of the default
+entirely — for a step that may legitimately run unbounded, with only its own
+`saga.timeout` or the run's `deadline` (if any) to bound it — with
+`step_timeout: None`:
+
+```gleam
+let config = execution.Config(..execution.config(), step_timeout: None)
+```
 
 Adapt a workflow's error and undo-error types to your own application
 vocabulary with `saga.map_errors` (whole workflow) or
@@ -114,14 +125,21 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   attempts and compensations get up to `settle_timeout` to finish on
   their own before being killed, and each individual compensation
   decision or undo action is bounded by `cleanup_timeout`.
-- **No deadline and no step timeout are enabled by default.**
-  `execution.config()`'s `deadline` is `None`, and `saga.step` gives a
-  step no `timeout` unless you call `saga.timeout` on it. Without either
-  one set, a step body that never returns — a genuine hang, not a crash —
-  blocks `execution.run`/`execution.await` forever; nothing in Saga times
-  it out for you. This is current behavior, not a documentation gap: set
-  `deadline` and/or per-step `timeout` explicitly wherever a hang must be
-  bounded.
+- **Every attempt is bounded by a default `step_timeout`; only the run
+  `deadline` is unbounded by default.** `execution.config()`'s
+  `step_timeout` defaults to `Some(60_000)` (60 seconds): a step with no
+  `saga.timeout` of its own still gets this default, so a step body that
+  never returns — a genuine hang, not a crash — is killed and reported
+  `StepTimedOut` rather than blocking `execution.run`/`execution.await`
+  forever. A step's own `saga.timeout(..)` always overrides the default, in
+  either direction; `step_timeout: None` opts out of the default entirely
+  for every step that does not set its own. `deadline` stays `None` by
+  default regardless: `step_timeout` already bounds each attempt and
+  `saga.compensate`'s `max_attempts` already bounds how many attempts a step
+  can accumulate, so every step already has a finite worst case without a
+  run-wide deadline; `deadline` is instead a coarser, opt-in ceiling on the
+  whole run, cutting across still-healthy steps too, for callers who
+  specifically want that.
 - **The workflow builder runs once, at `define` time.** `define` evaluates
   it to validate the workflow and to build its node graph; no run ever
   evaluates the builder again (see `saga.Workflow`'s doc comment for
