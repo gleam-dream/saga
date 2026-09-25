@@ -167,6 +167,16 @@ assert` panic.
   check used elsewhere before restoring scope. Ported the reviewer's probe
   P9 as a regression test (`embed_rejects_builder_returning_foreign_port_test`
   in `test/authoring_test.gleam`).
+- `map_errors`'s own `embed`-time builder retyping (`translating_build`) had
+  the identical unconditional-overwrite gap at its own, separate
+  scope-restoring site — found while porting the reviewer's probe P9 in
+  full (P9's actual shape wraps the foreign-scoped builder with
+  `map_errors` before `embed`ding it, not a plain `embed`, so the fix
+  above alone did not close it). Fixed the same way, as part of the
+  `define`-time node-table rework below (which already had to rebuild
+  `translating_build`'s own registry handling). New regression test:
+  `embed_rejects_map_errors_builder_returning_foreign_port_test` in
+  `test/authoring_test.gleam`.
 - `map_errors` re-ran a workflow's build function a second time (with no
   validation at all) to compute its own graph, instead of reusing the
   already-built, already-validated graph `define` produced. Found by

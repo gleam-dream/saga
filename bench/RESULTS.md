@@ -439,3 +439,131 @@ these particular shapes' N and fan-in/fan-out width do not make visible
 against admission's own cost at these sizes). No panics occurred across
 any shape/N/run, confirming every timed run's output was correct, not
 merely "completed."
+
+## Define time: `dict.merge` per `both`/`map` combinator call
+
+`define` time itself (not run time) grew superlinearly for the **wide**
+shape specifically — not chain or fan — as N increased: roughly 3.0x-3.24x
+per doubling at N=500/1000/2000, close to the O(N^2) shape the earlier
+sections above had already fixed for run time. Every `perform`/`both`/
+`all`/`map` call built a `Port` carrying its own `nodes: Dict(Int, Node(e,
+u))` — the full transitive node subgraph reachable from that port — and
+`both` (`saga.gleam`'s `merge_ports`) combined two ports with
+`dict.merge(first.nodes, second.nodes)`. For chain and fan this dict never
+grows large before being consumed once; for wide, each step reads a
+sliding window of `saga.both`/`saga.map` over the last 4 outputs, and each
+of those already carries the _entire_ history's nodes dict (since `perform`
+inserts into whatever dict its input port already carried) — so every one
+of wide's O(N) `both` calls merges a dict whose size is proportional to how
+far into the graph it sits, for an O(N^2) total define cost.
+
+### Profiling
+
+`:eprof` (Erlang/OTP's standard call-time profiler) around
+`shapes.wide(2000, counter)`'s own `saga.define` call (a single sample —
+`shapes:wide/2` builds and defines in one call), before this fix:
+
+```
+maps:merge/2    5992 calls   35.28%   27713 µs   [4.63 µs/call]
+-------------------------------------------------------------
+Total                       100.00%   78548 µs
+```
+
+`maps:merge/2` (the BEAM primitive behind `gleam/dict.merge`) alone
+accounted for over a third of `define`'s total wall time, called once per
+`both`/`map` combinator invocation as identified above — confirming
+`dict.merge` in `merge_ports` as the superlinear cost, not admission,
+scheduling, or anything else already fixed by the sections above.
+
+### Fix
+
+`Port` no longer carries a `nodes` field at all. Every node `perform`
+creates is instead appended once (O(1)) to its scope's own `registry` (the
+same per-`define`-evaluation accumulator `saga/internal/cell.Registry`
+already used for orphan-step tracking — see `ScopeToken`'s doc comment),
+never merged into a growing map at every combinator call. `define` now
+assembles the workflow's node table exactly once, at the very end: it reads
+the scope's _entire_ registered-node list into a `Dict` in one O(N) pass,
+then walks it as a graph — following each node's own `deps` list outward
+from the workflow output port's immediate dependency ids
+(`reachable_nodes`/`walk_reachable`) — to find the subset actually reachable
+from the output, which is both the workflow's real node table and (by
+elimination against the full registry) the orphan set `OrphanStep` already
+reported. This is one O(V+E) graph walk per `define`, replacing what used
+to be an O(N) `dict.merge` repeated once per `both`/`map` call.
+`map_errors`'s `embed`-time builder retyping (`translating_build`) follows
+the same shape: the original builder's nodes are registered into a
+freshly-typed shadow registry, translated, and re-registered (O(1) each)
+into the composing `define`'s own registry — no `dict.merge` there either.
+`saga.embed` itself gained an unrelated but related fix in the same
+change: it now checks the re-invoked builder's returned port for a foreign
+scope (`ForeignPort`) before restoring the parent's own scope on the way
+out, exactly like `both`/`all`/`perform` already do — see the Changelog's
+"Fixed" entry.
+
+### Wide dependency reads: `define` time before/after
+
+Same machine, `sizes`, and `execution.Config` as every section above; one
+`define`-time sample per N (`bench.gleam`'s existing `define_us` column),
+before and after this fix:
+
+| N    | define before (µs) | define after (µs) |
+| ---- | ------------------ | ----------------- |
+| 250  | 1086               | 514               |
+| 500  | 3166               | 1424              |
+| 1000 | 9850               | 3414              |
+| 2000 | 31904              | 6461              |
+
+Growth per doubling (define time at 2N / define time at N):
+
+| Transition   | Before (superlinear) | After (linear) |
+| ------------ | -------------------- | -------------- |
+| 250 -> 500   | 2.92x                | 2.77x          |
+| 500 -> 1000  | 3.11x                | 2.40x          |
+| 1000 -> 2000 | 3.24x                | 1.89x          |
+
+The before column's ratios climb toward 3.0x-3.24x as N grows — the
+signature of an O(N^2) cost dominating at larger N. After the fix, the
+ratios trend down toward ~1.9x-2.4x as N grows, consistent with linear
+`define` time (matching chain's and fan's own define-time growth, both
+already ~2.0x-2.2x per doubling before this fix and unchanged by it, since
+neither shape's builder re-merges an ever-larger node map the way wide's
+window fold did).
+
+### Chain and fan: define time, checked for the same superlinear pattern
+
+Neither shape shows the wide shape's superlinear pattern, before or after
+this fix — consistent with neither one repeatedly `both`-combining a port
+that already carries a large, growing node dict (chain never calls `both`
+at all; fan's `all` call happens exactly once, at the very end, not once
+per produced step):
+
+| Shape | N    | define before (µs) | define after (µs) |
+| ----- | ---- | ------------------ | ----------------- |
+| Chain | 250  | 519                | 417               |
+| Chain | 500  | 1143               | 868               |
+| Chain | 1000 | 2425               | 1725              |
+| Chain | 2000 | 4706               | 3261              |
+| Fan   | 250  | 486                | 402               |
+| Fan   | 500  | 1772               | 1155              |
+| Fan   | 1000 | 3042               | 2228              |
+| Fan   | 2000 | 8010               | 5175              |
+
+| Shape | Transition   | Before | After |
+| ----- | ------------ | ------ | ----- |
+| Chain | 250 -> 500   | 2.20x  | 2.08x |
+| Chain | 500 -> 1000  | 2.12x  | 1.99x |
+| Chain | 1000 -> 2000 | 1.94x  | 1.89x |
+| Fan   | 250 -> 500   | 3.65x  | 2.87x |
+| Fan   | 500 -> 1000  | 1.72x  | 1.93x |
+| Fan   | 1000 -> 2000 | 2.63x  | 2.32x |
+
+Both shapes' ratios bounce around ~1.9x-2.9x at these absolute microsecond
+counts on both sides of the fix (chain and fan's own define times are
+already small enough, and their combinator use sparse enough, that
+measurement noise from a single sample per cell dominates any real
+signal) — neither one was, or is, superlinear. Run time itself (the
+`warmup`/`median`/`p95` columns) is unaffected by this change beyond
+ordinary run-to-run noise, since it never touched `for_run`, the
+coordinator, or any node's own closures — only how `define` assembles the
+node table it hands them.

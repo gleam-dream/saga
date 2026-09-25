@@ -288,6 +288,63 @@ pub fn embed_rejects_builder_returning_foreign_port_test() {
   }
 }
 
+/// The reviewer's probe P9's actual shape: the foreign-scoped builder is
+/// wrapped with `map_errors` before being `embed`ded. `map_errors`'s own
+/// `translating_build` (the shadow-scope re-evaluation `embed` invokes for
+/// a mapped workflow) has its own separate spot where the same
+/// unconditional-overwrite bug could hide: it used to build the result
+/// `Port` with `scope: input.scope` (or, before that, `shadow_output.scope`)
+/// with no `foreign_error_for` check of its own, so a foreign port returned
+/// through *this* path was caught only by sheer accident (or not at all)
+/// rather than by a real check. This test failed independently of
+/// `embed_rejects_builder_returning_foreign_port_test` above during this
+/// fix's own development, catching a second unconditional-overwrite site
+/// the first test's plain-`embed` shape never exercised — see
+/// `map_errors`'s `translating_build`.
+pub fn embed_rejects_map_errors_builder_returning_foreign_port_test() {
+  let calls = process.new_subject()
+  process.send(calls, 0)
+  let stash = process.new_subject()
+
+  let assert Ok(wf) =
+    saga.define("nd9m", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
+      let assert Ok(n) = process.receive(calls, 0)
+      process.send(calls, n + 1)
+      case n {
+        0 -> input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }))
+        _ -> {
+          let assert Ok(p) = process.receive(stash, 0)
+          p
+        }
+      }
+    })
+  let mapped = saga.map_errors(wf, error: fn(e) { e }, undo_error: fn(u) { u })
+
+  let assert Ok(_source) =
+    saga.define("source9m", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
+      let p = input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+      process.send(stash, p)
+      p
+    })
+
+  // `embed(mapped)` invokes `translating_build`, which re-evaluates `wf`'s
+  // original builder under a shadow scope — this is `wf`'s second
+  // invocation, taking the `_ ->` branch and returning the port stashed
+  // from `source9m`'s unrelated `define`.
+  let result = saga.define("outer9m", fn(input) { saga.embed(input, mapped) })
+  case result {
+    Error(errors) ->
+      list.any(errors, fn(e) {
+        case e {
+          saga.ForeignPort(_) -> True
+          _ -> False
+        }
+      })
+      |> should.be_true
+    Ok(_) -> panic as "expected embed(map_errors(..)) to reject a foreign port"
+  }
+}
+
 pub fn shared_dependency_creates_one_node_test() {
   let assert Ok(workflow) =
     saga.define("diamond", fn(input) {
