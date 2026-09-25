@@ -8,6 +8,7 @@ import gleeunit/should
 import saga
 import saga/execution
 import saga/observation
+import saga/testing
 import sinal
 import support/probe
 
@@ -159,9 +160,11 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
   // before the decider's `RetryAfter` decision arrives, or the refusal
   // this test exercises never happens.
   let assert Ok(_progress) =
-    probe.wait_until_progress(exec, 10_000, fn(p) {
-      p.phase == execution.Settling
-    })
+    testing.wait_until(
+      exec,
+      matching: fn(p) { p.phase == execution.Settling },
+      within: 10_000,
+    )
   probe.open(decider_gate)
 
   let assert Ok(execution.Failed(cause, settlement)) =

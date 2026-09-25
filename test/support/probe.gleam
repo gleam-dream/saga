@@ -338,57 +338,7 @@ pub fn dictionary_size() -> Int
 /// `ErrorClass`.
 @external(erlang, "probe_ffi", "native_throw")
 pub fn native_throw() -> a
-
-// ---------------------------------------------------------------------------
-// Progress polling
-// ---------------------------------------------------------------------------
-
-/// Polls `execution.progress` until `matches` accepts a snapshot, or
-/// `timeout_ms` elapses overall. Each poll is a real (short) message
-/// round-trip with the coordinator via `execution.progress` — never a
-/// `process.sleep` — so this returns as soon as `matches` is satisfied
-/// rather than waiting out any fixed guess at how long a transition takes.
-/// Used to synchronize a test with a run's phase or a step's state instead
-/// of sleeping a hopefully-long-enough duration.
-pub fn wait_until_progress(
-  execution: Execution(o, e, u),
-  timeout_ms: Int,
-  matches: fn(execution.Progress) -> Bool,
-) -> Result(execution.Progress, Nil) {
-  let deadline = ffi_deadline(timeout_ms)
-  wait_until_progress_loop(execution, deadline, matches)
-}
-
-fn wait_until_progress_loop(
-  execution: Execution(o, e, u),
-  deadline: Int,
-  matches: fn(execution.Progress) -> Bool,
-) -> Result(execution.Progress, Nil) {
-  let remaining = deadline - ffi_now()
-  case remaining <= 0 {
-    True -> Error(Nil)
-    False -> {
-      let poll_timeout = case remaining < 50 {
-        True -> remaining
-        False -> 50
-      }
-      case execution.progress(execution, poll_timeout) {
-        Ok(snapshot) ->
-          case matches(snapshot) {
-            True -> Ok(snapshot)
-            False -> wait_until_progress_loop(execution, deadline, matches)
-          }
-        Error(execution.ExecutionEnded) -> Error(Nil)
-        Error(execution.ProgressTimedOut) ->
-          wait_until_progress_loop(execution, deadline, matches)
-      }
-    }
-  }
-}
-
-@external(erlang, "probe_ffi", "monotonic_time_ms")
-fn ffi_now() -> Int
-
-fn ffi_deadline(timeout_ms: Int) -> Int {
-  ffi_now() + timeout_ms
-}
+// Progress polling used to live here as `wait_until_progress`. It is now
+// `saga/testing.wait_until` — a public, dogfooded helper built on the same
+// `execution.progress` polling loop — so every call site imports
+// `saga/testing` directly instead.
