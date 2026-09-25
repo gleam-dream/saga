@@ -227,6 +227,67 @@ pub fn repeated_embed_scopes_and_disambiguates_test() {
   saga.address_to_string(outer.address) |> should.equal("inner_step")
 }
 
+/// Ported from the reviewer's probe P9 (`outer9b`): a builder that is not a
+/// pure function of its input can, on `embed`'s one required re-evaluation
+/// (see `Workflow`'s doc comment), return a `Port` stashed from a *prior*,
+/// unrelated `define` call instead of deriving its output from the scoped
+/// input it was given. `embed` must reject that as `ForeignPort` — the same
+/// way `both`/`all`/`perform` already do for a foreign port used directly —
+/// rather than silently accepting it by overwriting the stashed port's
+/// scope with the parent's own on the way out. Before this fix, `embed`
+/// unconditionally rewrote the output's `scope` field to the caller's own
+/// (`Port(..output, scope: input.scope)`), which masked exactly this case:
+/// the returned port's *nodes* still belonged to the foreign definition's
+/// graph, so a run would panic in `store.get` instead of `define` failing.
+pub fn embed_rejects_builder_returning_foreign_port_test() {
+  let calls = process.new_subject()
+  process.send(calls, 0)
+  let stash = process.new_subject()
+
+  // `wf`'s builder is not a pure function of its input: its first call (at
+  // this very `define`) legitimately depends on `input`, but a *later* call
+  // (triggered by `embed`, which must call a workflow's builder again to
+  // splice it into a different, unrelated `define`'s own evaluation — see
+  // `Workflow`'s doc comment) ignores `input` and returns a port stashed
+  // from a third, unrelated `define` call below.
+  let assert Ok(wf) =
+    saga.define("nd9", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
+      let assert Ok(n) = process.receive(calls, 0)
+      process.send(calls, n + 1)
+      case n {
+        0 -> input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }))
+        _ -> {
+          let assert Ok(p) = process.receive(stash, 0)
+          p
+        }
+      }
+    })
+
+  let assert Ok(_source) =
+    saga.define("source9", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
+      let p = input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+      process.send(stash, p)
+      p
+    })
+
+  // `embed` here is `wf`'s second builder invocation (the first happened
+  // inside `wf`'s own `define` above): it takes the `_ ->` branch and
+  // returns the port stashed from `source9`'s unrelated `define`.
+  let result = saga.define("outer9b", fn(input) { saga.embed(input, wf) })
+  case result {
+    Error(errors) ->
+      list.any(errors, fn(e) {
+        case e {
+          saga.ForeignPort(_) -> True
+          _ -> False
+        }
+      })
+      |> should.be_true
+    Ok(_) ->
+      panic as "expected embed to reject a builder that returns a foreign port"
+  }
+}
+
 pub fn shared_dependency_creates_one_node_test() {
   let assert Ok(workflow) =
     saga.define("diamond", fn(input) {

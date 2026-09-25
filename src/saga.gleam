@@ -1054,10 +1054,15 @@ pub fn embed(
       ),
     )
   let output = workflow.build(scoped_input)
+  let foreign_errors = foreign_error_for(scoped_input.scope, output)
   // Restore the parent's own scope (path) on the output port, so a sibling
   // `perform`/`embed` chained after this one addresses its own steps at the
   // parent's path, not nested under this embed's.
-  Port(..output, scope: input.scope)
+  Port(
+    ..output,
+    scope: input.scope,
+    errors: list.append(output.errors, foreign_errors),
+  )
 }
 
 /// Adapts a whole workflow's error and undo-error types.

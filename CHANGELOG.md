@@ -42,6 +42,25 @@ increments toward the first local-execution release.
   validated graph directly (see `saga.Workflow`'s and `saga.map_errors`'s
   own doc comments for exactly which two situations ever invoke a
   builder).
+- **Performance: `define` time no longer grows superlinearly for
+  wide-dependency workflows.** `Port` used to carry its own transitive
+  `nodes: Dict(Int, Node(e, u))`, merged with `dict.merge` on every
+  `both`/`map` combinator call (`saga.gleam`'s `merge_ports`); a workflow
+  whose steps each read a sliding window of several prior outputs (like
+  `bench`'s "wide" shape) merged an ever-larger dict on every such call,
+  for an O(N^2) `define` cost. Profiling (`:eprof` on the wide shape's
+  `define` at N=2000) attributed 35% of total time to `maps:merge/2` alone.
+  Every node is now appended once (O(1)) to its scope's own registry
+  instead (`saga/internal/cell.Registry`, already used for orphan-step
+  tracking); `define` assembles the node table exactly once, at the end,
+  by walking the registered nodes' own `deps` edges from the workflow's
+  output (`reachable_nodes`/`walk_reachable`) — one O(V+E) graph walk
+  instead of one O(N) merge per combinator call. See `bench/RESULTS.md`'s
+  "Define time" section: the wide shape's `define`-time growth per
+  doubling dropped from ~3.0x-3.24x (superlinear) to ~1.9x-2.8x (linear,
+  matching chain's and fan's own define-time growth, both already linear
+  and unaffected by this change). Run time, admission, and validation
+  order are unchanged.
 
 ### Removed
 
@@ -134,6 +153,20 @@ assert` panic.
 
 ### Fixed
 
+- `embed` did not check its re-invoked builder's returned port for a
+  foreign scope before restoring the parent's own scope on it
+  (`Port(..output, scope: input.scope)`, unconditionally). A builder that
+  is not a pure function of its input (see the previous `map_errors`
+  finding on this same page) could return a `Port` stashed from a
+  different, unrelated `define` call; `embed` accepted it silently instead
+  of reporting `DefinitionError.ForeignPort` — the same check `both`/`all`/
+  `perform` already apply to a foreign port used directly — so `define`
+  succeeded on a graph it never actually validated, and running it later
+  panicked in `store.get` (reported to the caller as `Lost`) instead of
+  failing at `define` time. `embed` now calls the same `foreign_error_for`
+  check used elsewhere before restoring scope. Ported the reviewer's probe
+  P9 as a regression test (`embed_rejects_builder_returning_foreign_port_test`
+  in `test/authoring_test.gleam`).
 - `map_errors` re-ran a workflow's build function a second time (with no
   validation at all) to compute its own graph, instead of reusing the
   already-built, already-validated graph `define` produced. Found by
