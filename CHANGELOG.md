@@ -6,6 +6,27 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
+### Added
+
+- **`execution.Config` gains `step_timeout: Option(Int)`, defaulting to
+  `Some(60_000)` (60 seconds) in `execution.config()`.** Previously a step
+  with no `saga.timeout` of its own could hang forever and block
+  `execution.run`/`execution.await` indefinitely, with no default anywhere
+  in the library to prevent it. Every attempt is now bounded by
+  `step_timeout` unless the step declares its own `saga.timeout`, which
+  always overrides the default (shorter or longer). `step_timeout: None` is
+  the explicit opt-out, restoring the previous no-default-timeout behavior
+  for every step that does not set its own. `validate` rejects a non-positive
+  `step_timeout` as the new `ConfigError.StepTimeoutNotPositive(value)`,
+  before any process starts, consistent with the existing `deadline`
+  validation. The run `deadline` default stays `None`: `step_timeout` and
+  `saga.compensate`'s `max_attempts` already bound every attempt and its
+  total retry budget, so a run-wide deadline remains an opt-in, coarser
+  ceiling rather than something the library defaults on every caller's
+  behalf. A timed-out attempt's semantics are unchanged: its effect is
+  unknown, never journaled or undone, and reported exactly as before
+  (`StepTimedOut`, `interrupted`, `CompletedWithUnknownEffects`).
+
 ### Changed
 
 - **Performance: the workflow build function now runs exactly once, at

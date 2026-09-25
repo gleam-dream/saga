@@ -281,6 +281,11 @@ type RunState(o, e, u) {
     running: Int,
     max_concurrency: Int,
     deadline: Option(Int),
+    // The per-attempt timeout applied when a step declares none of its own
+    // (`n.timeout` is `None`) — see `start_attempt`. `None` here means no
+    // default is enforced (the explicit opt-out); it is never itself
+    // overridden by a step's own `timeout`, only the other way around.
+    step_timeout: Option(Int),
     settle_timeout: Int,
     cleanup_timeout: Int,
     deadline_timer: Option(Timer),
@@ -325,6 +330,7 @@ pub fn start(
   owner owner: Pid,
   max_concurrency max_concurrency: Int,
   deadline deadline: Option(Int),
+  step_timeout step_timeout: Option(Int),
   settle_timeout settle_timeout: Int,
   cleanup_timeout cleanup_timeout: Int,
   build_graph build_graph: fn() ->
@@ -348,6 +354,7 @@ pub fn start(
         run_id,
         max_concurrency,
         deadline,
+        step_timeout,
         settle_timeout,
         cleanup_timeout,
         build_graph,
@@ -374,6 +381,7 @@ fn run(
   run_id: Int,
   max_concurrency: Int,
   deadline: Option(Int),
+  step_timeout: Option(Int),
   settle_timeout: Int,
   cleanup_timeout: Int,
   build_graph: fn() ->
@@ -435,6 +443,7 @@ fn run(
       running: 0,
       max_concurrency: max_concurrency,
       deadline: deadline,
+      step_timeout: step_timeout,
       settle_timeout: settle_timeout,
       cleanup_timeout: cleanup_timeout,
       deadline_timer: deadline_timer,
@@ -658,7 +667,11 @@ fn start_attempt(
       }
     })
   emit_step_started(state, n.address, attempt_number)
-  let timer = case n.timeout {
+  // A step's own `timeout` (`n.timeout`) always wins when set; only a step
+  // that declared none at all falls back to the run's `step_timeout`
+  // default. `option.or` picks the first `Some`, so this is exactly that
+  // override direction — never the reverse.
+  let timer = case option.or(n.timeout, state.step_timeout) {
     None -> None
     Some(ms) ->
       Some(process.send_after(control, ms, StepTimeoutFired(node_id, seq)))

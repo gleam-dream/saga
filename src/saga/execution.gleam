@@ -30,17 +30,31 @@ pub type Config {
   Config(
     max_concurrency: Int,
     deadline: Option(Int),
+    step_timeout: Option(Int),
     settle_timeout: Int,
     cleanup_timeout: Int,
   )
 }
 
 /// Sensible defaults: one attempt/compensation task per scheduler, no run
-/// deadline, a 5 second settle window, and a 5 second cleanup bound.
+/// deadline, a 60 second default per-attempt `step_timeout`, a 5 second
+/// settle window, and a 5 second cleanup bound.
+///
+/// **Why the run `deadline` stays `None` while `step_timeout` does not.**
+/// `step_timeout` alone already bounds every individual attempt, and
+/// `saga.compensate`'s `max_attempts` already bounds how many attempts (plus
+/// backoff waits) a step can accumulate — together those two already give
+/// every step a finite worst-case duration without a run-wide deadline
+/// forcing one. A `deadline` is a different, coarser knob (a ceiling on the
+/// *whole run*, cutting across still-healthy steps too) that only some
+/// callers need; unlike a hung step, that is not a hazard the library can
+/// safely default on behalf of every caller, so it stays an opt-in via
+/// `deadline: Some(_)`.
 pub fn config() -> Config {
   Config(
     max_concurrency: schedulers_online(),
     deadline: None,
+    step_timeout: Some(60_000),
     settle_timeout: 5000,
     cleanup_timeout: 5000,
   )
@@ -54,6 +68,7 @@ fn schedulers_online() -> Int
 pub type ConfigError {
   MaxConcurrencyNotPositive(value: Int)
   DeadlineNotPositive(value: Int)
+  StepTimeoutNotPositive(value: Int)
   SettleTimeoutNegative(value: Int)
   CleanupTimeoutNotPositive(value: Int)
 }
@@ -71,6 +86,11 @@ pub fn validate(config: Config) -> Result(Config, List(ConfigError)) {
         None -> []
         Some(ms) if ms > 0 -> []
         Some(ms) -> [DeadlineNotPositive(ms)]
+      },
+      case config.step_timeout {
+        None -> []
+        Some(ms) if ms > 0 -> []
+        Some(ms) -> [StepTimeoutNotPositive(ms)]
       },
       case config.settle_timeout >= 0 {
         True -> []
@@ -350,6 +370,7 @@ pub fn start(
       owner: owner,
       max_concurrency: validated.max_concurrency,
       deadline: validated.deadline,
+      step_timeout: validated.step_timeout,
       settle_timeout: validated.settle_timeout,
       cleanup_timeout: validated.cleanup_timeout,
       build_graph: fn() { saga.for_run(workflow, input) },

@@ -5,6 +5,128 @@ import saga
 import saga/execution
 import support/probe
 
+// ---------------------------------------------------------------------------
+// Default step timeout
+// ---------------------------------------------------------------------------
+
+/// `execution.config()` ships a 60 second default per-attempt `step_timeout`
+/// — asserted directly rather than only indirectly through behavior, so a
+/// silent change to the default value is caught even if every behavioral
+/// test below still passes.
+pub fn config_defaults_to_a_60_second_step_timeout_test() {
+  execution.config().step_timeout |> should.equal(Some(60_000))
+}
+
+/// A step with no `saga.timeout` of its own is still bounded by the run's
+/// `step_timeout` default: a hung step is killed and reported `StepTimedOut`
+/// rather than blocking the run forever. Uses a small override (not a real
+/// 60 second wait) to keep the test fast.
+pub fn default_step_timeout_bounds_a_hung_step_test() {
+  let gate = probe.new_gate()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("blocked", fn(x: Int) {
+          probe.enter(gate)
+          Ok(x)
+        }),
+      )
+    })
+
+  let config = execution.Config(..execution.config(), step_timeout: Some(50))
+
+  probe.with_run(workflow, 0, config, fn(exec) {
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
+    let assert Ok(execution.Failed(cause, _settlement)) =
+      execution.await(exec, 10_000)
+    case cause {
+      execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
+      _ -> panic as "expected StepTimedOut(blocked) from the default timeout"
+    }
+  })
+}
+
+/// A step's own `saga.timeout` overrides the run's `step_timeout` default
+/// when the step's own bound is *shorter*: the step is killed on its own
+/// schedule, well before the (longer) default would have fired.
+pub fn step_timeout_overrides_default_when_shorter_test() {
+  let gate = probe.new_gate()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("blocked", fn(x: Int) {
+          probe.enter(gate)
+          Ok(x)
+        })
+        |> saga.timeout(50),
+      )
+    })
+
+  // A default far longer than the step's own timeout: if the override did
+  // not take effect, this test would hang until the default fired instead.
+  let config =
+    execution.Config(..execution.config(), step_timeout: Some(10_000))
+
+  probe.with_run(workflow, 0, config, fn(exec) {
+    let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
+    let assert Ok(execution.Failed(cause, _settlement)) =
+      execution.await(exec, 2000)
+    case cause {
+      execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
+      _ -> panic as "expected StepTimedOut(blocked) from the step's own timeout"
+    }
+  })
+}
+
+/// A step's own `saga.timeout` overrides the run's `step_timeout` default
+/// even when the step's own bound is *longer*: a short default must not
+/// pre-empt a step that explicitly asked for more time.
+pub fn step_timeout_overrides_default_when_longer_test() {
+  let counter = probe.new_counter()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("slow_but_fine", fn(x: Int) {
+          probe.counter_enter(counter)
+          Ok(x)
+        })
+        |> saga.timeout(10_000),
+      )
+    })
+
+  // A default far shorter than the step's own timeout: if the override did
+  // not take effect, the default would kill the step before it can finish.
+  let config = execution.Config(..execution.config(), step_timeout: Some(1))
+
+  let assert Ok(execution.Completed(0)) = execution.run(workflow, 0, config)
+  probe.total_entries(counter) |> should.equal(1)
+}
+
+/// `step_timeout: None` is the explicit opt-out: a step with no `saga.timeout`
+/// of its own is never killed by the coordinator, and a slow-but-eventually-
+/// finishing step still completes normally.
+pub fn step_timeout_none_disables_the_default_test() {
+  let counter = probe.new_counter()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("slow", fn(x: Int) {
+          probe.counter_enter(counter)
+          Ok(x)
+        }),
+      )
+    })
+
+  let config = execution.Config(..execution.config(), step_timeout: None)
+
+  let assert Ok(execution.Completed(0)) = execution.run(workflow, 0, config)
+  probe.total_entries(counter) |> should.equal(1)
+}
+
 pub type DemoError {
   Boom
 }
@@ -30,24 +152,35 @@ pub fn invalid_config_rejected_before_start_test() {
     execution.Config(
       max_concurrency: 0,
       deadline: None,
+      step_timeout: Some(60_000),
       settle_timeout: 5000,
       cleanup_timeout: 5000,
     ),
     execution.Config(
       max_concurrency: 1,
       deadline: Some(0),
+      step_timeout: Some(60_000),
       settle_timeout: 5000,
       cleanup_timeout: 5000,
     ),
     execution.Config(
       max_concurrency: 1,
       deadline: None,
+      step_timeout: Some(0),
+      settle_timeout: 5000,
+      cleanup_timeout: 5000,
+    ),
+    execution.Config(
+      max_concurrency: 1,
+      deadline: None,
+      step_timeout: Some(60_000),
       settle_timeout: -1,
       cleanup_timeout: 5000,
     ),
     execution.Config(
       max_concurrency: 1,
       deadline: None,
+      step_timeout: Some(60_000),
       settle_timeout: 5000,
       cleanup_timeout: 0,
     ),
@@ -69,12 +202,13 @@ pub fn every_config_error_variant_is_reachable_test() {
     execution.Config(
       max_concurrency: -1,
       deadline: Some(-5),
+      step_timeout: Some(-2),
       settle_timeout: -1,
       cleanup_timeout: -1,
     )
   case execution.validate(config) {
     Error(errors) -> {
-      list.length(errors) |> should.equal(4)
+      list.length(errors) |> should.equal(5)
       list.any(errors, fn(e) {
         case e {
           execution.MaxConcurrencyNotPositive(-1) -> True
@@ -85,6 +219,13 @@ pub fn every_config_error_variant_is_reachable_test() {
       list.any(errors, fn(e) {
         case e {
           execution.DeadlineNotPositive(-5) -> True
+          _ -> False
+        }
+      })
+      |> should.be_true
+      list.any(errors, fn(e) {
+        case e {
+          execution.StepTimeoutNotPositive(-2) -> True
           _ -> False
         }
       })
