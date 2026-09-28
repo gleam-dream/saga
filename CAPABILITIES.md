@@ -42,6 +42,10 @@ Every capability below carries a status:
 - Process lifecycle: `execution.start`/`await`/`run`, owner-exit detection,
   `execution.pid` for external monitoring, `execution.progress` for a
   read-only phase/step-state snapshot.
+- Outcome delivery to a caller-supplied `Subject`
+  (`execution.start_reporting`): one message per run, to any process or a
+  registered name, delivered after rollback even when the owner's exit
+  cancelled the run, and selectable in the receiver's own `Selector`.
 - Sinal-based observations (`saga/observation`): run start/stop, step
   start/stop, compensation decisions, and undo outcomes, with typed
   measurements and metadata.
