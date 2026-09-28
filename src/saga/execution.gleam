@@ -1,6 +1,14 @@
 /// Run lifecycle for a `saga.Workflow`: config and its validation, starting
 /// a run, waiting for or inspecting its outcome, and cancellation.
 ///
+/// **Who learns the outcome.** `run` returns it; `start` delivers it to the
+/// starting process, which alone may `await` it; `start_reporting` delivers
+/// it as one message to a caller-supplied `Subject`, which a surviving
+/// process can hold even after the starting process exits, or which the
+/// starting process can add to its own `Selector`. In every case the
+/// starting process owns the run: its exit cancels the run, which still
+/// settles and rolls back before ending.
+///
 /// `run`/`start`/`await`/`cancel`/`progress` are implemented with bounded
 /// concurrency, retry/compensation, reverse-order undo, a run deadline,
 /// per-step timeouts, and cancellation settlement of active siblings.
@@ -24,6 +32,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/string
 import saga.{type Workflow}
 import saga/internal/coordinator
+import saga/internal/ffi
 
 /// Bounds and pacing for one run.
 pub type Config {
@@ -264,24 +273,30 @@ pub type ProgressError {
 /// after success as conclusive.
 pub type AwaitError {
   AwaitTimedOut
+  /// The calling process does not receive this run's outcome: it is not the
+  /// process that called `start`, or the run was started with
+  /// `start_reporting` and delivers its outcome to a report subject.
   NotOwner
   AlreadyAwaited
   Lost(crash: Crash)
 }
 
-/// A started run. Only the process that called `start` may `await` it.
+/// A started run. Only the process that called `start` may `await` it; a
+/// run started with `start_reporting` delivers its outcome to its report
+/// subject instead, and cannot be awaited at all. Either way, `cancel`,
+/// `progress`, `pid` and `run_id` work from any process.
 ///
 /// Deliberately stateless on the owner's side: no process-dictionary flag
 /// or other bookkeeping outside this immutable value survives between
 /// `await` calls, so starting and awaiting any number of `Execution`s never
-/// grows the owner's process dictionary. `monitor` is the *original*
-/// monitor set up once, in `start` — an ordinary value held on `Execution`,
-/// not owner-process state, so keeping it costs nothing once the
-/// `Execution` itself is dropped. It is what makes a coordinator that dies
-/// abnormally *before ever being awaited* reliably reported as `Lost`: a
-/// monitor set up while the coordinator was still alive is the only way to
-/// see its *real* exit reason, since a monitor set up afterwards (once the
-/// coordinator is already dead) always reports the synthetic reason
+/// grows the owner's process dictionary. `ToOwner.monitor` is the
+/// *original* monitor set up once, in `start` — an ordinary value held on
+/// `Execution`, not owner-process state, so keeping it costs nothing once
+/// the `Execution` itself is dropped. It is what makes a coordinator that
+/// dies abnormally *before ever being awaited* reliably reported as `Lost`:
+/// a monitor set up while the coordinator was still alive is the only way
+/// to see its *real* exit reason, since a monitor set up afterwards (once
+/// the coordinator is already dead) always reports the synthetic reason
 /// `noproc` instead. See `await`'s doc comment for how a second `await`
 /// (after `monitor` has already fired and been torn down) is still
 /// detected — without extra owner-side state — using a second, freshly
@@ -296,15 +311,27 @@ pub type AwaitError {
 /// message sitting in the owner's mailbox once the run eventually settles.
 /// Always `await` again after `cancel` (even with a short timeout) so the
 /// run's terminal outcome is consumed before the `Execution` is dropped.
+/// A `start_reporting` run sets up no monitor in the starting process and
+/// sends it nothing, so it leaves nothing behind there.
 pub opaque type Execution(o, e, u) {
   Execution(
     pid: Pid,
     run_id: Int,
+    control: Subject(coordinator.Control(o, e, u)),
+    delivery: Delivery(o, e, u),
+  )
+}
+
+/// Where a run's outcome goes.
+type Delivery(o, e, u) {
+  /// `start`: to `result`, owned by `owner`, which alone may `await` it.
+  ToOwner(
     owner: Pid,
     monitor: process.Monitor,
-    control: Subject(coordinator.Control(o, e, u)),
     result: Subject(coordinator.Outcome(o, e, u)),
   )
+  /// `start_reporting`: to the caller's report subject; not awaitable.
+  ToReport
 }
 
 /// Runs `workflow` with `input` to completion, validating `config` first.
@@ -323,7 +350,7 @@ pub fn run(
         // `await_forever` cannot produce `AwaitTimedOut` (no timeout was
         // given) or `NotOwner` (the same process that started also awaits).
         // `AlreadyAwaited` should likewise be unreachable here: this is the
-        // only `await` ever raced against `execution.monitor`, and that
+        // only `await` ever raced against `original_monitor`, and that
         // monitor has been armed since `start` — so if the coordinator has
         // already died by the time this call's fresh monitor is created,
         // the original's real `Down` was necessarily enqueued first (mailbox
@@ -357,24 +384,91 @@ pub fn start(
   input: i,
   config: Config,
 ) -> Result(Execution(o, e, u), RunError) {
+  let owner = process.self()
+  let result = process.new_subject()
+  use #(pid, run_id, control) <- result_try(
+    launch(workflow, input, config, process.send(result, _)),
+  )
+  Ok(Execution(
+    pid: pid,
+    run_id: run_id,
+    control: control,
+    delivery: ToOwner(owner: owner, monitor: process.monitor(pid), result:),
+  ))
+}
+
+/// Starts a run like `start`, but delivers its outcome to `report` as one
+/// message instead of to the calling process. `report` may belong to any
+/// process — the caller itself, to receive the outcome in its own
+/// `Selector` next to its other messages, or another process, which then
+/// learns the outcome even if the caller is gone — or be a
+/// `process.named_subject`, resolved when the outcome is sent.
+///
+/// **Ownership.** The calling process is still the run's owner: if it
+/// exits before the run ends, the run is cancelled with `OwnerExited`,
+/// settles and rolls back exactly as for `cancel`, and the resulting
+/// `Cancelled(OwnerExited, settlement)` is still delivered to `report`.
+/// The settlement names every step undone, every undo or compensation that
+/// failed or timed out, and every step interrupted with an unknown effect.
+///
+/// **Delivery.** `report` receives at most one message per run, sent by the
+/// run's coordinator when the run ends, never before. It receives exactly
+/// one unless the coordinator itself is killed (then nothing is sent) or,
+/// for a named subject, no process holds the name when the outcome is sent
+/// (then the outcome is dropped and the coordinator still exits normally).
+/// To detect a lost run, the receiver monitors `pid(execution)`: the
+/// coordinator's `Down` always arrives after its outcome, so a `Down` with
+/// no outcome before it means the run was lost. A monitor set up after the
+/// coordinator exited still fires (with reason `noproc`) and still arrives
+/// after the outcome, if one was sent.
+///
+/// `await` on the returned `Execution` reports `Error(NotOwner)`, from any
+/// process; `cancel`, `progress`, `pid` and `run_id` work as for `start`.
+/// The starting process gets no monitor and no message from the run.
+pub fn start_reporting(
+  workflow: Workflow(i, o, e, u),
+  input: i,
+  config: Config,
+  to report: Subject(Outcome(o, e, u)),
+) -> Result(Execution(o, e, u), RunError) {
+  use #(pid, run_id, control) <- result_try(
+    launch(workflow, input, config, fn(outcome) {
+      // A named subject with no process behind it raises; the outcome is
+      // then dropped rather than crashing the coordinator as it exits.
+      case
+        ffi.rescue(fn() { process.send(report, to_public_outcome(outcome)) })
+      {
+        ffi.Rescued(Nil) | ffi.Raised(..) -> Nil
+      }
+    }),
+  )
+  Ok(Execution(pid: pid, run_id: run_id, control: control, delivery: ToReport))
+}
+
+/// Validates `config` and spawns the coordinator, owned by the calling
+/// process, delivering its outcome through `deliver`.
+fn launch(
+  workflow: Workflow(i, o, e, u),
+  input: i,
+  config: Config,
+  deliver: fn(coordinator.Outcome(o, e, u)) -> Nil,
+) -> Result(#(Pid, Int, Subject(coordinator.Control(o, e, u))), RunError) {
   use validated <- result_try(case validate(config) {
     Ok(validated) -> Ok(validated)
     Error(errors) -> Error(InvalidConfig(errors))
   })
-  let owner = process.self()
-  let result_subject = process.new_subject()
   let control_subject_out = process.new_subject()
   let #(pid, run_id) =
     coordinator.start(
       workflow_name: saga.name(workflow),
-      owner: owner,
+      owner: process.self(),
       max_concurrency: validated.max_concurrency,
       deadline: validated.deadline,
       step_timeout: validated.step_timeout,
       settle_timeout: validated.settle_timeout,
       cleanup_timeout: validated.cleanup_timeout,
       build_graph: fn() { saga.for_run(workflow, input) },
-      result_subject: result_subject,
+      deliver: deliver,
       control_subject_out: control_subject_out,
     )
   case process.receive(control_subject_out, 5000) {
@@ -385,15 +479,7 @@ pub fn start(
           "coordinator did not complete its startup handshake within 5000ms",
         )),
       )
-    Ok(control) ->
-      Ok(Execution(
-        pid: pid,
-        run_id: run_id,
-        owner: owner,
-        monitor: process.monitor(pid),
-        control: control,
-        result: result_subject,
-      ))
+    Ok(control) -> Ok(#(pid, run_id, control))
   }
 }
 
@@ -414,19 +500,19 @@ type AwaitSignal(o, e, u) {
 }
 
 /// Builds the selector for one `await`/`await_forever` call: it races
-/// `execution.result` against *two* monitors on the coordinator —
-/// `execution.monitor` (the original one, set up once in `start`, still
+/// `result` against *two* monitors on the coordinator —
+/// `original_monitor` (the original one, set up once in `start`, still
 /// armed only until it has fired and been torn down once) and a brand new
 /// one created here, just for this call. Returns the fresh monitor
 /// alongside the selector so the caller can demonitor it afterwards;
-/// `execution.monitor` is demonitored by `await_signal` instead, since
+/// `original_monitor` is demonitored by `await_signal` instead, since
 /// whether *it* still needs tearing down depends on which signal actually
 /// matched.
 ///
 /// Racing both, rather than only the original, is what makes a *second*
 /// `await` (after the first already consumed the outcome, or already
 /// observed the original's `Down`) resolve promptly instead of idling out
-/// the full timeout: `execution.monitor` cannot fire again once spent, but
+/// the full timeout: `original_monitor` cannot fire again once spent, but
 /// Erlang delivers a brand new monitor's `Down` immediately — with the
 /// synthetic reason `noproc` — when the monitored process is already dead,
 /// which `await_signal` recognizes as "nothing further to await". See
@@ -435,18 +521,20 @@ type AwaitSignal(o, e, u) {
 /// exit reason, only `noproc`).
 ///
 /// Erlang mailboxes are FIFO, and a coordinator's real `Down` for
-/// `execution.monitor` (fired while that monitor was live) is always
+/// `original_monitor` (fired while that monitor was live) is always
 /// enqueued before the fresh monitor's synthetic post-mortem `Down`
 /// (created afterwards) can be, so racing both together can never lose the
 /// original's real exit reason to the fresh monitor's `noproc`.
 fn await_selector(
-  execution: Execution(o, e, u),
+  pid: Pid,
+  original_monitor: process.Monitor,
+  result: Subject(coordinator.Outcome(o, e, u)),
 ) -> #(process.Monitor, process.Selector(AwaitSignal(o, e, u))) {
-  let fresh_monitor = process.monitor(execution.pid)
+  let fresh_monitor = process.monitor(pid)
   let selector =
     process.new_selector()
-    |> process.select_map(execution.result, GotOutcome)
-    |> process.select_specific_monitor(execution.monitor, fn(down) {
+    |> process.select_map(result, GotOutcome)
+    |> process.select_specific_monitor(original_monitor, fn(down) {
       OriginalDown(down_reason(down))
     })
     |> process.select_specific_monitor(fresh_monitor, fn(down) {
@@ -467,21 +555,21 @@ fn down_reason(down: process.Down) -> process.ExitReason {
 /// matched — it has either already fired (its `Down`, if any, must not sit
 /// in the owner's mailbox forever) or never will (a `GotOutcome` or
 /// `OriginalDown` win instead, or this call is timing out) and either way
-/// must be torn down before the next `await`. `execution.monitor` (the
+/// must be torn down before the next `await`. `original_monitor` (the
 /// original) is demonitored (with `[flush]`) on every branch: `GotOutcome`
 /// and `OriginalDown` consume it directly, and `FreshDown` either finds and
 /// consumes its `Down` too (see below) or tears down a monitor that can now
 /// never fire (the coordinator is confirmed dead either way), so nothing is
 /// ever left armed after this call returns.
 fn await_signal(
-  execution: Execution(o, e, u),
+  original_monitor: process.Monitor,
   fresh_monitor: process.Monitor,
   signal: AwaitSignal(o, e, u),
 ) -> Result(Outcome(o, e, u), AwaitError) {
   process.demonitor_process(fresh_monitor)
   case signal {
     GotOutcome(outcome) -> {
-      process.demonitor_process(execution.monitor)
+      process.demonitor_process(original_monitor)
       Ok(to_public_outcome(outcome))
     }
     // A first-hand `Down` from the *original* monitor: it was still armed
@@ -492,7 +580,7 @@ fn await_signal(
     // contract rules out; kept as `Lost` rather than panicking, since it is
     // cheaper to report defensively than to prove unreachable.
     OriginalDown(reason) -> {
-      process.demonitor_process(execution.monitor)
+      process.demonitor_process(original_monitor)
       Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
     }
     // The *fresh* monitor fired instead, with the synthetic reason `noproc`
@@ -519,12 +607,12 @@ fn await_signal(
     // resolves this without polling or a process-dictionary flag: if its
     // `Down` is already in the mailbox, case 2 applies and its real reason
     // is reported as `Lost`; otherwise case 1 applies. Either way
-    // `execution.monitor` is demonitored with `[flush]` afterwards, so it
+    // `original_monitor` is demonitored with `[flush]` afterwards, so it
     // never lingers into a later `await`.
     FreshDown(_reason) -> {
       let original_selector =
         process.new_selector()
-        |> process.select_specific_monitor(execution.monitor, fn(down) {
+        |> process.select_specific_monitor(original_monitor, fn(down) {
           down_reason(down)
         })
       let outcome = case process.selector_receive(original_selector, 0) {
@@ -532,7 +620,7 @@ fn await_signal(
           Error(Lost(saga.Crash(saga.ExitClass, exit_reason_to_string(reason))))
         Error(_) -> Error(AlreadyAwaited)
       }
-      process.demonitor_process(execution.monitor)
+      process.demonitor_process(original_monitor)
       outcome
     }
   }
@@ -572,17 +660,14 @@ pub fn await(
   execution: Execution(o, e, u),
   timeout milliseconds: Int,
 ) -> Result(Outcome(o, e, u), AwaitError) {
-  case process.self() == execution.owner {
-    False -> Error(NotOwner)
-    True -> {
-      let #(fresh_monitor, selector) = await_selector(execution)
-      case process.selector_receive(selector, milliseconds) {
-        Ok(signal) -> await_signal(execution, fresh_monitor, signal)
-        Error(_) -> {
-          process.demonitor_process(fresh_monitor)
-          Error(AwaitTimedOut)
-        }
-      }
+  use #(monitor, result) <- awaited_by_self(execution)
+  let #(fresh_monitor, selector) =
+    await_selector(execution.pid, monitor, result)
+  case process.selector_receive(selector, milliseconds) {
+    Ok(signal) -> await_signal(monitor, fresh_monitor, signal)
+    Error(_) -> {
+      process.demonitor_process(fresh_monitor)
+      Error(AwaitTimedOut)
     }
   }
 }
@@ -590,16 +675,29 @@ pub fn await(
 fn await_forever(
   execution: Execution(o, e, u),
 ) -> Result(Outcome(o, e, u), AwaitError) {
-  case process.self() == execution.owner {
-    False -> Error(NotOwner)
-    True -> {
-      let #(fresh_monitor, selector) = await_selector(execution)
-      await_signal(
-        execution,
-        fresh_monitor,
-        process.selector_receive_forever(selector),
-      )
-    }
+  use #(monitor, result) <- awaited_by_self(execution)
+  let #(fresh_monitor, selector) =
+    await_selector(execution.pid, monitor, result)
+  await_signal(
+    monitor,
+    fresh_monitor,
+    process.selector_receive_forever(selector),
+  )
+}
+
+/// Runs `then` with the run's original monitor and result subject when the
+/// calling process is the one `start` delivers the outcome to; otherwise
+/// `NotOwner` (another process, or a `start_reporting` run).
+fn awaited_by_self(
+  execution: Execution(o, e, u),
+  then: fn(#(process.Monitor, Subject(coordinator.Outcome(o, e, u)))) ->
+    Result(Outcome(o, e, u), AwaitError),
+) -> Result(Outcome(o, e, u), AwaitError) {
+  let self = process.self()
+  case execution.delivery {
+    ToOwner(owner:, monitor:, result:) if owner == self ->
+      then(#(monitor, result))
+    ToOwner(..) | ToReport -> Error(NotOwner)
   }
 }
 
@@ -609,6 +707,13 @@ fn await_forever(
 /// kills whatever remains (reported `interrupted`) and rolls back known
 /// completed effects. It never reverses an interrupted or not-undoable
 /// effect.
+///
+/// The settle window is the run's `Config.settle_timeout`, fixed at start;
+/// a cancellation cannot shorten it, because the owner's exit cancels a
+/// run with no call to carry a value. It is an upper bound, not a delay:
+/// settling ends as soon as nothing is in flight. `settle_timeout: 0`
+/// kills in-flight work at once, reporting it `interrupted`; a longer
+/// window lets it finish, so that it is known and undone.
 pub fn cancel(execution: Execution(o, e, u)) -> Nil {
   process.send(execution.control, coordinator.CancelRequest)
 }
