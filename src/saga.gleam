@@ -285,6 +285,14 @@ pub fn undo(
 /// Attaches an explicit recovery decision for a *failing* attempt (an
 /// application error, a crash, or a timeout), with a total attempt budget.
 /// With no `compensate`, a failure aborts after exactly one attempt.
+///
+/// **A crash stays visible whatever `decide` returns.** `decide` receives
+/// `Crashed`/`TimedOut` for an attempt that never returned, whose effect may
+/// or may not have happened. Whatever it returns, that attempt is named in
+/// the outcome's `execution.unknown_effects`. In particular, `Abort(error)`
+/// after a crash ends the run with `execution.StepFailed(step, error)`, the
+/// same cause as an aborted typed error: choose an `error` that says the
+/// attempt crashed if the caller must tell the two apart from the cause.
 pub fn compensate(
   step: Step(i, o, e, u),
   max_attempts max_attempts: Int,

@@ -196,8 +196,8 @@ pub fn cancel_while_step_in_flight_rolls_back_and_reports_cancelled_test() {
 
     execution.cancel(execution)
 
-    let assert Ok(execution.Cancelled(reason, settlement)) =
-      execution.await(execution, 2000)
+    let assert Ok(outcome) = execution.await(execution, 2000)
+    let assert execution.Cancelled(reason, settlement) = outcome
     reason |> should.equal(execution.CancelRequested)
     // The blocked step was killed by the settle window, not undone: its
     // effect is unknown, so it must show up as interrupted, never undone.
@@ -205,6 +205,12 @@ pub fn cancel_while_step_in_flight_rolls_back_and_reports_cancelled_test() {
     |> list.map(fn(address) { address.name })
     |> should.equal(["await_release"])
     settlement.undone |> should.equal([])
+    // The outcome names the killed attempt as an unknown effect.
+    execution.unknown_effects(outcome)
+    |> list.map(fn(effect) { #(effect.step.name, effect.action, effect.ending) })
+    |> should.equal([
+      #("await_release", execution.StepAttempt(1), execution.ActionInterrupted),
+    ])
   })
 }
 

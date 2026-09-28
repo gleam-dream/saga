@@ -32,7 +32,14 @@ Every capability below carries a status:
   (see the design's conflict log).
 - Settlement reporting: `undone`, `undo_failures` (all retained, not just
   the first), `not_undoable`, `held`, `interrupted`, `compensation_failures`,
-  `sibling_failures`.
+  `sibling_failures`, `unknown_effects`.
+- Unknown-effect reporting for every outcome kind:
+  `execution.unknown_effects(outcome)` names each step attempt,
+  compensation decision and undo that crashed or exited, timed out, or was
+  interrupted, by step, action and attempt number, and is `[]` exactly when
+  every action returned a result. A crashed attempt stays named whatever
+  its decider then chose, including a retry to success
+  (`CompletedWithUnknownEffects`).
 - Run deadlines, per-step timeouts, a settle window for in-flight siblings
   after a terminal trigger, and a cleanup timeout bounding each individual
   compensation decision or undo action.

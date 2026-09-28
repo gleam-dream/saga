@@ -305,19 +305,49 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   running: every step created via `perform`/`embed` must have its output
   port threaded (directly or through `map`/`both`/`all`) into the
   workflow's final returned port.
+- **Every outcome says which effects are unknown.** Each action of a run
+  — a step attempt, a compensation decision, an undo — ends with a known
+  result (it returned `Ok` or a typed error) or with an unknown effect (it
+  crashed or its process exited, it was killed at its time bound, or it was
+  killed when the settle window closed). `execution.unknown_effects(outcome)`
+  lists every action of the second kind as an
+  `UnknownEffect(step, action, ending)`, for every outcome kind, and is
+  `[]` exactly when every action returned:
+  ```gleam
+  case execution.unknown_effects(outcome) {
+    // Every effect is known: done, undone, or left in place by a result.
+    [] -> Definite
+    // Each names a step, `StepAttempt(n)`, `StepCompensation(n)` or
+    // `StepUndo`, and `ActionCrashed(_)`, `ActionTimedOut` or
+    // `ActionInterrupted`.
+    unknown -> Uncertain(unknown)
+  }
+  ```
+  An action is recorded when it ends, so a later decision cannot hide it: a
+  crashed attempt retried to success, continued, aborted or held is still
+  named. An effect a result left in place (an undo that returned an error,
+  a step with no undo, a held step) is known, and is reported by the
+  settlement instead.
 - **A `Completed` outcome does not always mean every effect is known.**
   `execution.Outcome.CompletedWithUnknownEffects(output, unknown_effects)`
-  is `Completed`'s counterpart for the one case a plain `Completed` cannot
-  honestly report: a step whose attempt was killed by its own `timeout`,
-  but whose `compensate` decider chose `Retry`/`RetryAfter`/`Continue`
-  anyway, letting the run reach a normal output. The _killed_ attempt's own
-  effect is still unknown and was never journaled or undone — only the
-  _replacement_ attempt is known-good. `unknown_effects` names every such
-  step; it is never empty on this variant. `saga/observation`'s
+  is `Completed`'s counterpart for a run that reached its output although
+  a step attempt crashed (or its process exited) or was killed by its own
+  `timeout`, and the step's `compensate` decider chose
+  `Retry`/`RetryAfter`/`Continue`. That attempt's own effect is still
+  unknown and was never journaled or undone — only the _replacement_
+  attempt is known. `unknown_effects` is never empty on this variant, and a
+  plain `Completed` means every action returned. `saga/observation`'s
   `run_stopped` event reports this case as `OutcomeCompleted` (the same
   `OutcomeKind` as a plain `Completed`), with its `interrupted` measurement
   populated from `unknown_effects`'s length instead — check that field, not
   the outcome kind, to tell the two apart from telemetry alone.
+- **A `StepFailed` cause may follow a crash.** A `compensate` decider is
+  asked about crashed and timed-out attempts too, and its `Abort(error)` is
+  reported as `StepFailed(step, error)`, the same cause as an aborted typed
+  error, whether as the run's primary cause or as a sibling failure. The
+  crashed attempt is in `unknown_effects`. A decider that aborts after a
+  crash should return an error that says so if the caller must tell the
+  two apart from the cause alone.
 - **A refused retry is distinguished from an exhausted one.** A
   `Retry`/`RetryAfter` compensation decision that arrives after the run has
   already begun settling for a different, unrelated trigger cannot be

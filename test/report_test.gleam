@@ -63,6 +63,7 @@ fn settlement(
   undone undone: List(String),
   undo_failures undo_failures: List(execution.UndoFailure(String)),
   interrupted interrupted: List(String),
+  unknown_effects unknown_effects: List(execution.UnknownEffect),
 ) -> execution.Settlement(String, String) {
   execution.Settlement(
     undone: list_map(undone, at),
@@ -72,6 +73,7 @@ fn settlement(
     interrupted: list_map(interrupted, at),
     compensation_failures: [],
     sibling_failures: [],
+    unknown_effects: unknown_effects,
   )
 }
 
@@ -167,6 +169,7 @@ pub fn owner_death_reports_a_completed_compensation_test() {
         undone: ["charge", "reserve"],
         undo_failures: [],
         interrupted: [],
+        unknown_effects: [],
       ),
     )),
   )
@@ -193,6 +196,7 @@ pub fn owner_death_reports_a_failed_compensation_test() {
         undone: ["charge"],
         undo_failures: [execution.UndoFailed(at("reserve"), "refused")],
         interrupted: [],
+        unknown_effects: [],
       ),
     )),
   )
@@ -201,8 +205,8 @@ pub fn owner_death_reports_a_failed_compensation_test() {
 
 /// A step still running when the settle window closes is killed and
 /// reported `interrupted` (its effect unknown, never undone); an undo that
-/// outlives `cleanup_timeout` is reported `UndoTimedOut`. Both still reach
-/// the report.
+/// outlives `cleanup_timeout` is reported `UndoTimedOut`. Both are unknown
+/// effects, and both still reach the report.
 pub fn owner_death_reports_an_interrupted_compensation_test() {
   let gate = probe.new_gate()
   let log = process.new_subject()
@@ -226,6 +230,18 @@ pub fn owner_death_reports_an_interrupted_compensation_test() {
         undone: [],
         undo_failures: [execution.UndoTimedOut(at("reserve"))],
         interrupted: ["charge"],
+        unknown_effects: [
+          execution.UnknownEffect(
+            at("charge"),
+            execution.StepAttempt(1),
+            execution.ActionInterrupted,
+          ),
+          execution.UnknownEffect(
+            at("reserve"),
+            execution.StepUndo,
+            execution.ActionTimedOut,
+          ),
+        ],
       ),
     )),
   )

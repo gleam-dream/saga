@@ -96,7 +96,33 @@ pub type Settlement(e, u) {
     interrupted: List(StepAddress),
     compensation_failures: List(CompensationFailure(u)),
     sibling_failures: List(Cause(e)),
+    unknown_effects: List(UnknownEffect),
   )
+}
+
+/// One action of the run that ended without a result, so its effect is
+/// unknown: it may or may not have happened, and it was never journaled or
+/// undone. Every such action is recorded when it ends, whatever is decided
+/// afterwards.
+pub type UnknownEffect {
+  UnknownEffect(step: StepAddress, action: Action, ending: UnknownEnding)
+}
+
+/// Which of a step's actions ended: its attempt with this number, the
+/// compensation decision about the attempt with this number, or its undo.
+pub type Action {
+  StepAttempt(attempt: Int)
+  StepCompensation(attempt: Int)
+  StepUndo
+}
+
+/// How an action ended without a result: it raised or its process exited,
+/// it was killed at its time bound (the step's timeout, or
+/// `cleanup_timeout`), or it was killed when the settle window closed.
+pub type UnknownEnding {
+  ActionCrashed(crash: node.Crash)
+  ActionTimedOut
+  ActionInterrupted
 }
 
 fn empty_settlement() -> Settlement(e, u) {
@@ -108,29 +134,22 @@ fn empty_settlement() -> Settlement(e, u) {
     interrupted: [],
     compensation_failures: [],
     sibling_failures: [],
+    unknown_effects: [],
   )
 }
 
-/// `CompletedWithUnknownEffects` is `Completed`'s counterpart for the one
-/// case a plain successful output cannot honestly report: a step whose
-/// attempt was killed by its own `timeout` (see
-/// `handle_step_timeout_fired`), but whose recovery decider nonetheless
-/// chose `Retry`/`RetryAfter`/`Continue`, letting the run reach a normal
-/// output anyway. That step's *killed* attempt's own side effect is still
-/// unknown and was never journaled or undone — only the *replacement*
-/// attempt (the retry, or `Continue`'s supplied output) is known-good.
-/// Kept as a distinct variant (rather than an extra always-present field on
-/// `Completed`) specifically so it is impossible to pattern-match
-/// `Completed` and silently ignore this: any caller matching only
-/// `Completed` on this closed type fails to compile once a workflow's
-/// steps declare a `timeout`, and must decide how to treat the residual
-/// uncertainty (`unknown_effects` is never empty on this variant — an
-/// empty result is always plain `Completed` instead). The same fact is
-/// folded into `Settlement.interrupted` for every other outcome kind,
-/// since those already carry a settlement to report it in.
+/// `CompletedWithUnknownEffects` is `Completed`'s counterpart for a run
+/// that reached its output although a step attempt crashed or was killed by
+/// its own `timeout` and its recovery decider then chose
+/// `Retry`/`RetryAfter`/`Continue`. That attempt's effect is still unknown
+/// and was never journaled or undone — only the *replacement* attempt (the
+/// retry, or `Continue`'s supplied output) is known. `unknown_effects` is
+/// never empty on this variant — an empty list is always plain `Completed`
+/// instead. Every other outcome kind carries the same record in
+/// `Settlement.unknown_effects`.
 pub type Outcome(o, e, u) {
   Completed(output: o)
-  CompletedWithUnknownEffects(output: o, unknown_effects: List(StepAddress))
+  CompletedWithUnknownEffects(output: o, unknown_effects: List(UnknownEffect))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
   Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
@@ -293,12 +312,12 @@ type RunState(o, e, u) {
     journal: List(JournalEntry(u)),
     phase: RunPhase(e, u),
     start_time: Int,
-    // Every step whose attempt was killed by its own `timeout`, recorded
-    // the moment the kill happens — independent of `phase`/`Settlement`,
-    // since the run may still be `PhaseRunning` (a Retry/Continue decision
-    // can let it proceed to `Completed`) when this needs to be remembered.
-    // See `Outcome.Completed`'s doc comment.
-    timed_out_attempts: List(StepAddress),
+    // Every action that ended with an unknown effect (see `UnknownEffect`),
+    // newest first, recorded the moment it ends — independent of
+    // `phase`/`Settlement`, since the run may still be `PhaseRunning` (a
+    // Retry/Continue decision can let it proceed to a normal output) when
+    // this needs to be remembered. See `Outcome`'s doc comment.
+    unknown_effects: List(UnknownEffect),
   )
 }
 
@@ -454,7 +473,7 @@ fn run(
       journal: [],
       phase: PhaseRunning,
       start_time: start_time,
-      timed_out_attempts: [],
+      unknown_effects: [],
     )
   let admitted = admit(initial)
   loop(admitted, fetch_output, deliver)
@@ -478,10 +497,9 @@ fn loop(
           case fetch_output(state.store) {
             ffi.Rescued(output) -> {
               cancel_deadline_timer(state)
-              // `timed_out_attempts` is accumulated oldest-last (each new
-              // one is prepended); reverse so callers see them in the
-              // order they occurred.
-              let unknown_effects = list.reverse(state.timed_out_attempts)
+              // `unknown_effects` is accumulated newest-first; reverse so
+              // callers see them in the order they occurred.
+              let unknown_effects = list.reverse(state.unknown_effects)
               let outcome = case unknown_effects {
                 [] -> Completed(output)
                 _ -> CompletedWithUnknownEffects(output, unknown_effects)
@@ -535,13 +553,12 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
       case rollback_complete(state) {
         False -> None
         True -> {
-          // Every step-timeout kill recorded during this run (regardless
-          // of when it happened, or what its recovery decision was) is
-          // folded into `interrupted` here — the run did not, in the end,
-          // complete cleanly, so this settlement is exactly where callers
-          // already look for "effects never journaled or undone". See
-          // `Outcome.Completed`'s doc comment for the parallel case where
-          // the run *did* complete.
+          // Every action that ended with an unknown effect during this run
+          // (regardless of when it happened, or what its recovery decision
+          // was) becomes `unknown_effects` here. Every step-timeout kill
+          // among them is also folded into `interrupted`, which reported
+          // them before `unknown_effects` existed. See `Outcome`'s doc
+          // comment for the parallel case where the run *did* complete.
           //
           // `undone`/`undo_failures`/`not_undoable`/`held` were all built
           // newest-first (prepended, not appended — see
@@ -551,6 +568,14 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
           // instead of O(N^2); this is the one place they are reversed back
           // into their documented (completion/processing) order, since this
           // `Settlement` is now final and externally observed.
+          let unknown_effects = list.reverse(state.unknown_effects)
+          let timed_out_attempts =
+            list.filter_map(unknown_effects, fn(effect) {
+              case effect {
+                UnknownEffect(step, StepAttempt(_), ActionTimedOut) -> Ok(step)
+                _ -> Error(Nil)
+              }
+            })
           let settlement =
             Settlement(
               ..settlement,
@@ -559,9 +584,10 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
               not_undoable: list.reverse(settlement.not_undoable),
               held: list.reverse(settlement.held),
               interrupted: list.append(
-                list.reverse(state.timed_out_attempts),
+                timed_out_attempts,
                 settlement.interrupted,
               ),
+              unknown_effects: unknown_effects,
             )
           Some(case trigger {
             TriggerFailure(cause) -> Failed(cause, settlement)
@@ -1190,8 +1216,15 @@ fn handle_task_crashed(
     False -> state
     True ->
       case dict.get(state.state, node_id) {
-        Ok(NodeAttempting(..)) -> {
+        Ok(NodeAttempting(_seq, attempt_number, ..)) -> {
           let assert Ok(n) = dict.get(state.nodes, node_id)
+          let state =
+            record_unknown_effect(
+              state,
+              node_id,
+              StepAttempt(attempt_number),
+              ActionCrashed(crash),
+            )
           case n.prepare_crash_recovery {
             None ->
               fail_terminal(
@@ -1204,10 +1237,15 @@ fn handle_task_crashed(
               start_crash_recovery(state, node_id, prepare, Crashed(crash))
           }
         }
-        Ok(NodeCompensating(..)) -> {
+        Ok(NodeCompensating(_seq, attempt_number, ..)) -> {
           let compensation_failure =
             CompensationCrashed(node_address(state, node_id), crash)
           state
+          |> record_unknown_effect(
+            node_id,
+            StepCompensation(attempt_number),
+            ActionCrashed(crash),
+          )
           |> fail_terminal(node_id, Crashed(crash), observation.AttemptCrashed)
           |> record_compensation_failure(compensation_failure)
         }
@@ -1246,12 +1284,12 @@ fn start_crash_recovery(
 /// failure is terminal. This never touches `settlement.interrupted` — that
 /// is reserved for tasks still running when the *settle* window closes, not
 /// for a step's own configured timeout — but the killed attempt is always
-/// recorded into `state.timed_out_attempts` regardless of what the
-/// recovery decider (if any) subsequently decides: even a `Retry` or
-/// `Continue` that lets the run proceed leaves this one attempt's effect
-/// permanently unknown, and that fact must survive to the final `Outcome`
-/// (see `Outcome.Completed`'s doc comment; a terminal failure instead
-/// carries it via `settlement.interrupted`, folded in by `run_finished`).
+/// recorded as an unknown effect regardless of what the recovery decider
+/// (if any) subsequently decides: even a `Retry` or `Continue` that lets
+/// the run proceed leaves this one attempt's effect permanently unknown,
+/// and that fact must survive to the final `Outcome` (see `Outcome`'s doc
+/// comment; a terminal outcome also folds it into `settlement.interrupted`,
+/// in `run_finished`).
 fn handle_step_timeout_fired(
   state: RunState(o, e, u),
   node_id: Int,
@@ -1285,7 +1323,11 @@ fn handle_step_timeout_fired(
                   started_at,
                 ),
               ),
-              timed_out_attempts: [n.address, ..state.timed_out_attempts],
+            )
+            |> record_unknown_effect(
+              node_id,
+              StepAttempt(attempt_number),
+              ActionTimedOut,
             )
           case n.prepare_crash_recovery {
             None ->
@@ -1340,11 +1382,16 @@ fn handle_cleanup_timeout_fired(
     False -> state
     True ->
       case dict.get(state.state, node_id) {
-        Ok(NodeCompensating(_seq, _attempt, pid, _timer, _started_at)) -> {
+        Ok(NodeCompensating(_seq, attempt_number, pid, _timer, _started_at)) -> {
           process.kill(pid)
           let compensation_failure =
             CompensationTimedOut(node_address(state, node_id))
           state
+          |> record_unknown_effect(
+            node_id,
+            StepCompensation(attempt_number),
+            ActionTimedOut,
+          )
           |> fail_terminal(node_id, TimedOut, observation.AttemptTimedOut)
           |> record_compensation_failure(compensation_failure)
         }
@@ -1356,6 +1403,19 @@ fn handle_cleanup_timeout_fired(
 fn node_address(state: RunState(o, e, u), node_id: Int) -> StepAddress {
   let assert Ok(n) = dict.get(state.nodes, node_id)
   n.address
+}
+
+/// Records that `node_id`'s `action` ended with an unknown effect. Called
+/// at the moment the action ends, before any decision about it, so the
+/// record survives whatever the run does next.
+fn record_unknown_effect(
+  state: RunState(o, e, u),
+  node_id: Int,
+  action: Action,
+  ending: UnknownEnding,
+) -> RunState(o, e, u) {
+  let effect = UnknownEffect(node_address(state, node_id), action, ending)
+  RunState(..state, unknown_effects: [effect, ..state.unknown_effects])
 }
 
 fn record_compensation_failure(
@@ -1613,15 +1673,19 @@ fn handle_settle_fired(
         |> list.filter_map(fn(entry) {
           let #(node_id, node_state) = entry
           case node_state {
-            NodeAttempting(_, _, pid, _, _) -> Ok(#(node_id, pid))
-            NodeCompensating(_, _, pid, _, _) -> Ok(#(node_id, pid))
+            NodeAttempting(_, attempt, pid, _, _) ->
+              Ok(#(node_id, pid, StepAttempt(attempt)))
+            NodeCompensating(_, attempt, pid, _, _) ->
+              Ok(#(node_id, pid, StepCompensation(attempt)))
             _ -> Error(Nil)
           }
         })
       let state =
         list.fold(in_flight, state, fn(acc, entry) {
-          let #(node_id, pid) = entry
+          let #(node_id, pid, action) = entry
           process.kill(pid)
+          let acc =
+            record_unknown_effect(acc, node_id, action, ActionInterrupted)
           let address = node_address(acc, node_id)
           let attempt_number = attempt_number_for(acc, node_id)
           let duration = duration_since_started(acc, node_id)
@@ -1766,7 +1830,9 @@ fn handle_undo_done(
         UndoOk -> record_undone(state, address)
         UndoErr(error) -> record_undo_failure(state, UndoFailed(address, error))
         UndoCrash(crash) ->
-          record_undo_failure(state, UndoCrashed(address, crash))
+          state
+          |> record_unknown_effect(node_id, StepUndo, ActionCrashed(crash))
+          |> record_undo_failure(UndoCrashed(address, crash))
       }
       undo_next(state)
     }
@@ -1804,7 +1870,10 @@ fn handle_undo_timeout(
           state: dict.insert(state.state, node_id, NodeUndoFailedTerminal),
           undoing: False,
         )
-      let state = record_undo_failure(state, UndoTimedOut(address))
+      let state =
+        state
+        |> record_unknown_effect(node_id, StepUndo, ActionTimedOut)
+        |> record_undo_failure(UndoTimedOut(address))
       undo_next(state)
     }
     _ -> state
