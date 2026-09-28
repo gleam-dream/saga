@@ -159,8 +159,13 @@ pub fn step_timeout_recovery_can_retry_test() {
   let assert Ok(execution.CompletedWithUnknownEffects(0, unknown_effects)) =
     execution.run(workflow, 0, execution.config())
   unknown_effects
-  |> list.map(fn(address) { address.name })
-  |> should.equal(["flaky"])
+  |> should.equal([
+    execution.UnknownEffect(
+      saga.StepAddress(scope: [], name: "flaky", occurrence: 1),
+      execution.StepAttempt(1),
+      execution.ActionTimedOut,
+    ),
+  ])
   probe.total_entries(counter) |> should.equal(2)
 }
 

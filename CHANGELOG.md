@@ -8,6 +8,42 @@ increments toward the first local-execution release.
 
 ### Added
 
+- **Breaking: the outcome names every action whose effect is unknown.**
+  A consumer that must tell a caller whether a run's effects are known
+  (Fabric reports a workflow to an AI model as definite or uncertain)
+  could not decide it from the `Outcome`: a crashed attempt whose
+  `compensate` decider then chose `Abort(e)` was reported as an ordinary
+  `StepFailed`, a sibling in the settle window likewise, and a crashed
+  attempt retried to success left no trace at all. Only timed-out attempts
+  were folded into `interrupted` or `CompletedWithUnknownEffects`.
+  `execution.unknown_effects(outcome) -> List(UnknownEffect)` now lists,
+  for every outcome kind, each step attempt, compensation decision and undo
+  that ended with an unknown effect, in the order they ended, and is `[]`
+  exactly when every action returned `Ok` or a typed error. An
+  `UnknownEffect(step, action, ending)` names the step, the action
+  (`StepAttempt(n)`, `StepCompensation(n)` for the decision about attempt
+  `n`, or `StepUndo`), and how it ended (`ActionCrashed(crash)` for a raise
+  or process exit, `ActionTimedOut` for a kill at the step's timeout or
+  `cleanup_timeout`, `ActionInterrupted` for a kill when the settle window
+  closed). The record is taken when the action ends, so no later decision
+  (retry, `Continue`, `Abort`, `Hold`) hides it. `Cause.StepFailed`'s and
+  `saga.compensate`'s docs now say that an `Abort` after a crash is
+  reported as `StepFailed`. Two public shapes change:
+  - `Settlement` gains `unknown_effects: List(UnknownEffect)`. A
+    `Settlement(..)` literal must add `unknown_effects: []` (or the
+    expected list); record updates (`Settlement(..s, …)`) and field
+    access are unaffected. `interrupted` keeps its meaning (attempts killed
+    at their timeout, attempts and decisions killed by the settle window).
+  - `CompletedWithUnknownEffects.unknown_effects` changes from
+    `List(StepAddress)` to `List(UnknownEffect)`, and the variant is now
+    also returned when an attempt crashed or its process exited and its
+    decider retried or continued (previously a plain `Completed`). A caller
+    that used the addresses maps them:
+    `list.map(unknown_effects, fn(effect) { effect.step })`. A plain
+    `Completed` now proves every action of the run returned.
+    `saga/observation`'s `run_stopped` `interrupted` measurement for such a
+    run counts these crashed attempts too, since it is the list's length.
+
 - **`execution.start_reporting(workflow, input, config, to: report)`
   delivers a run's outcome to a caller-supplied `Subject`.** A consumer
   that ran a workflow in a task it could lose (Fabric runs one as a tool,

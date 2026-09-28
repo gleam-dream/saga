@@ -26,6 +26,14 @@
 /// window closing — is reported `interrupted`: its effect is unknown and is
 /// never journaled or undone. Only steps that are known to have completed
 /// are undone.
+///
+/// **Known results and unknown effects.** Every action a run performs — a
+/// step attempt, a compensation decision, an undo — ends either with a
+/// known result (it returned `Ok` or a typed error) or with an unknown
+/// effect (it crashed or its process exited, it was killed at its time
+/// bound, or it was killed when the settle window closed).
+/// `unknown_effects(outcome)` names every action of the second kind, for
+/// every outcome kind; it is `[]` exactly when every action returned.
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -133,7 +141,24 @@ pub type StepAddress =
 /// execution failure (`StepCrashed`/`StepTimedOut`), retry exhaustion, and
 /// an output-transform crash as distinct variants, so no report can
 /// conflate them.
+///
+/// A cause names the *last* failure of a step, not every attempt before
+/// it. Whether any attempt, compensation decision or undo left an effect of
+/// unknown status is reported by `unknown_effects`, never by the cause's
+/// variant.
 pub type Cause(e) {
+  /// The step's attempt returned `error` and the step has no `compensate`
+  /// decider, or its decider chose `Abort(error)` or
+  /// `AbortAfterCleanupFailure(error, _)`.
+  ///
+  /// **A `StepFailed` may follow a crash.** A decider is asked about a
+  /// crashed or timed-out attempt too (`saga.Crashed`/`saga.TimedOut`), and
+  /// an `Abort` it returns is reported as `StepFailed` with the decider's
+  /// error, exactly like an aborted typed error. The crashed or timed-out
+  /// attempt is then named in `Settlement.unknown_effects`: a decider
+  /// author who aborts after a crash should choose an error that says so,
+  /// and a consumer should consult `unknown_effects` rather than infer a
+  /// known result from `StepFailed`.
   StepFailed(step: StepAddress, error: e)
   StepCrashed(step: StepAddress, crash: Crash)
   StepTimedOut(step: StepAddress)
@@ -172,8 +197,17 @@ pub type CancelReason {
 /// which were undone (in reverse completion order), which undo actions
 /// failed (all retained, not just the first), which had no undo configured,
 /// which were held by an unresolved `Hold`, which attempts or compensations
-/// were killed in flight with an unknown, never-undone effect, and which
-/// sibling failures settled after the primary cause.
+/// were killed by their step's own `timeout` or in flight when the settle
+/// window closed (`interrupted`), and which sibling failures settled after
+/// the primary cause.
+///
+/// `unknown_effects` is the complete record: every action of the whole run
+/// — attempt, compensation decision or undo, whether before or after the
+/// run stopped admitting work — that ended with an unknown effect, in the
+/// order they ended. It includes each `interrupted` entry, a crashed
+/// attempt whatever its decider then chose, a crashed or timed-out
+/// compensation, and a crashed or timed-out undo. It is `[]` exactly when
+/// every action of the run returned a result.
 pub type Settlement(e, u) {
   Settlement(
     undone: List(StepAddress),
@@ -183,7 +217,40 @@ pub type Settlement(e, u) {
     interrupted: List(StepAddress),
     compensation_failures: List(CompensationFailure(u)),
     sibling_failures: List(Cause(e)),
+    unknown_effects: List(UnknownEffect),
   )
+}
+
+/// One action of a run that ended without a result, so its effect is
+/// unknown: it may or may not have happened, and saga never journaled or
+/// undid it. Recorded when the action ends, whatever is decided afterwards:
+/// a crashed attempt retried to success, continued, aborted or held is
+/// still named.
+pub type UnknownEffect {
+  UnknownEffect(step: StepAddress, action: Action, ending: UnknownEnding)
+}
+
+/// Which of a step's actions ended with an unknown effect.
+pub type Action {
+  /// The step's attempt with this number (the first is `1`).
+  StepAttempt(attempt: Int)
+  /// The `saga.compensate` decider, deciding about the attempt with this
+  /// number.
+  StepCompensation(attempt: Int)
+  /// The step's `saga.undo`, during rollback.
+  StepUndo
+}
+
+/// How an action ended without a result.
+pub type UnknownEnding {
+  /// It raised, or its process exited (for example, killed from outside).
+  ActionCrashed(crash: Crash)
+  /// It was killed at its time bound: the step's `timeout` (or
+  /// `Config.step_timeout`) for an attempt, `Config.cleanup_timeout` for a
+  /// compensation decision or an undo.
+  ActionTimedOut
+  /// It was still running when the settle window closed, and was killed.
+  ActionInterrupted
 }
 
 /// A run's terminal result: success, a failure with its settlement, a
@@ -192,20 +259,19 @@ pub type Settlement(e, u) {
 /// completed steps are undone, and interrupted or not-undoable effects are
 /// listed rather than claimed reversed.
 ///
-/// `CompletedWithUnknownEffects` is `Completed`'s counterpart for the one
-/// case a plain successful output cannot honestly report: a step whose
-/// attempt was killed by its own `timeout`, but whose recovery decider
-/// chose `Retry`/`RetryAfter`/`Continue` anyway, letting the run reach a
-/// normal output. That step's *killed* attempt's own effect is still
-/// unknown and was never journaled or undone — only the *replacement*
-/// attempt (the retry, or `Continue`'s supplied output) is known-good. Kept
-/// as its own variant (never an always-present field on `Completed`) so a
-/// `case` matching only `Completed` on this closed type must be revisited
-/// once any step declares a `timeout`, rather than silently dropping the
-/// uncertainty. `unknown_effects` is never empty on this variant.
+/// `CompletedWithUnknownEffects` is `Completed`'s counterpart for a run
+/// that reached its output although a step attempt crashed (or its process
+/// exited) or was killed at its timeout, and the step's recovery decider
+/// then chose `Retry`/`RetryAfter`/`Continue`. That attempt's own effect is
+/// still unknown and was never journaled or undone — only the
+/// *replacement* attempt (the retry, or `Continue`'s supplied output) is
+/// known. Kept as its own variant (never an always-present field on
+/// `Completed`) so a `case` matching only `Completed` cannot silently drop
+/// the uncertainty. `unknown_effects` is never empty on this variant, and a
+/// plain `Completed` means every action of the run returned a result.
 pub type Outcome(o, e, u) {
   Completed(output: o)
-  CompletedWithUnknownEffects(output: o, unknown_effects: List(StepAddress))
+  CompletedWithUnknownEffects(output: o, unknown_effects: List(UnknownEffect))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
   Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
@@ -752,6 +818,24 @@ pub fn progress(
   outcome
 }
 
+/// Every action of the run that ended with an unknown effect, in the order
+/// they ended: `[]` for `Completed`, the variant's own list for
+/// `CompletedWithUnknownEffects`, and `settlement.unknown_effects` for
+/// `Failed`, `Cancelled` and `Unresolved`. `[]` means every step attempt,
+/// compensation decision and undo that ran returned a result, so no effect
+/// of the run is of unknown status; effects a result left in place (an
+/// undo that returned an error, a step with no undo, a held step) are
+/// reported by the settlement, not here.
+pub fn unknown_effects(outcome: Outcome(o, e, u)) -> List(UnknownEffect) {
+  case outcome {
+    Completed(_) -> []
+    CompletedWithUnknownEffects(_, unknown_effects) -> unknown_effects
+    Failed(_, settlement)
+    | Cancelled(_, settlement)
+    | Unresolved(_, _, settlement) -> settlement.unknown_effects
+  }
+}
+
 /// The coordinator's pid, for monitoring.
 pub fn pid(execution: Execution(o, e, u)) -> Pid {
   execution.pid
@@ -774,7 +858,7 @@ fn to_public_outcome(
     coordinator.CompletedWithUnknownEffects(output, unknown_effects) ->
       CompletedWithUnknownEffects(
         output,
-        list.map(unknown_effects, saga.address_from_node),
+        list.map(unknown_effects, to_public_unknown_effect),
       )
     coordinator.Failed(cause, settlement) ->
       Failed(to_public_cause(cause), to_public_settlement(settlement))
@@ -836,6 +920,29 @@ fn to_public_settlement(
       to_public_compensation_failure,
     ),
     sibling_failures: list.map(settlement.sibling_failures, to_public_cause),
+    unknown_effects: list.map(
+      settlement.unknown_effects,
+      to_public_unknown_effect,
+    ),
+  )
+}
+
+fn to_public_unknown_effect(
+  effect: coordinator.UnknownEffect,
+) -> UnknownEffect {
+  UnknownEffect(
+    step: saga.address_from_node(effect.step),
+    action: case effect.action {
+      coordinator.StepAttempt(attempt) -> StepAttempt(attempt)
+      coordinator.StepCompensation(attempt) -> StepCompensation(attempt)
+      coordinator.StepUndo -> StepUndo
+    },
+    ending: case effect.ending {
+      coordinator.ActionCrashed(crash) ->
+        ActionCrashed(saga.crash_from_node(crash))
+      coordinator.ActionTimedOut -> ActionTimedOut
+      coordinator.ActionInterrupted -> ActionInterrupted
+    },
   )
 }
 
