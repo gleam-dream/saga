@@ -8,6 +8,25 @@ increments toward the first local-execution release.
 
 ### Added
 
+- **`execution.start_reporting(workflow, input, config, to: report)`
+  delivers a run's outcome to a caller-supplied `Subject`.** A consumer
+  that ran a workflow in a task it could lose (Fabric runs one as a tool,
+  and cancelling Fabric kills the task) could not learn how compensation
+  ended: `await` is owner-only, and the outcome went to the dead owner.
+  `report` now receives one `Outcome` when the run ends, after rollback,
+  whether or not the starting process is alive; a subject of the caller's
+  own can join its `Selector`, removing the helper owner process that an
+  owner-only `await` required. The starting process still owns the run: its
+  exit cancels the run with `OwnerExited`, and that cancellation's
+  settlement is what `report` receives. The report is sent at most once,
+  and exactly once unless the coordinator is killed or a named subject has
+  no process behind it; a receiver detects a lost run with a monitor on
+  `execution.pid`, whose `Down` always follows the outcome. `await` on such
+  a run returns `NotOwner`. `start` and `await` are unchanged. The settle
+  window stays per run (`Config.settle_timeout`): the owner-exit
+  cancellation has no call to carry a per-cancel value, and settling already
+  ends as soon as nothing is in flight.
+
 - **`execution.Config` gains `step_timeout: Option(Int)`, defaulting to
   `Some(60_000)` (60 seconds) in `execution.config()`.** Previously a step
   with no `saga.timeout` of its own could hang forever and block

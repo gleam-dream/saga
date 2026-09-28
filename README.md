@@ -82,6 +82,31 @@ library's defaults for the rest, so a new `Config` field added later does
 not silently reset every existing caller's untouched settings back to a
 stale literal.
 
+To learn the outcome somewhere other than the starting process, start with
+`execution.start_reporting`. The run sends its outcome, once, to the
+`Subject` you pass: a subject of another process, which learns the outcome
+even after the starting process exits, or a subject of your own, which you
+can add to a `Selector` next to your other messages:
+
+```gleam
+import gleam/erlang/process
+
+let report = process.new_subject()
+let assert Ok(exec) =
+  execution.start_reporting(workflow, order_id, config, to: report)
+let selector =
+  process.new_selector()
+  |> process.select_map(report, RunEnded)
+  |> process.select_map(other_messages, Other)
+```
+
+The starting process still owns the run: its exit cancels the run, which
+settles and rolls back, and the `Cancelled(OwnerExited, settlement)` outcome
+still reaches `report`. `execution.await` on a reporting run returns
+`Error(NotOwner)`. A coordinator killed from outside sends nothing; monitor
+`execution.pid(exec)` to detect that, since its `Down` always arrives after
+its outcome.
+
 A step's own `saga.timeout(..)` always overrides `step_timeout`, in either
 direction (shorter or longer than the default). Opt out of the default
 entirely — for a step that may legitimately run unbounded, with only its own
@@ -328,6 +353,21 @@ cleanup_timeout`: once a run stops admitting new work, in-flight
   actually consumes a signal. Always `await` again (even with a short
   timeout) after `cancel`, so the run's eventual `Cancelled` outcome is
   consumed and nothing is left behind in your mailbox.
+- **A reported outcome survives the owner; a killed coordinator does not.**
+  `start_reporting`'s subject receives at most one message per run, sent
+  when the run ends, after any rollback. It receives exactly one unless the
+  coordinator itself is killed, or, for a `process.named_subject`, no
+  process holds the name at that moment (the outcome is then dropped). The
+  owner's exit is a cancellation, not a loss: the run settles, rolls back,
+  and reports `Cancelled(OwnerExited, settlement)`, whose settlement names
+  every failed, timed-out, or interrupted compensation.
+- **The settle window is set per run, not per cancel.** `settle_timeout`
+  is fixed when the run starts; an owner's exit cancels with no call to
+  carry another value. Settling ends as soon as nothing is in flight, so
+  the window only delays rollback while a step is still running.
+  `settle_timeout: 0` rolls back at once and reports in-flight steps
+  `interrupted`; a longer window lets them finish, so they are known and
+  undone.
 - **A repeated `await` cannot always tell `AlreadyAwaited` apart from a
   previously-reported `Lost`.** `execution.await`/`AwaitError` are
   deliberately stateless on the caller's side (no process-dictionary
