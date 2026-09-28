@@ -320,11 +320,14 @@ type Trigger(e) {
 }
 
 /// Spawns a coordinator for one run and returns once it is alive, with its
-/// pid, the subject the outcome will be sent to, and the run's id.
-/// `build_graph` calls `saga.for_run` for this one run: the workflow's
-/// already-built node graph (built once, at `define`) plus a fresh
-/// run-scoped `Store` and the output-fetch thunk. `owner` is monitored: its
-/// exit is treated as a cancellation with `OwnerExited`.
+/// pid and the run's id. `build_graph` calls `saga.for_run` for this one
+/// run: the workflow's already-built node graph (built once, at `define`)
+/// plus a fresh run-scoped `Store` and the output-fetch thunk. `owner` is
+/// monitored: its exit is treated as a cancellation with `OwnerExited`.
+/// `deliver` is called once, from the coordinator process, with the run's
+/// terminal outcome, just before the coordinator exits. It is the only path
+/// by which an outcome leaves this process, and it runs whether or not
+/// `owner` is still alive.
 pub fn start(
   workflow_name workflow_name: String,
   owner owner: Pid,
@@ -341,7 +344,7 @@ pub fn start(
       Store,
       fn(Store) -> ffi.RescueResult(o),
     ),
-  result_subject result_subject: Subject(Outcome(o, e, u)),
+  deliver deliver: fn(Outcome(o, e, u)) -> Nil,
   control_subject_out control_subject_out: Subject(Subject(Control(o, e, u))),
 ) -> #(Pid, Int) {
   let run_id = ffi.unique_integer()
@@ -358,7 +361,7 @@ pub fn start(
         settle_timeout,
         cleanup_timeout,
         build_graph,
-        result_subject,
+        deliver,
         control_subject_out,
         ready,
       )
@@ -392,7 +395,7 @@ fn run(
       Store,
       fn(Store) -> ffi.RescueResult(o),
     ),
-  result_subject: Subject(Outcome(o, e, u)),
+  deliver: fn(Outcome(o, e, u)) -> Nil,
   control_subject_out: Subject(Subject(Control(o, e, u))),
   ready: Subject(Nil),
 ) -> Nil {
@@ -454,19 +457,19 @@ fn run(
       timed_out_attempts: [],
     )
   let admitted = admit(initial)
-  loop(admitted, fetch_output, result_subject)
+  loop(admitted, fetch_output, deliver)
 }
 
 fn loop(
   state: RunState(o, e, u),
   fetch_output: fn(Store) -> ffi.RescueResult(o),
-  result_subject: Subject(Outcome(o, e, u)),
+  deliver: fn(Outcome(o, e, u)) -> Nil,
 ) -> Nil {
   case run_finished(state) {
     Some(outcome) -> {
       cancel_deadline_timer(state)
       emit_run_stopped(state, outcome)
-      process.send(result_subject, outcome)
+      deliver(outcome)
       Nil
     }
     None ->
@@ -484,14 +487,14 @@ fn loop(
                 _ -> CompletedWithUnknownEffects(output, unknown_effects)
               }
               emit_run_stopped(state, outcome)
-              process.send(result_subject, outcome)
+              deliver(outcome)
             }
             ffi.Raised(class, reason) ->
               begin_settling(
                 state,
                 TriggerFailure(OutputCrashed(node.Crash(class, reason))),
               )
-              |> loop(fetch_output, result_subject)
+              |> loop(fetch_output, deliver)
           }
         False -> {
           let selector =
@@ -508,7 +511,7 @@ fn loop(
             })
           let message = process.selector_receive_forever(selector)
           let next = handle_control(state, message)
-          loop(next, fetch_output, result_subject)
+          loop(next, fetch_output, deliver)
         }
       }
   }

@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleeunit
@@ -159,7 +160,7 @@ pub fn undo_failure_is_preserved_in_settlement_test() {
 }
 
 // ---------------------------------------------------------------------------
-// (c) advanced config + cancellation via start/cancel/await
+// (c) advanced config + cancellation via start/cancel/await/start_reporting
 // ---------------------------------------------------------------------------
 
 pub fn advanced_config_runs_with_bounded_concurrency_and_deadline_test() {
@@ -226,6 +227,36 @@ pub fn cancel_is_idempotent_test() {
       execution.await(execution, 2000)
     Nil
   })
+}
+
+/// A run started with `start_reporting` from a process that is then killed
+/// is cancelled by that owner's exit, and the process holding the report
+/// subject still learns how it ended.
+pub fn a_reported_run_outlives_its_owner_test() {
+  let release_gate = gate.new_gate()
+  let assert Ok(workflow) =
+    workflows.blocking_workflow(fn() { gate.enter(release_gate) })
+  let report = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert Ok(_execution) =
+        execution.start_reporting(
+          workflow,
+          "ord-1",
+          workflows.bounded_config(None),
+          to: report,
+        )
+      process.sleep_forever()
+    })
+  let assert Ok(_task_pid) = gate.wait_entered(release_gate, 2000)
+
+  process.kill(owner)
+
+  let assert Ok(execution.Cancelled(execution.OwnerExited, settlement)) =
+    process.receive(report, 2000)
+  settlement.interrupted
+  |> list.map(fn(address) { address.name })
+  |> should.equal(["await_release"])
 }
 
 // ---------------------------------------------------------------------------
