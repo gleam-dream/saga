@@ -12,6 +12,7 @@
 import gleam/dict.{type Dict}
 import gleam/list
 import gleam/option.{type Option}
+import saga/internal/checkpoint
 import saga/internal/ffi.{type CrashClass}
 import saga/internal/store.{type Store}
 
@@ -22,7 +23,15 @@ pub type StepAddress {
 }
 
 pub type Attempt {
-  Attempt(number: Int, remaining: Int)
+  Attempt(
+    number: Int,
+    remaining: Int,
+    key: String,
+    cancelled: Bool,
+    persistent: Bool,
+    saved_input: Option(String),
+    admit: fn(String) -> Result(Nil, String),
+  )
 }
 
 pub type AttemptFailure(e) {
@@ -39,6 +48,7 @@ pub type Crash {
 /// decider closure. `EContinue` carries the same commit-then-undo shape as
 /// `AttemptSucceeded`.
 pub type ErasedRecovery(e, u) {
+  EBlocked(checkpoint.Failure)
   ERetry
   ERetryAfter(milliseconds: Int)
   EContinue(commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))))
@@ -63,6 +73,8 @@ pub type ErasedRecovery(e, u) {
 /// — variants that carry no `e`-typed payload, so no inversion is needed
 /// there either.
 pub type AttemptResult(e, u) {
+  AttemptBlocked(reason: checkpoint.Failure)
+  AttemptAbsent
   AttemptSucceeded(
     commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
   )
@@ -86,6 +98,39 @@ pub fn map_errors(
     id: a_node.id,
     address: a_node.address,
     deps: a_node.deps,
+    conditions: a_node.conditions,
+    persistence: option.map(a_node.persistence, fn(p) {
+      Persistence(
+        version: p.version,
+        valid: p.valid,
+        recovery_undo_declared: p.recovery_undo_declared,
+        freeze: p.freeze,
+        thaw: fn(saved, run_store, key) {
+          case p.thaw(saved, run_store, key) {
+            Ok(commit) -> Ok(map_undo_thunk(commit, map_undo_error))
+            Error(reason) -> Error(reason)
+          }
+        },
+        resume_undo: fn(run_store, key) {
+          let body = p.resume_undo(run_store, key)
+          fn() {
+            case body() {
+              Ok(Ok(Nil)) -> Ok(Ok(Nil))
+              Ok(Error(error)) -> Ok(Error(map_undo_error(error)))
+              Error(reason) -> Error(reason)
+            }
+          }
+        },
+        resume_compensation: fn(attempt, run_store) {
+          let body = p.resume_compensation(attempt, run_store)
+          fn() { map_erased_recovery(body(), map_error, map_undo_error) }
+        },
+        resume: fn(attempt, run_store) {
+          let body = p.resume(attempt, run_store)
+          fn() { map_attempt_result(body(), map_error, map_undo_error) }
+        },
+      )
+    }),
     max_attempts: a_node.max_attempts,
     timeout: a_node.timeout,
     undoable: a_node.undoable,
@@ -152,6 +197,7 @@ fn map_erased_recovery(
   map_undo_error: fn(u1) -> u2,
 ) -> ErasedRecovery(e2, u2) {
   case recovery {
+    EBlocked(reason) -> EBlocked(reason)
     ERetry -> ERetry
     ERetryAfter(ms) -> ERetryAfter(ms)
     EContinue(commit) -> EContinue(map_undo_thunk(commit, map_undo_error))
@@ -168,6 +214,8 @@ fn map_attempt_result(
   map_undo_error: fn(u1) -> u2,
 ) -> AttemptResult(e2, u2) {
   case result {
+    AttemptBlocked(reason) -> AttemptBlocked(reason)
+    AttemptAbsent -> AttemptAbsent
     AttemptSucceeded(commit) ->
       AttemptSucceeded(map_undo_thunk(commit, map_undo_error))
     AttemptFailed(failure, recover) ->
@@ -199,6 +247,8 @@ pub type Node(e, u) {
     id: Int,
     address: StepAddress,
     deps: List(Int),
+    conditions: List(#(Int, Bool)),
+    persistence: Option(Persistence(e, u)),
     max_attempts: Int,
     timeout: Option(Int),
     undoable: Bool,
@@ -233,4 +283,20 @@ pub fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
       })
     })
   dict.map_values(reversed, fn(_dep_id, ids) { list.reverse(ids) })
+}
+
+/// Node-specific codecs remain bound to the node's concrete value types.
+pub type Persistence(e, u) {
+  Persistence(
+    version: String,
+    valid: Bool,
+    recovery_undo_declared: Bool,
+    freeze: fn(Store, String) -> Result(List(String), String),
+    thaw: fn(List(String), Store, String) ->
+      Result(fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))), String),
+    resume_compensation: fn(Attempt, Store) -> fn() -> ErasedRecovery(e, u),
+    resume_undo: fn(Store, String) ->
+      fn() -> Result(Result(Nil, u), checkpoint.Failure),
+    resume: fn(Attempt, Store) -> fn() -> AttemptResult(e, u),
+  )
 }

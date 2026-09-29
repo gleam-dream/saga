@@ -38,7 +38,7 @@
 import gleam/dict.{type Dict}
 
 pub opaque type Store {
-  Store(values: Dict(Int, Native))
+  Store(values: Dict(Int, Native), records: Dict(Int, Native))
 }
 
 /// The type-erased representation held in the map. Never constructed or
@@ -46,14 +46,14 @@ pub opaque type Store {
 type Native
 
 pub fn new() -> Store {
-  Store(dict.new())
+  Store(dict.new(), dict.new())
 }
 
 /// Records `node_id`'s completed value. Must be called at most once per
 /// node id per run (the coordinator only ever commits a node's output
 /// once); a second `put` for the same id overwrites the first.
 pub fn put(store: Store, node_id: Int, value: a) -> Store {
-  Store(dict.insert(store.values, node_id, to_native(value)))
+  Store(..store, values: dict.insert(store.values, node_id, to_native(value)))
 }
 
 /// Reads back `node_id`'s value, coerced to the caller's expected type `a`.
@@ -76,3 +76,15 @@ fn to_native(value: a) -> Native
 
 @external(erlang, "saga_ffi", "identity")
 fn from_native(value: Native) -> a
+
+/// The node that binds its input/output types owns both accessors.
+pub fn put_record(store: Store, id: Int, value: a) -> Store {
+  Store(..store, records: dict.insert(store.records, id, to_native(value)))
+}
+
+pub fn get_record(store: Store, id: Int) -> Result(a, Nil) {
+  case dict.get(store.records, id) {
+    Ok(value) -> Ok(from_native(value))
+    Error(Nil) -> Error(Nil)
+  }
+}

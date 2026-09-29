@@ -28,7 +28,10 @@ import gleam/erlang/process.{type Monitor, type Pid, type Subject, type Timer}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
+import gleam/set.{type Set}
 import gleam/string
+import saga/internal/checkpoint
 import saga/internal/ffi
 import saga/internal/min_heap.{type MinHeap}
 import saga/internal/node.{
@@ -186,6 +189,7 @@ pub type Progress {
 /// Messages the control subject accepts. Owned by the coordinator process;
 /// `saga/execution` only ever talks to it through these.
 pub type Control(o, e, u) {
+  InputPrepared(node_id: Int, seq: Int, input: String, reply: Subject(Nil))
   AttemptDone(node_id: Int, seq: Int, result: AttemptResult(e, u))
   RecoveryDone(node_id: Int, seq: Int, recovery: ErasedRecovery(e, u))
   TaskCrashed(node_id: Int, seq: Int, crash: node.Crash)
@@ -210,6 +214,7 @@ pub type UndoOutcome(u) {
   UndoOk
   UndoErr(error: u)
   UndoCrash(crash: node.Crash)
+  UndoBlocked(reason: checkpoint.Failure)
 }
 
 /// State for one node during the run. `NodeAttempting`/`NodeCompensating`/
@@ -235,7 +240,7 @@ type NodeRunState {
     timer: Option(Timer),
     started_at: Int,
   )
-  NodeRetryScheduled(seq: Int, attempt: Int)
+  NodeRetryScheduled(seq: Int, attempt: Int, due_at: Int)
   /// A scheduled retry's backoff has fired (or an immediate `Retry` was
   /// decided) and the node is ready to attempt again, but is waiting for
   /// `admit` to grant it a concurrency slot — exactly like a fresh node
@@ -256,11 +261,20 @@ type NodeRunState {
 
 type RunState(o, e, u) {
   RunState(
+    persistence: Option(Session(e, u)),
+    dispatch: List(Subject(Nil)),
+    pending_starts: List(Int),
+    blocked: Option(checkpoint.Failure),
+    resume_nodes: Set(Int),
+    inputs: Dict(Int, String),
+    resume_undos: Set(Int),
+    deadline_at: Option(Int),
     workflow_name: String,
     run_id: Int,
     control: Subject(Control(o, e, u)),
     nodes: Dict(Int, Node(e, u)),
     order: List(Int),
+    positions: Dict(Int, Int),
     total_nodes: Int,
     dependents: Dict(Int, List(Int)),
     state: Dict(Int, NodeRunState),
@@ -332,7 +346,7 @@ type RunPhase(e, u) {
   PhaseRollingBack(trigger: Trigger(e), settlement: Settlement(e, u))
 }
 
-type Trigger(e) {
+pub type Trigger(e) {
   TriggerFailure(cause: Cause(e))
   TriggerUnresolved(step: StepAddress, evidence: e)
   TriggerCancel(reason: CancelReason)
@@ -383,6 +397,7 @@ pub fn start(
         deliver,
         control_subject_out,
         ready,
+        None,
       )
     })
   // This wait is a startup smoke-check, not the caller's actual failure
@@ -417,6 +432,7 @@ fn run(
   deliver: fn(Outcome(o, e, u)) -> Nil,
   control_subject_out: Subject(Subject(Control(o, e, u))),
   ready: Subject(Nil),
+  persistence: Option(Session(e, u)),
 ) -> Nil {
   process.trap_exits(True)
   let control = process.new_subject()
@@ -449,11 +465,21 @@ fn run(
   emit_run_started(workflow_name, run_id)
   let initial =
     RunState(
+      persistence: persistence,
+      dispatch: [],
+      pending_starts: [],
+      blocked: None,
+      resume_nodes: set.new(),
+      inputs: dict.new(),
+      resume_undos: set.new(),
+      deadline_at: option.map(deadline, fn(ms) { ffi.system_time() + ms }),
       workflow_name: workflow_name,
       run_id: run_id,
       control: control,
       nodes: nodes,
       order: order,
+      positions: list.index_map(order, fn(id, index) { #(id, index) })
+        |> dict.from_list,
       total_nodes: dict.size(nodes),
       dependents: dependents,
       state: node_state,
@@ -475,11 +501,57 @@ fn run(
       start_time: start_time,
       unknown_effects: [],
     )
-  let admitted = admit(initial)
-  loop(admitted, fetch_output, deliver)
+  let restored = case persistence {
+    None -> Ok(initial)
+    Some(session) ->
+      case session.snapshot {
+        None -> Ok(initial)
+        Some(saved) -> restore(initial, saved)
+      }
+  }
+  case restored {
+    Error(reason) ->
+      case persistence {
+        Some(session) -> session.failed(reason)
+        None -> Nil
+      }
+    Ok(initial) -> {
+      let initial = case persistence {
+        Some(Session(cancelled: True, ..)) -> handle_cancel_request(initial)
+        _ -> initial
+      }
+      loop(admit(initial), fetch_output, deliver)
+    }
+  }
 }
 
 fn loop(
+  state: RunState(o, e, u),
+  fetch_output: fn(Store) -> ffi.RescueResult(o),
+  deliver: fn(Outcome(o, e, u)) -> Nil,
+) -> Nil {
+  case checkpoint(state) {
+    Error(reason) -> {
+      stop_workers(state)
+      cancel_deadline_timer(state)
+      case state.persistence {
+        Some(session) -> session.failed(reason)
+        None -> Nil
+      }
+    }
+    Ok(Nil) -> {
+      let state = start_saved_timers(state)
+      list.each(state.dispatch, fn(permit) { process.send(permit, Nil) })
+      loop_committed(
+        RunState(..state, dispatch: [], pending_starts: []),
+        fetch_output,
+        deliver,
+      )
+    }
+  }
+}
+
+fn loop_committed(
   state: RunState(o, e, u),
   fetch_output: fn(Store) -> ffi.RescueResult(o),
   deliver: fn(Outcome(o, e, u)) -> Nil,
@@ -653,7 +725,26 @@ fn admit(state: RunState(o, e, u)) -> RunState(o, e, u) {
                 Ok(NodeReadyForRetry(attempt)) -> attempt
                 _ -> 1
               }
-              admit(start_attempt(state, next, attempt_number))
+              let assert Ok(n) = dict.get(state.nodes, next)
+              let enabled =
+                list.all(n.conditions, fn(condition) {
+                  let selected: Bool = store.get(state.store, condition.0)
+                  selected == condition.1
+                })
+              case enabled {
+                True -> admit(start_attempt(state, next, attempt_number))
+                False -> {
+                  let state =
+                    RunState(
+                      ..state,
+                      state: dict.insert(state.state, next, NodeSkipped),
+                      done_count: state.done_count + 1,
+                    )
+                  let dependents =
+                    dict.get(state.dependents, next) |> option_unwrap_list
+                  admit(decrement_dependents(state, dependents))
+                }
+              }
             }
           }
       }
@@ -679,12 +770,21 @@ fn start_attempt(
 ) -> RunState(o, e, u) {
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let seq = ffi.unique_integer()
+  let attempt = attempt_context(state, node_id, attempt_number, n.max_attempts)
   let attempt =
-    Attempt(number: attempt_number, remaining: n.max_attempts - attempt_number)
-  let body = n.prepare_attempt(attempt, state.store)
+    node.Attempt(..attempt, admit: fn(input) {
+      let reply = process.new_subject()
+      process.send(state.control, InputPrepared(node_id, seq, input, reply))
+      process.receive_forever(reply)
+      Ok(Nil)
+    })
+  let body = case set.contains(state.resume_nodes, node_id), n.persistence {
+    True, Some(p) -> p.resume(attempt, state.store)
+    _, _ -> n.prepare_attempt(attempt, state.store)
+  }
   let control = state.control
-  let pid =
-    process.spawn(fn() {
+  let #(pid, permits) =
+    spawn_task(state, fn() {
       case ffi.rescue(body) {
         ffi.Rescued(result) ->
           process.send(control, AttemptDone(node_id, seq, result))
@@ -700,13 +800,27 @@ fn start_attempt(
   // that declared none at all falls back to the run's `step_timeout`
   // default. `option.or` picks the first `Some`, so this is exactly that
   // override direction — never the reverse.
-  let timer = case option.or(n.timeout, state.step_timeout) {
-    None -> None
-    Some(ms) ->
+  let timer = case
+    option.is_some(state.persistence),
+    option.or(n.timeout, state.step_timeout)
+  {
+    True, _ -> None
+    False, None -> None
+    False, Some(ms) ->
       Some(process.send_after(control, ms, StepTimeoutFired(node_id, seq)))
   }
   RunState(
     ..state,
+    dispatch: list.append(permits, state.dispatch),
+    pending_starts: case permits {
+      [] -> state.pending_starts
+      _ -> [node_id, ..state.pending_starts]
+    },
+    resume_nodes: set.delete(state.resume_nodes, node_id),
+    inputs: case set.contains(state.resume_nodes, node_id) {
+      True -> state.inputs
+      False -> dict.delete(state.inputs, node_id)
+    },
     running: state.running + 1,
     state: dict.insert(
       state.state,
@@ -725,6 +839,16 @@ fn handle_control(
   message: Control(o, e, u),
 ) -> RunState(o, e, u) {
   case message {
+    InputPrepared(id, seq, input, reply) ->
+      case current_attempt_seq(state, id) == Some(seq) {
+        True ->
+          RunState(
+            ..state,
+            inputs: dict.insert(state.inputs, id, input),
+            dispatch: [reply, ..state.dispatch],
+          )
+        False -> state
+      }
     AttemptDone(node_id, seq, result) ->
       handle_attempt_done(state, node_id, seq, result)
     RecoveryDone(node_id, seq, recovery) ->
@@ -851,6 +975,15 @@ fn handle_attempt_done(
     True -> {
       cancel_node_timer(state, node_id)
       case result {
+        node.AttemptBlocked(reason) -> RunState(..state, blocked: Some(reason))
+        node.AttemptAbsent ->
+          maybe_finish_settling(
+            RunState(
+              ..state,
+              running: state.running - 1,
+              state: dict.insert(state.state, node_id, NodeSkipped),
+            ),
+          )
         AttemptSucceeded(commit) ->
           commit_success(state, node_id, commit, observation.AttemptSucceeded)
         AttemptFailed(failure, recover) ->
@@ -985,8 +1118,7 @@ fn start_recovery_from_returned(
   let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer, _started_at)) =
     dict.get(state.state, node_id)
   let assert Ok(n) = dict.get(state.nodes, node_id)
-  let attempt =
-    Attempt(number: attempt_number, remaining: n.max_attempts - attempt_number)
+  let attempt = attempt_context(state, node_id, attempt_number, n.max_attempts)
   spawn_recovery(
     state,
     node_id,
@@ -1010,8 +1142,8 @@ fn spawn_recovery(
     )
   let seq = ffi.unique_integer()
   let control = state.control
-  let pid =
-    process.spawn(fn() {
+  let #(pid, permits) =
+    spawn_task(state, fn() {
       case ffi.rescue(body) {
         ffi.Rescued(recovery) ->
           process.send(control, RecoveryDone(node_id, seq, recovery))
@@ -1022,14 +1154,22 @@ fn spawn_recovery(
           )
       }
     })
-  let timer =
-    Some(process.send_after(
-      control,
-      state.cleanup_timeout,
-      CleanupTimeoutFired(node_id, seq),
-    ))
+  let timer = case state.persistence {
+    Some(_) -> None
+    None ->
+      Some(process.send_after(
+        control,
+        state.cleanup_timeout,
+        CleanupTimeoutFired(node_id, seq),
+      ))
+  }
   RunState(
     ..state,
+    dispatch: list.append(permits, state.dispatch),
+    pending_starts: case permits {
+      [] -> state.pending_starts
+      _ -> [node_id, ..state.pending_starts]
+    },
     state: dict.insert(
       state.state,
       node_id,
@@ -1057,18 +1197,23 @@ fn handle_recovery_done(
       )) = dict.get(state.state, node_id)
       let assert Ok(n) = dict.get(state.nodes, node_id)
       let duration = duration_since_started(state, node_id)
-      emit_compensation_stopped(
-        state,
-        n.address,
-        attempt_number,
-        decision_kind(recovery),
-        duration,
-      )
+      case recovery {
+        node.EBlocked(_) -> Nil
+        _ ->
+          emit_compensation_stopped(
+            state,
+            n.address,
+            attempt_number,
+            decision_kind(recovery),
+            duration,
+          )
+      }
       let settling_or_rolling_back = case state.phase {
         PhaseRunning -> False
         PhaseSettling(..) | PhaseRollingBack(..) -> True
       }
       case recovery, settling_or_rolling_back {
+        node.EBlocked(reason), _ -> RunState(..state, blocked: Some(reason))
         // Retry/RetryAfter decisions are not honored once settling has
         // begun (§3.3): the run is already stopping admission, so a fresh
         // attempt would race the settle window. The exhausted-vs-not
@@ -1129,7 +1274,7 @@ fn decision_kind(recovery: ErasedRecovery(e, u)) -> observation.DecisionKind {
     ERetry | ERetryAfter(_) -> observation.DecisionRetry
     EContinue(_) -> observation.DecisionContinue
     EAbort(_) | EAbortCleanup(_, _) -> observation.DecisionAbort
-    EHold(_) -> observation.DecisionHold
+    EHold(_) | node.EBlocked(_) -> observation.DecisionHold
   }
 }
 
@@ -1169,7 +1314,7 @@ fn retry_after(
       state: dict.insert(
         state.state,
         node_id,
-        NodeRetryScheduled(seq, next_attempt),
+        NodeRetryScheduled(seq, next_attempt, ffi.system_time() + delay),
       ),
     )
   // The attempt that just failed already freed its `running` slot (the
@@ -1191,7 +1336,7 @@ fn handle_retry_fire(
   seq: Int,
 ) -> RunState(o, e, u) {
   case dict.get(state.state, node_id) {
-    Ok(NodeRetryScheduled(current_seq, next_attempt)) if current_seq == seq ->
+    Ok(NodeRetryScheduled(current_seq, next_attempt, _)) if current_seq == seq ->
       RunState(
         ..state,
         state: dict.insert(
@@ -1263,8 +1408,7 @@ fn start_crash_recovery(
   let assert Ok(NodeAttempting(_seq, attempt_number, _pid, _timer, _started_at)) =
     dict.get(state.state, node_id)
   let assert Ok(n) = dict.get(state.nodes, node_id)
-  let attempt =
-    Attempt(number: attempt_number, remaining: n.max_attempts - attempt_number)
+  let attempt = attempt_context(state, node_id, attempt_number, n.max_attempts)
   spawn_recovery(
     state,
     node_id,
@@ -1758,13 +1902,27 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
         [JournalEntry(node_id, _address, Some(undo_fn)), ..rest] -> {
           let control = state.control
           let seq = ffi.unique_integer()
-          let pid =
-            process.spawn(fn() {
-              case ffi.rescue(undo_fn) {
-                ffi.Rescued(Ok(Nil)) ->
+          let assert Ok(n) = dict.get(state.nodes, node_id)
+          let undo_body = case
+            set.contains(state.resume_undos, node_id),
+            n.persistence
+          {
+            True, Some(p) ->
+              p.resume_undo(state.store, action_key(state, node_id, "undo"))
+            _, _ -> fn() { Ok(undo_fn()) }
+          }
+          let #(pid, permits) =
+            spawn_task(state, fn() {
+              case ffi.rescue(undo_body) {
+                ffi.Rescued(Ok(Ok(Nil))) ->
                   process.send(control, UndoDone(node_id, seq, UndoOk))
-                ffi.Rescued(Error(error)) ->
+                ffi.Rescued(Ok(Error(error))) ->
                   process.send(control, UndoDone(node_id, seq, UndoErr(error)))
+                ffi.Rescued(Error(reason)) ->
+                  process.send(
+                    control,
+                    UndoDone(node_id, seq, UndoBlocked(reason)),
+                  )
                 ffi.Raised(class, reason) ->
                   process.send(
                     control,
@@ -1772,15 +1930,24 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
                   )
               }
             })
-          let timer =
-            Some(process.send_after(
-              control,
-              state.cleanup_timeout,
-              CleanupTimeoutFired(node_id, seq),
-            ))
+          let timer = case state.persistence {
+            Some(_) -> None
+            None ->
+              Some(process.send_after(
+                control,
+                state.cleanup_timeout,
+                CleanupTimeoutFired(node_id, seq),
+              ))
+          }
           RunState(
             ..state,
             journal: rest,
+            dispatch: list.append(permits, state.dispatch),
+            pending_starts: case permits {
+              [] -> state.pending_starts
+              _ -> [node_id, ..state.pending_starts]
+            },
+            resume_undos: set.delete(state.resume_undos, node_id),
             state: dict.insert(
               state.state,
               node_id,
@@ -1794,6 +1961,18 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
 }
 
 fn handle_undo_done(
+  state: RunState(o, e, u),
+  node_id: Int,
+  seq: Int,
+  outcome: UndoOutcome(u),
+) -> RunState(o, e, u) {
+  case outcome {
+    UndoBlocked(reason) -> RunState(..state, blocked: Some(reason))
+    _ -> handle_known_undo(state, node_id, seq, outcome)
+  }
+}
+
+fn handle_known_undo(
   state: RunState(o, e, u),
   node_id: Int,
   seq: Int,
@@ -1816,7 +1995,7 @@ fn handle_undo_done(
       let new_state = case outcome {
         UndoOk -> NodeUndone
         UndoErr(_) -> NodeUndoFailedTerminal
-        UndoCrash(_) -> NodeUndoFailedTerminal
+        UndoCrash(_) | UndoBlocked(_) -> NodeUndoFailedTerminal
       }
       emit_undo_stopped(state, address, undo_outcome_kind(outcome), duration)
       let state =
@@ -1827,6 +2006,7 @@ fn handle_undo_done(
         )
       let _ = attempt_number
       let state = case outcome {
+        UndoBlocked(reason) -> RunState(..state, blocked: Some(reason))
         UndoOk -> record_undone(state, address)
         UndoErr(error) -> record_undo_failure(state, UndoFailed(address, error))
         UndoCrash(crash) ->
@@ -1842,6 +2022,7 @@ fn handle_undo_done(
 
 fn undo_outcome_kind(outcome: UndoOutcome(u)) -> observation.UndoKind {
   case outcome {
+    UndoBlocked(_) -> observation.UndoCrashedKind
     UndoOk -> observation.UndoUndone
     UndoErr(_) -> observation.UndoFailedKind
     UndoCrash(_) -> observation.UndoCrashedKind
@@ -1931,7 +2112,8 @@ fn build_progress(state: RunState(o, e, u)) -> Progress {
         Ok(NodeWaiting(_)) -> Waiting
         Ok(NodeAttempting(_, attempt, _, _, _)) -> Attempting(attempt)
         Ok(NodeCompensating(_, attempt, _, _, _)) -> Compensating(attempt)
-        Ok(NodeRetryScheduled(_, next_attempt)) -> RetryScheduled(next_attempt)
+        Ok(NodeRetryScheduled(_, next_attempt, _)) ->
+          RetryScheduled(next_attempt)
         Ok(NodeReadyForRetry(next_attempt)) -> RetryScheduled(next_attempt)
         Ok(NodeDone) -> Succeeded
         Ok(NodeFailedTerminal) -> FailedStep
@@ -2106,4 +2288,505 @@ fn emit_undo_stopped(
       ),
     )
   Nil
+}
+
+/// Runtime-independent execution progress. Node positions refer to the checked
+/// definition's construction order, never to VM-generated node identifiers.
+pub type Snapshot(e, u) {
+  Snapshot(
+    nodes: List(SavedNode),
+    journal: List(Int),
+    phase: SavedPhase(e, u),
+    last_failure: List(#(Int, AttemptFailure(e))),
+    unknown_effects: List(UnknownEffect),
+    deadline_at: Option(Int),
+  )
+}
+
+pub type SavedNode {
+  SavedNode(progress: StepState, values: List(String), retry_at: Int)
+}
+
+pub type SavedPhase(e, u) {
+  SavedRunning
+  SavedSettling(trigger: Trigger(e), settlement: Settlement(e, u))
+  SavedRollback(trigger: Trigger(e), settlement: Settlement(e, u))
+}
+
+pub type Session(e, u) {
+  Session(
+    execution_id: String,
+    snapshot: Option(Snapshot(e, u)),
+    cancelled: Bool,
+    save: fn(Snapshot(e, u)) -> Result(Nil, checkpoint.Failure),
+    failed: fn(checkpoint.Failure) -> Nil,
+  )
+}
+
+/// Used by the optional persistent runner. The same admission and lifecycle
+/// functions serve local execution; ownership and storage belong to `session`.
+pub fn execute_saved(
+  workflow_name: String,
+  max_concurrency: Int,
+  deadline: Option(Int),
+  step_timeout: Option(Int),
+  settle_timeout: Int,
+  cleanup_timeout: Int,
+  build_graph: fn() ->
+    #(
+      Dict(Int, Node(e, u)),
+      List(Int),
+      Dict(Int, List(Int)),
+      Store,
+      fn(Store) -> ffi.RescueResult(o),
+    ),
+  session: Session(e, u),
+  deliver: fn(Outcome(o, e, u)) -> Nil,
+) -> Nil {
+  let control_out = process.new_subject()
+  let ready = process.new_subject()
+  run(
+    workflow_name,
+    process.self(),
+    ffi.unique_integer(),
+    max_concurrency,
+    deadline,
+    step_timeout,
+    settle_timeout,
+    cleanup_timeout,
+    build_graph,
+    deliver,
+    control_out,
+    ready,
+    Some(session),
+  )
+  let _ = process.receive(control_out, 0)
+  let _ = process.receive(ready, 0)
+  Nil
+}
+
+fn action_key(state: RunState(o, e, u), id: Int, action: String) -> String {
+  let execution = case state.persistence {
+    Some(session) -> session.execution_id
+    None -> int.to_string(state.run_id)
+  }
+  let position = dict.get(state.positions, id) |> result.unwrap(-1)
+  int.to_string(string.byte_size(execution))
+  <> ":"
+  <> execution
+  <> ":"
+  <> int.to_string(position)
+  <> ":"
+  <> action
+}
+
+fn checkpoint(state: RunState(o, e, u)) -> Result(Nil, checkpoint.Failure) {
+  case state.blocked, state.persistence {
+    Some(reason), _ -> Error(reason)
+    None, None -> Ok(Nil)
+    None, Some(session) -> {
+      use snapshot <- result.try(
+        freeze(state) |> result.map_error(checkpoint.CodecFailure),
+      )
+      session.save(snapshot)
+    }
+  }
+}
+
+fn freeze(state: RunState(o, e, u)) -> Result(Snapshot(e, u), String) {
+  let progress = build_progress(state)
+  use nodes <- result.try(
+    list.try_map(list.zip(state.order, progress.steps), fn(pair) {
+      let #(id, progress) = pair
+      let assert Ok(n) = dict.get(state.nodes, id)
+      let values = case progress.state {
+        Succeeded | Undoing | Undone | UndoFailedStep ->
+          case n.persistence {
+            Some(p) -> p.freeze(state.store, action_key(state, id, "undo"))
+            None -> Error("step has no persistence capability")
+          }
+        Attempting(_) | Compensating(_) ->
+          Ok(case dict.get(state.inputs, id) {
+            Ok(input) -> [input]
+            Error(_) -> []
+          })
+        _ -> Ok([])
+      }
+      use values <- result.try(values)
+      let retry_at = case dict.get(state.state, id) {
+        Ok(NodeRetryScheduled(_, _, due)) -> due
+        _ -> 0
+      }
+      Ok(SavedNode(progress.state, values, retry_at))
+    }),
+  )
+  let phase = case state.phase {
+    PhaseRunning -> SavedRunning
+    PhaseSettling(trigger, settlement, _, _) ->
+      SavedSettling(trigger, settlement)
+    PhaseRollingBack(trigger, settlement) -> SavedRollback(trigger, settlement)
+  }
+  Ok(Snapshot(
+    nodes,
+    list.map(state.journal, fn(entry) {
+      dict.get(state.positions, entry.node_id) |> result.unwrap(-1)
+    }),
+    phase,
+    dict.to_list(state.last_failure)
+      |> list.map(fn(pair) {
+        #(dict.get(state.positions, pair.0) |> result.unwrap(-1), pair.1)
+      }),
+    state.unknown_effects,
+    state.deadline_at,
+  ))
+}
+
+fn stop_workers(state: RunState(o, e, u)) -> Nil {
+  dict.values(state.state)
+  |> list.each(fn(node_state) {
+    case node_state {
+      NodeAttempting(_, _, pid, _, _)
+      | NodeCompensating(_, _, pid, _, _)
+      | NodeUndoing(_, pid, _, _) -> process.kill(pid)
+      _ -> Nil
+    }
+  })
+}
+
+fn restore(
+  state: RunState(o, e, u),
+  saved: Snapshot(e, u),
+) -> Result(RunState(o, e, u), checkpoint.Failure) {
+  use _ <- result.try(
+    case list.length(saved.nodes) == list.length(state.order) {
+      True -> Ok(Nil)
+      False -> Error(checkpoint.InvalidState("checkpoint graph size mismatch"))
+    },
+  )
+  use _ <- result.try(
+    case
+      list.count(saved.nodes, fn(n) {
+        case n.progress {
+          Attempting(_) | Compensating(_) -> True
+          _ -> False
+        }
+      })
+      > state.max_concurrency
+    {
+      True ->
+        Error(checkpoint.InvalidState(
+          "concurrency limit below saved in-flight count",
+        ))
+      False -> Ok(Nil)
+    },
+  )
+  let pairs = list.zip(state.order, saved.nodes)
+  use restored <- result.try(
+    list.try_fold(pairs, #(state.store, dict.new()), fn(acc, pair) {
+      let #(id, saved_node) = pair
+      case saved_node.values, saved_node.progress {
+        [], _ | _, Attempting(_) | _, Compensating(_) -> Ok(acc)
+        values, _ -> {
+          let assert Ok(n) = dict.get(state.nodes, id)
+          use p <- result.try(case n.persistence {
+            Some(p) -> Ok(p)
+            None ->
+              Error(checkpoint.InvalidState("missing persistence capability"))
+          })
+          use commit <- result.try(
+            p.thaw(values, acc.0, action_key(state, id, "undo"))
+            |> result.map_error(checkpoint.CodecFailure),
+          )
+          let #(store, undo) = commit(acc.0)
+          Ok(#(store, dict.insert(acc.1, id, undo)))
+        }
+      }
+    }),
+  )
+  let #(run_store, undos) = restored
+  let statuses =
+    dict.from_list(
+      list.map(pairs, fn(pair) {
+        let #(id, n) = pair
+        let status = case n.progress {
+          Waiting -> NodeWaiting(0)
+          Attempting(attempt) | RetryScheduled(attempt) ->
+            NodeReadyForRetry(attempt)
+          Compensating(_) -> NodeInterrupted
+          Succeeded -> NodeDone
+          FailedStep -> NodeFailedTerminal
+          Interrupted -> NodeInterrupted
+          Undoing -> NodeDone
+          Undone -> NodeUndone
+          UndoFailedStep -> NodeUndoFailedTerminal
+          Skipped -> NodeSkipped
+        }
+        #(id, status)
+      }),
+    )
+  let statuses =
+    dict.map_values(statuses, fn(id, status) {
+      case status {
+        NodeWaiting(_) -> {
+          let assert Ok(n) = dict.get(state.nodes, id)
+          let remaining =
+            list.count(n.deps, fn(dep) {
+              case dict.get(statuses, dep) {
+                Ok(NodeDone) | Ok(NodeSkipped) -> False
+                _ -> True
+              }
+            })
+          NodeWaiting(remaining)
+        }
+        _ -> status
+      }
+    })
+  use journal <- result.try(
+    list.try_map(saved.journal, fn(index) {
+      use id <- result.try(case list.first(list.drop(state.order, index)) {
+        Ok(id) -> Ok(id)
+        Error(_) -> Error(checkpoint.InvalidState("invalid journal position"))
+      })
+      let assert Ok(n) = dict.get(state.nodes, id)
+      use undo <- result.try(case dict.get(undos, id) {
+        Ok(undo) -> Ok(undo)
+        Error(_) ->
+          Error(checkpoint.InvalidState("journal has no saved output"))
+      })
+      Ok(JournalEntry(id, n.address, undo))
+    }),
+  )
+  let active_undo =
+    list.filter_map(pairs, fn(pair) {
+      case pair.1.progress {
+        Undoing -> {
+          let assert Ok(n) = dict.get(state.nodes, pair.0)
+          let assert Ok(undo) = dict.get(undos, pair.0)
+          Ok(JournalEntry(pair.0, n.address, undo))
+        }
+        _ -> Error(Nil)
+      }
+    })
+  let phase = case saved.phase {
+    SavedRunning -> PhaseRunning
+    SavedSettling(trigger, settlement) -> {
+      let seq = ffi.unique_integer()
+      PhaseSettling(
+        trigger,
+        settlement,
+        Some(process.send_after(
+          state.control,
+          state.settle_timeout,
+          SettleFired(seq),
+        )),
+        seq,
+      )
+    }
+    SavedRollback(trigger, settlement) -> PhaseRollingBack(trigger, settlement)
+  }
+  use failures <- result.try(
+    list.try_map(saved.last_failure, fn(pair) {
+      case list.first(list.drop(state.order, pair.0)) {
+        Ok(id) -> Ok(#(id, pair.1))
+        Error(_) -> Error(checkpoint.InvalidState("invalid failure position"))
+      }
+    }),
+  )
+  use _ <- result.try(
+    list.try_each(pairs, fn(pair) {
+      case pair.1.progress, dict.get(dict.from_list(failures), pair.0) {
+        Compensating(_), Error(_) ->
+          Error(checkpoint.InvalidState("compensation has no saved failure"))
+        _, _ -> Ok(Nil)
+      }
+    }),
+  )
+  cancel_deadline_timer(state)
+  let deadline_timer =
+    option.map(saved.deadline_at, fn(due) {
+      process.send_after(
+        state.control,
+        int.max(0, due - ffi.system_time()),
+        DeadlineFired(ffi.unique_integer()),
+      )
+    })
+  let restored =
+    RunState(
+      ..state,
+      inputs: list.filter_map(pairs, fn(pair) {
+          case pair.1.progress, pair.1.values {
+            Attempting(_), [input] | Compensating(_), [input] ->
+              Ok(#(pair.0, input))
+            _, _ -> Error(Nil)
+          }
+        })
+        |> dict.from_list,
+      store: run_store,
+      state: statuses,
+      journal: list.append(active_undo, journal),
+      phase: phase,
+      last_failure: dict.from_list(failures),
+      unknown_effects: saved.unknown_effects,
+      deadline_at: saved.deadline_at,
+      deadline_timer: deadline_timer,
+      ready: min_heap.new(),
+      done_count: list.count(dict.values(statuses), fn(s) {
+        case s {
+          NodeDone | NodeSkipped -> True
+          _ -> False
+        }
+      }),
+      resume_nodes: set.from_list(
+        list.filter_map(pairs, fn(pair) {
+          case pair.1.progress {
+            Attempting(_) -> Ok(pair.0)
+            _ -> Error(Nil)
+          }
+        }),
+      ),
+      resume_undos: set.from_list(
+        list.map(active_undo, fn(entry) { entry.node_id }),
+      ),
+    )
+  let restored =
+    list.fold(pairs, restored, fn(acc, pair) {
+      let #(id, saved_node) = pair
+      case saved_node.progress, acc.phase {
+        Compensating(attempt), PhaseRunning
+        | Compensating(attempt), PhaseSettling(..)
+        -> {
+          let assert Ok(n) = dict.get(acc.nodes, id)
+          let assert Some(p) = n.persistence
+          let assert Ok(failure) = dict.get(acc.last_failure, id)
+          let context = attempt_context(acc, id, attempt, n.max_attempts)
+          spawn_recovery(
+            RunState(..acc, running: acc.running + 1),
+            id,
+            attempt,
+            failure,
+            p.resume_compensation(context, acc.store),
+          )
+        }
+        Attempting(attempt), PhaseSettling(..)
+        | Attempting(attempt), PhaseRunning
+        -> start_attempt(acc, id, attempt)
+        RetryScheduled(attempt), PhaseRunning if saved_node.retry_at > 0 -> {
+          let seq = ffi.unique_integer()
+          process.send_after(
+            acc.control,
+            int.max(0, saved_node.retry_at - ffi.system_time()),
+            RetryFire(id, seq),
+          )
+          RunState(
+            ..acc,
+            state: dict.insert(
+              acc.state,
+              id,
+              NodeRetryScheduled(seq, attempt, saved_node.retry_at),
+            ),
+          )
+        }
+        _, PhaseRunning ->
+          case dict.get(acc.state, id) {
+            Ok(NodeWaiting(0)) | Ok(NodeReadyForRetry(_)) -> mark_ready(acc, id)
+            _ -> acc
+          }
+        _, _ -> acc
+      }
+    })
+  Ok(case restored.phase {
+    PhaseRunning -> restored
+    PhaseSettling(..) -> maybe_finish_settling(restored)
+    PhaseRollingBack(..) -> undo_next(restored)
+  })
+}
+
+fn spawn_waiting(body: fn() -> Nil) -> #(Pid, Subject(Nil)) {
+  let ready = process.new_subject()
+  let pid =
+    process.spawn(fn() {
+      let permit = process.new_subject()
+      process.send(ready, permit)
+      process.receive_forever(permit)
+      body()
+    })
+  #(pid, process.receive_forever(ready))
+}
+
+fn spawn_task(
+  state: RunState(o, e, u),
+  body: fn() -> Nil,
+) -> #(Pid, List(Subject(Nil))) {
+  case state.persistence {
+    None -> #(process.spawn(body), [])
+    Some(_) -> {
+      let #(pid, permit) = spawn_waiting(body)
+      #(pid, [permit])
+    }
+  }
+}
+
+fn attempt_context(
+  state: RunState(o, e, u),
+  id: Int,
+  number: Int,
+  maximum: Int,
+) -> Attempt {
+  Attempt(
+    number,
+    maximum - number,
+    action_key(state, id, "attempt:" <> int.to_string(number)),
+    case state.persistence {
+      Some(Session(cancelled: True, ..)) -> True
+      _ -> False
+    },
+    option.is_some(state.persistence),
+    dict.get(state.inputs, id) |> option.from_result,
+    fn(_) { Ok(Nil) },
+  )
+}
+
+/// Effect timeouts begin after the admission checkpoint, when work is released.
+fn start_saved_timers(state: RunState(o, e, u)) -> RunState(o, e, u) {
+  list.fold(state.pending_starts, state, fn(acc, id) {
+    let updated = case dict.get(acc.state, id) {
+      Ok(NodeAttempting(seq, attempt, pid, _, _)) -> {
+        let assert Ok(n) = dict.get(acc.nodes, id)
+        let timer =
+          option.map(option.or(n.timeout, acc.step_timeout), fn(ms) {
+            process.send_after(acc.control, ms, StepTimeoutFired(id, seq))
+          })
+        Some(NodeAttempting(seq, attempt, pid, timer, ffi.monotonic_time()))
+      }
+      Ok(NodeCompensating(seq, attempt, pid, _, _)) ->
+        Some(NodeCompensating(
+          seq,
+          attempt,
+          pid,
+          Some(process.send_after(
+            acc.control,
+            acc.cleanup_timeout,
+            CleanupTimeoutFired(id, seq),
+          )),
+          ffi.monotonic_time(),
+        ))
+      Ok(NodeUndoing(seq, pid, _, _)) ->
+        Some(NodeUndoing(
+          seq,
+          pid,
+          Some(process.send_after(
+            acc.control,
+            acc.cleanup_timeout,
+            CleanupTimeoutFired(id, seq),
+          )),
+          ffi.monotonic_time(),
+        ))
+      _ -> None
+    }
+    case updated {
+      Some(updated) ->
+        RunState(..acc, state: dict.insert(acc.state, id, updated))
+      None -> acc
+    }
+  })
 }

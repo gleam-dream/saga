@@ -20,14 +20,18 @@ import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/set.{type Set}
 import gleam/string
+import saga/codec.{type Codec}
 import saga/internal/cell
+import saga/internal/checkpoint
 import saga/internal/ffi
 import saga/internal/node.{
   type ErasedRecovery, type Node, AttemptSucceeded, Node,
 }
 import saga/internal/store.{type Store}
+import saga/reconciliation
 
 /// A step's recorded location: nested scope (from `embed`), a name, and the
 /// 1-based occurrence rank among nodes sharing the same scope + name.
@@ -224,8 +228,16 @@ pub opaque type Step(i, o, e, u) {
     timeout: Option(Int),
     undoable: Bool,
     compensates: Bool,
-    attempt: fn(i) -> RunOutcome(o, u, e),
-    decide_crash: Option(fn(i, CrashOrTimeout, Attempt) -> Recovery(o, e, u)),
+    attempt: fn(i, String) -> RunOutcome(o, u, e),
+    persistence: Option(StepPersistence(i, o, e)),
+    undo_for: fn(i, o, String) -> Undo(u),
+    recovery_undo_declared: Bool,
+    resolve_undo: fn(i, o, String) -> UndoStatus(u),
+    resolve_compensation: fn(i, Attempt, String) -> CompensationStatus(o, e, u),
+    decide_returned: Option(fn(i, e, Attempt, String) -> Recovery(o, e, u)),
+    decide_crash: Option(
+      fn(i, CrashOrTimeout, Attempt, String) -> Recovery(o, e, u),
+    ),
   )
 }
 
@@ -241,7 +253,7 @@ type RunOutcome(o, u, e) {
   Succeeded(output: o, undo: Undo(u))
   Failed(
     failure: AttemptFailure(e),
-    recover_returned: Option(fn(Attempt) -> Recovery(o, e, u)),
+    recover_returned: Option(fn(Attempt, String) -> Recovery(o, e, u)),
   )
 }
 
@@ -249,14 +261,28 @@ type RunOutcome(o, u, e) {
 /// modifiers, a failure is terminal after one attempt and nothing is undone
 /// on rollback.
 pub fn step(name: String, run: fn(i) -> Result(o, e)) -> Step(i, o, e, u) {
+  effect(name, fn(input, _key) { run(input) })
+}
+
+/// An effect receives a stable per-attempt key when persistence is enabled.
+pub fn effect(
+  name: String,
+  run: fn(i, String) -> Result(o, e),
+) -> Step(i, o, e, u) {
   Step(
     name: name,
     max_attempts: 1,
     timeout: None,
     undoable: False,
     compensates: False,
-    attempt: fn(input) {
-      case run(input) {
+    persistence: None,
+    undo_for: fn(_, _, _) { NoUndo },
+    recovery_undo_declared: False,
+    resolve_undo: fn(_, _, _) { UndoUnknown },
+    resolve_compensation: fn(_, _, _) { CompensationUnknown },
+    decide_returned: None,
+    attempt: fn(input, key) {
+      case run(input, key) {
         Ok(output) -> Succeeded(output, NoUndo)
         Error(error) -> Failed(Returned(error), None)
       }
@@ -272,14 +298,31 @@ pub fn undo(
   step: Step(i, o, e, u),
   undo_fn: fn(i, o) -> Result(Nil, u),
 ) -> Step(i, o, e, u) {
+  undo_effect(step, fn(input, output, _) { undo_fn(input, output) })
+}
+
+/// An undo action with the execution's stable undo key, used identically
+/// during normal rollback and restoration.
+pub fn undo_effect(
+  step: Step(i, o, e, u),
+  undo_fn: fn(i, o, String) -> Result(Nil, u),
+) -> Step(i, o, e, u) {
   let attempt = step.attempt
-  Step(..step, undoable: True, attempt: fn(input) {
-    case attempt(input) {
-      Succeeded(output, NoUndo) ->
-        Succeeded(output, UndoWith(fn() { undo_fn(input, output) }))
-      unchanged -> unchanged
-    }
-  })
+  Step(
+    ..step,
+    undoable: True,
+    undo_for: fn(i, o, key) { UndoWith(fn() { undo_fn(i, o, key) }) },
+    attempt: fn(input, key) {
+      case attempt(input, key) {
+        Succeeded(output, NoUndo) ->
+          Succeeded(
+            output,
+            UndoWith(fn() { undo_fn(input, output, undo_key(key)) }),
+          )
+        unchanged -> unchanged
+      }
+    },
+  )
 }
 
 /// Attaches an explicit recovery decision for a *failing* attempt (an
@@ -298,27 +341,42 @@ pub fn compensate(
   max_attempts max_attempts: Int,
   with decide: fn(i, AttemptFailure(e), Attempt) -> Recovery(o, e, u),
 ) -> Step(i, o, e, u) {
+  compensate_with_key(step, max_attempts, fn(input, failure, attempt, _) {
+    decide(input, failure, attempt)
+  })
+}
+
+/// A compensation callback receives a stable key for this step and attempt.
+/// A restart consults `reconcile_compensation`; it never repeats this callback.
+pub fn compensate_with_key(
+  step: Step(i, o, e, u),
+  max_attempts max_attempts: Int,
+  with decide: fn(i, AttemptFailure(e), Attempt, String) -> Recovery(o, e, u),
+) -> Step(i, o, e, u) {
   let attempt = step.attempt
   Step(
     ..step,
     max_attempts: max_attempts,
     compensates: True,
-    attempt: fn(input) {
-      case attempt(input) {
+    decide_returned: Some(fn(input, error, attempt, key) {
+      decide(input, Returned(error), attempt, key)
+    }),
+    attempt: fn(input, key) {
+      case attempt(input, key) {
         Failed(failure, _) ->
           Failed(
             failure,
-            Some(fn(attempt_no) { decide(input, failure, attempt_no) }),
+            Some(fn(attempt_no, key) { decide(input, failure, attempt_no, key) }),
           )
         unchanged -> unchanged
       }
     },
-    decide_crash: Some(fn(input, crash_or_timeout, attempt_no) {
+    decide_crash: Some(fn(input, crash_or_timeout, attempt_no, key) {
       let failure = case crash_or_timeout {
         StepCrashed(crash) -> Crashed(crash)
         StepTimedOut -> TimedOut
       }
-      decide(input, failure, attempt_no)
+      decide(input, failure, attempt_no, key)
     }),
   )
 }
@@ -342,16 +400,37 @@ pub fn map_step_errors(
     timeout: step.timeout,
     undoable: step.undoable,
     compensates: step.compensates,
-    attempt: fn(input) {
-      case step.attempt(input) {
+    persistence: None,
+    recovery_undo_declared: step.recovery_undo_declared,
+    resolve_undo: fn(i, o, key) {
+      case step.resolve_undo(i, o, key) {
+        UndoCompleted -> UndoCompleted
+        UndoStillApplied -> UndoStillApplied
+        UndoUnknown -> UndoUnknown
+        UndoFailed(error) -> UndoFailed(map_undo_error(error))
+      }
+    },
+    resolve_compensation: fn(input, attempt, key) {
+      case step.resolve_compensation(input, attempt, key) {
+        CompensationUnknown -> CompensationUnknown
+        CompensationResolved(recovery) ->
+          CompensationResolved(map_recovery(recovery, map_error, map_undo_error))
+      }
+    },
+    decide_returned: None,
+    undo_for: fn(i, o, key) {
+      map_undo(step.undo_for(i, o, key), map_undo_error)
+    },
+    attempt: fn(input, key) {
+      case step.attempt(input, key) {
         Succeeded(output, undo_choice) ->
           Succeeded(output, map_undo(undo_choice, map_undo_error))
         Failed(failure, recover_returned) ->
           Failed(
             failure: map_attempt_failure(failure, map_error),
             recover_returned: option.map(recover_returned, fn(recover_fn) {
-              fn(attempt_no) {
-                recover_fn(attempt_no)
+              fn(attempt_no, key) {
+                recover_fn(attempt_no, key)
                 |> map_recovery(map_error, map_undo_error)
               }
             }),
@@ -359,8 +438,13 @@ pub fn map_step_errors(
       }
     },
     decide_crash: option.map(step.decide_crash, fn(decide_fn) {
-      fn(input: i, crash_or_timeout: CrashOrTimeout, attempt_no: Attempt) {
-        decide_fn(input, crash_or_timeout, attempt_no)
+      fn(
+        input: i,
+        crash_or_timeout: CrashOrTimeout,
+        attempt_no: Attempt,
+        key: String,
+      ) {
+        decide_fn(input, crash_or_timeout, attempt_no, key)
         |> map_recovery(map_error, map_undo_error)
       }
     }),
@@ -582,6 +666,91 @@ pub fn all(
   |> map(list.reverse)
 }
 
+/// Constructs both branches once, and executes only the selected branch.
+/// The decision is a scheduled value, shared by all nodes in that branch.
+pub fn choose(
+  input: Port(i, e, u),
+  name: String,
+  decision: Port(Bool, e, u),
+  when_true: fn(Port(i, e, u)) -> Port(o, e, u),
+  when_false: fn(Port(i, e, u)) -> Port(o, e, u),
+) -> Port(o, e, u) {
+  let selected =
+    perform(
+      decision,
+      step(name, fn(value) { Ok(value) })
+        |> recoverable("choice-1", codec.bool(), codec.bool(), fn(value, _) {
+          EffectCompleted(value)
+        }),
+    )
+  let yes = choice_branch(input, selected, name, True, when_true)
+  let no = choice_branch(input, selected, name, False, when_false)
+  let combined =
+    merge_ports(input.scope, yes, no, fn() {
+      let capture_decision = selected.fetch()
+      let capture_yes = yes.fetch()
+      let capture_no = no.fetch()
+      fn(run_store) {
+        // The decision node is a Bool identity step, so this reads no user map.
+        case capture_decision(run_store)() {
+          True -> capture_yes(run_store)
+          False -> capture_no(run_store)
+        }
+      }
+    })
+  Port(
+    ..combined,
+    deps: set.union(combined.deps, selected.deps),
+    errors: list.append(
+      combined.errors,
+      foreign_error_for(input.scope, decision),
+    ),
+  )
+}
+
+fn choice_branch(
+  input: Port(i, e, u),
+  selected: Port(Bool, e, u),
+  name: String,
+  selected_value: Bool,
+  build: fn(Port(i, e, u)) -> Port(o, e, u),
+) -> Port(o, e, u) {
+  let registry = cell.new_registry()
+  let branch_name = case selected_value {
+    True -> "true"
+    False -> "false"
+  }
+  let scoped =
+    Port(
+      ..input,
+      scope: ScopeToken(
+        ..input.scope,
+        path: list.append(input.scope.path, [name, branch_name]),
+        registry: registry,
+      ),
+    )
+  let output = build(scoped)
+  let conditions =
+    list.map(set.to_list(selected.deps), fn(id) { #(id, selected_value) })
+  cell.all_registered(registry)
+  |> list.each(fn(n) {
+    cell.register(
+      input.scope.registry,
+      Node(
+        ..n,
+        deps: set.union(set.from_list(n.deps), selected.deps) |> set.to_list,
+        conditions: list.append(conditions, n.conditions),
+      ),
+    )
+  })
+  cell.close(registry)
+  Port(
+    ..output,
+    scope: input.scope,
+    errors: list.append(output.errors, foreign_error_for(input.scope, output)),
+  )
+}
+
 // ---------------------------------------------------------------------------
 // perform
 // ---------------------------------------------------------------------------
@@ -598,7 +767,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   let deps = set.to_list(input.deps)
   let capture_input = input.fetch()
 
-  let to_erased_recovery = fn(recovery: Recovery(o, e, u)) -> ErasedRecovery(
+  let to_erased_recovery = fn(recovery: Recovery(o, e, u), input: i) -> ErasedRecovery(
     e,
     u,
   ) {
@@ -607,10 +776,15 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       RetryAfter(ms) -> node.ERetryAfter(ms)
       Continue(output, undo_choice) ->
         node.EContinue(commit: fn(run_store) {
-          #(store.put(run_store, id, output), case undo_choice {
-            NoUndo -> None
-            UndoWith(run) -> Some(fn() { run() })
-          })
+          #(
+            run_store
+              |> store.put(id, output)
+              |> store.put_record(id, #(input, output, has_undo(undo_choice))),
+            case undo_choice {
+              NoUndo -> None
+              UndoWith(run) -> Some(fn() { run() })
+            },
+          )
         })
       Abort(error) -> node.EAbort(error)
       AbortAfterCleanupFailure(error, cleanup_error) ->
@@ -632,32 +806,60 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   // task body below, under `rescue`, never here — so a panicking or slow
   // `map` becomes an ordinary attempt crash/duration instead of taking the
   // coordinator down or blocking it.
-  let prepare_attempt = fn(_node_attempt: node.Attempt, run_store: Store) -> fn() ->
+  let prepare_attempt = fn(node_attempt: node.Attempt, run_store: Store) -> fn() ->
     node.AttemptResult(e, u) {
     let produce_value = capture_input(run_store)
     fn() {
-      let value = produce_value()
-      case step.attempt(value) {
-        Succeeded(output, undo_choice) ->
-          AttemptSucceeded(commit: fn(commit_store) {
-            #(store.put(commit_store, id, output), case undo_choice {
-              NoUndo -> None
-              UndoWith(run) -> Some(fn() { run() })
-            })
+      let prepared = case node_attempt.persistent, step.persistence {
+        True, Some(p) -> {
+          use value <- result.try(case node_attempt.saved_input {
+            Some(encoded) -> codec.decode(p.input, encoded)
+            None -> Ok(produce_value())
           })
-        Failed(failure, recover_returned) ->
-          node.AttemptFailed(
-            failure: failure_to_node(failure),
-            recover: option.map(recover_returned, fn(recover_fn) {
-              fn(node_attempt: node.Attempt) {
-                fn() {
-                  to_erased_recovery(
-                    recover_fn(attempt_from_node(node_attempt)),
-                  )
-                }
-              }
-            }),
-          )
+          use encoded <- result.try(codec.encode(p.input, value))
+          use _ <- result.try(node_attempt.admit(encoded))
+          Ok(value)
+        }
+        _, _ -> Ok(produce_value())
+      }
+      case prepared {
+        Error(reason) -> node.AttemptBlocked(checkpoint.CodecFailure(reason))
+        Ok(value) ->
+          case step.attempt(value, node_attempt.key) {
+            Succeeded(output, undo_choice) ->
+              AttemptSucceeded(commit: fn(commit_store) {
+                #(
+                  commit_store
+                    |> store.put(id, output)
+                    |> store.put_record(id, #(
+                      value,
+                      output,
+                      has_undo(undo_choice),
+                    )),
+                  case undo_choice {
+                    NoUndo -> None
+                    UndoWith(run) -> Some(fn() { run() })
+                  },
+                )
+              })
+            Failed(failure, recover_returned) ->
+              node.AttemptFailed(
+                failure: failure_to_node(failure),
+                recover: option.map(recover_returned, fn(recover_fn) {
+                  fn(node_attempt: node.Attempt) {
+                    fn() {
+                      to_erased_recovery(
+                        recover_fn(
+                          attempt_from_node(node_attempt),
+                          compensation_key(node_attempt.key),
+                        ),
+                        value,
+                      )
+                    }
+                  }
+                }),
+              )
+          }
       }
     }
   }
@@ -687,11 +889,28 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
         }
         let attempt = attempt_from_node(node_attempt)
         fn() {
-          to_erased_recovery(decide_fn(
-            produce_value(),
-            crash_or_timeout,
-            attempt,
-          ))
+          let input = case
+            node_attempt.persistent,
+            step.persistence,
+            node_attempt.saved_input
+          {
+            True, Some(p), Some(encoded) -> codec.decode(p.input, encoded)
+            True, _, None -> Error("compensation has no admitted input")
+            _, _, _ -> Ok(produce_value())
+          }
+          case input {
+            Error(reason) -> node.EBlocked(checkpoint.CodecFailure(reason))
+            Ok(input) ->
+              to_erased_recovery(
+                decide_fn(
+                  input,
+                  crash_or_timeout,
+                  attempt,
+                  compensation_key(node_attempt.key),
+                ),
+                input,
+              )
+          }
         }
       }
     })
@@ -701,6 +920,221 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       id: id,
       address: address_to_node(address),
       deps: deps,
+      conditions: [],
+      persistence: option.map(step.persistence, fn(p) {
+        node.Persistence(
+          version: frame([
+            p.version,
+            codec.version(p.input),
+            codec.version(p.output),
+          ]),
+          recovery_undo_declared: step.recovery_undo_declared,
+          valid: !list.contains(
+            [p.version, codec.version(p.input), codec.version(p.output)],
+            "",
+          ),
+          freeze: fn(run_store, key) {
+            use pair <- result.try(case store.get_record(run_store, id) {
+              Ok(pair) -> Ok(pair)
+              Error(Nil) -> Error("missing checkpoint value")
+            })
+            let #(input, output, undoable) = pair
+            use _ <- result.try(
+              case undoable && !has_undo(step.undo_for(input, output, key)) {
+                True ->
+                  Error(
+                    "undo reconstruction contract returned NoUndo: "
+                    <> step.name,
+                  )
+                False -> Ok(Nil)
+              },
+            )
+            use input <- result.try(codec.encode(p.input, input))
+            use output <- result.try(codec.encode(p.output, output))
+            Ok([
+              input,
+              output,
+              case undoable {
+                True -> "undo"
+                False -> "none"
+              },
+            ])
+          },
+          thaw: fn(saved, _run_store, key) {
+            case saved {
+              [input, output, undo_kind] -> {
+                use input <- result.try(codec.decode(p.input, input))
+                use output <- result.try(codec.decode(p.output, output))
+                use undo <- result.try(case undo_kind {
+                  "none" -> Ok(None)
+                  "undo" ->
+                    case step.undo_for(input, output, key) {
+                      NoUndo ->
+                        Error("saved undo requires restore_undo: " <> step.name)
+                      UndoWith(run) -> Ok(Some(run))
+                    }
+                  _ -> Error("invalid undo capability")
+                })
+                Ok(fn(run_store) {
+                  #(
+                    run_store
+                      |> store.put(id, output)
+                      |> store.put_record(id, #(
+                        input,
+                        output,
+                        undo_kind == "undo",
+                      )),
+                    undo,
+                  )
+                })
+              }
+              _ -> Error("invalid saved step")
+            }
+          },
+          resume_compensation: fn(attempt, _run_store) {
+            fn() {
+              let key = compensation_key(attempt.key)
+              case attempt.saved_input {
+                None ->
+                  node.EBlocked(checkpoint.InvalidState(
+                    "compensation has no admitted input",
+                  ))
+                Some(encoded) ->
+                  case codec.decode(p.input, encoded) {
+                    Error(reason) ->
+                      node.EBlocked(checkpoint.CodecFailure(reason))
+                    Ok(input) ->
+                      case
+                        step.resolve_compensation(
+                          input,
+                          attempt_from_node(attempt),
+                          key,
+                        )
+                      {
+                        CompensationUnknown ->
+                          node.EBlocked(
+                            checkpoint.Uncertain(reconciliation.Required(
+                              step.name,
+                              reconciliation.Compensation,
+                              key,
+                            )),
+                          )
+                        CompensationResolved(recovery) ->
+                          to_erased_recovery(recovery, input)
+                      }
+                  }
+              }
+            }
+          },
+          resume_undo: fn(run_store, key) {
+            fn() {
+              use pair <- result.try(case store.get_record(run_store, id) {
+                Ok(pair) -> Ok(pair)
+                Error(Nil) ->
+                  Error(checkpoint.InvalidState("missing undo values"))
+              })
+              let #(input, output, _) = pair
+              case step.resolve_undo(input, output, key) {
+                UndoCompleted -> Ok(Ok(Nil))
+                UndoFailed(error) -> Ok(Error(error))
+                UndoUnknown ->
+                  Error(
+                    checkpoint.Uncertain(reconciliation.Required(
+                      step.name,
+                      reconciliation.Undo,
+                      key,
+                    )),
+                  )
+                UndoStillApplied ->
+                  case step.undo_for(input, output, key) {
+                    NoUndo ->
+                      Error(checkpoint.InvalidState("missing restored undo"))
+                    UndoWith(run) -> Ok(run())
+                  }
+              }
+            }
+          },
+          resume: fn(attempt, run_store) {
+            let produce = capture_input(run_store)
+            fn() {
+              let input = case attempt.saved_input {
+                None -> Ok(produce())
+                Some(encoded) -> codec.decode(p.input, encoded)
+              }
+              case input {
+                Error(reason) ->
+                  node.AttemptBlocked(checkpoint.CodecFailure(reason))
+                Ok(input) ->
+                  case attempt.saved_input {
+                    None ->
+                      case attempt.cancelled {
+                        True -> node.AttemptAbsent
+                        False -> prepare_attempt(attempt, run_store)()
+                      }
+                    Some(_) ->
+                      case p.resolve(input, attempt.key) {
+                        EffectUnknown ->
+                          node.AttemptBlocked(
+                            checkpoint.Uncertain(reconciliation.Required(
+                              step.name,
+                              reconciliation.Activity,
+                              attempt.key,
+                            )),
+                          )
+                        EffectAbsent ->
+                          case attempt.cancelled {
+                            True -> node.AttemptAbsent
+                            False -> prepare_attempt(attempt, run_store)()
+                          }
+                        EffectCompleted(output) -> {
+                          let undo =
+                            step.undo_for(input, output, undo_key(attempt.key))
+                          AttemptSucceeded(fn(run_store) {
+                            #(
+                              run_store
+                                |> store.put(id, output)
+                                |> store.put_record(id, #(
+                                  input,
+                                  output,
+                                  has_undo(undo),
+                                )),
+                              undo_option(undo),
+                            )
+                          })
+                        }
+                        EffectFailed(error) ->
+                          case step.decide_returned, step.compensates {
+                            None, True ->
+                              node.AttemptBlocked(checkpoint.InvalidState(
+                                "mapped recovery requires a decider after error mapping",
+                              ))
+                            decider, _ ->
+                              node.AttemptFailed(
+                                node.Returned(error),
+                                option.map(decider, fn(decide) {
+                                  fn(node_attempt) {
+                                    fn() {
+                                      to_erased_recovery(
+                                        decide(
+                                          input,
+                                          error,
+                                          attempt_from_node(node_attempt),
+                                          compensation_key(node_attempt.key),
+                                        ),
+                                        input,
+                                      )
+                                    }
+                                  }
+                                }),
+                              )
+                          }
+                      }
+                  }
+              }
+            }
+          },
+        )
+      }),
       max_attempts: step.max_attempts,
       timeout: step.timeout,
       undoable: step.undoable,
@@ -1288,4 +1722,202 @@ fn retype_empty_port(
     errors: input.errors,
     fetch: input.fetch,
   )
+}
+
+/// Status of an interrupted external attempt. Absence explicitly authorizes a
+/// retry under the original key; unknown never authorizes another effect.
+pub type EffectStatus(o, e) {
+  EffectCompleted(o)
+  EffectFailed(e)
+  EffectAbsent
+  EffectUnknown
+}
+
+type StepPersistence(i, o, e) {
+  StepPersistence(
+    version: String,
+    input: Codec(i),
+    output: Codec(o),
+    resolve: fn(i, String) -> EffectStatus(o, e),
+  )
+}
+
+/// Adds persistence capability to an ordinary step. Call after error mapping.
+/// The definition version covers callback semantics, including pure maps.
+pub fn recoverable(
+  step: Step(i, o, e, u),
+  version: String,
+  input: Codec(i),
+  output: Codec(o),
+  resolve: fn(i, String) -> EffectStatus(o, e),
+) -> Step(i, o, e, u) {
+  Step(
+    ..step,
+    persistence: Some(StepPersistence(version, input, output, resolve)),
+  )
+}
+
+/// Declares how to reconstruct undo from saved values and a stable key.
+/// Required for every persistent compensating step, including an explicit
+/// `NoUndo` declaration. The factory must be pure; checkpoints may call it to
+/// validate the capability before saving a Continue result.
+pub fn restore_undo(
+  step: Step(i, o, e, u),
+  restore: fn(i, o, String) -> Undo(u),
+) -> Step(i, o, e, u) {
+  Step(..step, undo_for: restore, recovery_undo_declared: True)
+}
+
+fn undo_option(undo: Undo(u)) -> Option(fn() -> Result(Nil, u)) {
+  case undo {
+    NoUndo -> None
+    UndoWith(run) -> Some(run)
+  }
+}
+
+pub type UndoStatus(u) {
+  UndoCompleted
+  UndoStillApplied
+  UndoFailed(u)
+  UndoUnknown
+}
+
+pub fn reconcile_undo(
+  step: Step(i, o, e, u),
+  resolve: fn(i, o, String) -> UndoStatus(u),
+) -> Step(i, o, e, u) {
+  Step(..step, resolve_undo: resolve)
+}
+
+/// Checks that every node can be restored and fingerprints its structural
+/// dependencies. Runtime node identifiers never enter the fingerprint.
+@internal
+pub fn persistence_stamp(
+  workflow: Workflow(i, o, e, u),
+  version: String,
+) -> Result(String, String) {
+  use _ <- result.try(case version {
+    "" -> Error("empty workflow version")
+    _ -> Ok(Nil)
+  })
+  use nodes <- result.try(
+    list.try_map(workflow.order, fn(id) {
+      let assert Ok(n) = dict.get(workflow.nodes, id)
+      use p <- result.try(case n.persistence {
+        Some(p) -> Ok(p)
+        None ->
+          Error(
+            "step requires persistence codecs: "
+            <> address_to_string(address_from_node(n.address)),
+          )
+      })
+      use _ <- result.try(case p.valid {
+        True -> Ok(Nil)
+        False -> Error("empty step or codec version")
+      })
+      use _ <- result.try(case n.compensates && !p.recovery_undo_declared {
+        True ->
+          Error(
+            "persistent compensation requires restore_undo: "
+            <> address_to_string(address_from_node(n.address)),
+          )
+        False -> Ok(Nil)
+      })
+      let position = fn(id) {
+        list.index_fold(workflow.order, -1, fn(found, candidate, index) {
+          case candidate == id {
+            True -> index
+            False -> found
+          }
+        })
+        |> int.to_string
+      }
+      Ok(
+        frame([
+          frame([
+            frame(n.address.scope),
+            n.address.name,
+            int.to_string(n.address.occurrence),
+          ]),
+          p.version,
+          case n.compensates {
+            True -> "compensates"
+            False -> "no-compensation"
+          },
+          int.to_string(n.max_attempts),
+          case n.timeout {
+            None -> "none"
+            Some(ms) -> int.to_string(ms)
+          },
+          case n.undoable {
+            True -> "undo"
+            False -> "no-undo"
+          },
+          frame(list.map(list.sort(n.deps, int.compare), position)),
+          frame(
+            list.map(n.conditions, fn(c) {
+              position(c.0)
+              <> case c.1 {
+                True -> "true"
+                False -> "false"
+              }
+            }),
+          ),
+        ]),
+      )
+    }),
+  )
+  Ok(frame([workflow.name, version, ..nodes]))
+}
+
+fn frame(parts: List(String)) -> String {
+  list.map(parts, fn(part) {
+    int.to_string(string.byte_size(part)) <> ":" <> part
+  })
+  |> string.concat
+}
+
+fn has_undo(undo: Undo(u)) -> Bool {
+  case undo {
+    NoUndo -> False
+    UndoWith(_) -> True
+  }
+}
+
+fn undo_key(attempt_key: String) -> String {
+  attempt_key
+  |> string.split(":")
+  |> list.reverse
+  |> list.drop(2)
+  |> list.reverse
+  |> string.join(":")
+  |> string.append(":undo")
+}
+
+/// Evidence for an interrupted compensation decision. Unknown keeps the run
+/// suspended. A resolved decision is subject to the original attempt budget
+/// and the execution's cancellation state.
+pub type CompensationStatus(o, e, u) {
+  CompensationResolved(Recovery(o, e, u))
+  CompensationUnknown
+}
+
+/// Reads external evidence using the original input, attempt, and stable key.
+/// The resolver must be safe to call repeatedly. Configuration order relative
+/// to `recoverable` does not matter.
+pub fn reconcile_compensation(
+  step: Step(i, o, e, u),
+  resolve: fn(i, Attempt, String) -> CompensationStatus(o, e, u),
+) -> Step(i, o, e, u) {
+  Step(..step, resolve_compensation: resolve)
+}
+
+fn compensation_key(attempt_key: String) -> String {
+  let parts = string.split(attempt_key, ":") |> list.reverse
+  let number = list.first(parts) |> result.unwrap("1")
+  parts
+  |> list.drop(2)
+  |> list.reverse
+  |> string.join(":")
+  |> string.append(":compensation:" <> number)
 }

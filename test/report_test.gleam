@@ -324,7 +324,6 @@ pub fn a_named_process_receives_the_report_test() {
 pub fn an_undeliverable_report_is_dropped_test() {
   let name = process.new_name("saga_report_nobody")
   let gate = probe.new_gate()
-  probe.open(gate)
   let log = process.new_subject()
   let assert Ok(run) =
     execution.start_reporting(
@@ -334,6 +333,7 @@ pub fn an_undeliverable_report_is_dropped_test() {
       to: process.named_subject(name),
     )
   let monitor = process.monitor(execution.pid(run))
+  probe.open(gate)
   let assert Ok(process.ProcessDown(_, _, process.Normal)) =
     process.new_selector()
     |> process.select_specific_monitor(monitor, fn(down) { down })

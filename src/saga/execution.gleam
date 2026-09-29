@@ -502,7 +502,7 @@ pub fn start_reporting(
       // A named subject with no process behind it raises; the outcome is
       // then dropped rather than crashing the coordinator as it exits.
       case
-        ffi.rescue(fn() { process.send(report, to_public_outcome(outcome)) })
+        ffi.rescue(fn() { process.send(report, from_coordinator(outcome)) })
       {
         ffi.Rescued(Nil) | ffi.Raised(..) -> Nil
       }
@@ -636,7 +636,7 @@ fn await_signal(
   case signal {
     GotOutcome(outcome) -> {
       process.demonitor_process(original_monitor)
-      Ok(to_public_outcome(outcome))
+      Ok(from_coordinator(outcome))
     }
     // A first-hand `Down` from the *original* monitor: it was still armed
     // when the coordinator exited, so this is a genuine, fresh report of
@@ -850,7 +850,8 @@ pub fn run_id(execution: Execution(o, e, u)) -> Int {
 // Internal <-> public type translation
 // ---------------------------------------------------------------------------
 
-fn to_public_outcome(
+@internal
+pub fn from_coordinator(
   outcome: coordinator.Outcome(o, e, u),
 ) -> Outcome(o, e, u) {
   case outcome {
