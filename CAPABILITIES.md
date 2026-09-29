@@ -1,15 +1,13 @@
 # Capabilities
 
-This inventory tracks saga's first local-execution release against the full
+This inventory tracks Saga's shared local and persistent runner against the full
 scope recorded in
 [`oversight/saga-design.md`](https://github.com/gleam-dream/oversight/blob/master/saga-design.md).
 Every capability below carries a status:
 
 - **Delivered** — implemented and covered by tests in this release.
-- **Deferred** — in the design's retained scope, not yet implemented. The
-  local model is built to stay compatible with these being added later
-  (definitions are pure descriptions, journals are closure lists, and
-  addresses are stable and deterministic), but no code for them ships here.
+- **Partial** — an independently usable slice exists, with named limits.
+- **Deferred** — in the design's retained scope, not yet implemented.
 - **Excluded** — ruled out for this design, not merely postponed.
 
 ## Delivered
@@ -77,6 +75,35 @@ occurrence)` distinguishes repeated occurrences of the same step name at
   that never reach the workflow's own output, as `DefinitionError.OrphanStep`
   — a step that would otherwise silently never run (e.g. a side-effecting
   step whose port is built but never consumed) is caught at `define` time.
+- One canonical `saga.Workflow` supports local and persistent execution through
+  the same concurrent coordinator. Local workflows require no codecs.
+- `saga.choose` constructs closed typed branches, executes only the selected
+  branch, and supports nesting and shared dependencies. Persistent execution
+  saves the selection before branch effects.
+- `saga/durable` checks persistence eligibility and compatibility, supplies
+  stable execution references, idempotent start/reconnect and persistent reads,
+  and restores concurrent DAG progress, retries/backoff, and rollback intent.
+- `saga/storage` defines atomic create, revision and ownership checks,
+  cancellation intent, and saved bytes. Memory and reference file adapters
+  exercise that contract. Additional adapters are optional integrations.
+- Checked input admission precedes effect dispatch. Saved outputs are reused;
+  unfinished effects and undo require explicit reconciliation. Caller or worker
+  death does not imply cancellation. See [DURABILITY.md](DURABILITY.md).
+
+- Interrupted compensation uses a stable key and an explicit resolver.
+  Resolved decisions retain retry budgets, cancellation, and undo semantics;
+  unknown decisions remain suspended without replaying the callback.
+- Persistent compensation requires an explicit undo reconstruction declaration
+  before execution. Actual Continue undo capability is checked before commit.
+- Typed storage, codec, checkpoint, and reconciliation failures survive saved
+  suspension and reads. Failed suspension recording retains distinct causes.
+- `saga/storage/conformance` supplies reusable protocol checks, exercised by
+  both adapters and the external consumer.
+
+## Partial
+
+- The reference file adapter coordinates one VM at a time and rewrites whole
+  snapshots. Distributed storage and delivery guarantees belong to adapters.
 
 ## Deferred
 
@@ -102,20 +129,17 @@ occurrence)` distinguishes repeated occurrences of the same step name at
   surface, which is itself deferred below. Width subtyping and broader
   assignability are explicitly out of scope until the conservative form
   exists.
-- Durable execution: PostgreSQL journals, persistent checkpoints,
-  freeze/thaw, snapshot codecs, restore, and migration.
-- Grind integration (`saga_grind` optional runner), durable per-activity
-  admission, and outbox.
+- Additional storage adapters and explicit checkpoint migrations.
+- Grind integration (`saga_grind` optional runner) and an outbox for
+  external job delivery. Saga itself has no Grind dependency.
 - Durable approvals, approval signals, and command dedup/revision checks.
-- Process-loss resume and Reactor-style in-memory halt/resume.
-- Persistence eligibility of local definitions (closure serialization is
-  Excluded, not deferred — see below).
+- Reactor-style explicit in-memory halt/resume commands.
 - Independent children, child admission, attachment, and compensation
   authority.
 - Post-success undo of a completed run (Reactor's `undo/2`) and local
   compensation authority beyond a single run's own rollback.
-- Value-dependent `and_then`, bounded homogeneous `traverse`/
-  `traverse_parallel`, and closed choice execution.
+- Value-dependent `and_then` and bounded homogeneous `traverse`/
+  `traverse_parallel`.
 - Runtime-authored schema graphs: registry, publication, unification, and
   Blueprint runtime contracts.
 - Draft/Published/Retired graph states, immutable executable graphs once
@@ -137,9 +161,6 @@ occurrence)` distinguishes repeated occurrences of the same step name at
 - Undo retry policy (Reactor retries undo up to 5 times) — a local undo
   failure is recorded once in `settlement.undo_failures`, not retried.
 - Supervisor-tree integration for coordinators.
-- Stable persisted identities and versions for steps (the design
-  laboratory's `StepId`/`Version`/`DefinitionId`); required only at a
-  future durable boundary, not for local, non-persisted execution.
 
 ## Excluded
 

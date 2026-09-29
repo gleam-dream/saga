@@ -23,6 +23,7 @@ gleam build --warnings-as-errors
 gleam test
 (cd examples/order_consumer && gleam format --check && gleam build --warnings-as-errors && gleam test && gleam run)
 scripts/check_negative.sh
+scripts/check_durable_restart.sh
 nix fmt
 nix flake check
 ```
@@ -33,3 +34,8 @@ acceptance test for saga's facade, not part of saga's own build.
 `scripts/check_negative.sh` proves the compiler-negative fixtures under
 `fixtures/negative/` still fail to compile, from that same external point
 of view.
+`scripts/check_durable_restart.sh` kills an Erlang VM after two concurrent
+external-effect probes but before Saga saves their outputs, then recovers
+the same DAG in a fresh VM through the file storage adapter. A second probe
+interrupts two compensation callbacks and resolves their saved decisions in a
+fresh VM without repeating either callback.

@@ -3,13 +3,11 @@
 A strongly-typed saga/DAG orchestrator for Gleam: typed dependency graphs
 instead of dynamic step maps.
 
-**Status:** first local-execution release, not yet published to Hex. Local,
-in-memory execution only — no durable journals, no persistence, no
-distributed coordination. See [CAPABILITIES.md](CAPABILITIES.md) for the
-full implemented/deferred/excluded inventory against
-[saga-design.md](https://github.com/gleam-dream/oversight/blob/master/saga-design.md)
-in [gleam-dream/oversight](https://github.com/gleam-dream/oversight), and
-[CHANGELOG.md](CHANGELOG.md) for what changed release to release.
+**Status:** unpublished local and optionally persistent workflow execution.
+One typed `saga.Workflow` supports concurrent DAGs and closed choices through
+the same runner. Persistence uses a storage contract with memory and reference
+file adapters; local execution needs no codecs or storage.
+See [DURABILITY.md](DURABILITY.md) for recovery and adapter guarantees.
 
 Behavioral reference: Reactor 1.0.6 (Elixir). Saga is a typed reimagining,
 not a port: dependencies are typed `Port` values checked by the compiler,
@@ -414,7 +412,7 @@ saga-design.md's original stance (see "Typed DAG construction" /
 saga-design.md:197-215, which reads "The scheduler must not use a central
 native-value structure like `Dict(NodeId, Dynamic)`").**
 
-Local execution (this repo's scope, before durable execution) originally
+The local execution path originally
 gave every node its own single-value mailbox cell, allocated fresh each
 time the workflow's builder ran. That kept the scheduler's own state
 free of any central heterogeneous map — each node's result lived only in
