@@ -98,6 +98,12 @@ increments toward the first local-execution release.
 
 ### Changed
 
+- **Built on the wave 2 Sinal API.** `saga/observation`'s descriptors use
+  Sinal's record builder and `fields.enum`, and the coordinator calls
+  `sinal.emit` directly, so an application that routes the `saga` prefix to
+  a `sinal/forwarder` moves saga's handlers off the coordinator. The event
+  names, keys, and Gleam types are unchanged; a kind field now also decodes
+  from an atom with the same name.
 - **Module docs render.** All 11 public modules wrote their module doc as
   `///` before the imports, which `gleam docs` attaches to the first
   definition, so no module page had an introduction. Each now starts with a

@@ -7,24 +7,21 @@
 //// module owns the events, not handler registration.
 ////
 //// A run's coordinator emits each event after the state change it
-//// describes, with `sinal.emit`. Handlers therefore run synchronously in
-//// the coordinator process: a slow handler delays the run. An emit error is
-//// ignored, because observations never control a run.
+//// describes, with `sinal.emit`. Handlers run synchronously in the
+//// coordinator process unless the application routes the `saga` prefix to
+//// a `sinal/forwarder`: a slow inline handler delays the run. Observations
+//// never control a run.
 ////
 //// ```gleam
 //// import saga/observation
 //// import sinal
 ////
-//// let assert Ok(id) = sinal.handler_id("checkout-run-stopped")
-//// let assert Ok(attachment) =
-////   sinal.observe(id, observation.run_stopped(), fn(_measurements, metadata) {
+//// let attachment =
+////   sinal.observe(observation.run_stopped(), fn(_measurements, metadata) {
 ////     log_outcome(metadata.workflow, metadata.outcome)
 ////   })
 //// ```
 
-import gleam/dynamic
-import gleam/dynamic/decode
-import gleam/erlang/atom
 import sinal.{type Event}
 import sinal/fields
 
@@ -144,16 +141,6 @@ fn outcome_kind_to_string(kind: OutcomeKind) -> String {
   }
 }
 
-fn outcome_kind_from_string(raw: String) -> Result(OutcomeKind, Nil) {
-  case raw {
-    "completed" -> Ok(OutcomeCompleted)
-    "failed" -> Ok(OutcomeFailed)
-    "cancelled" -> Ok(OutcomeCancelled)
-    "unresolved" -> Ok(OutcomeUnresolved)
-    _ -> Error(Nil)
-  }
-}
-
 fn attempt_kind_to_string(kind: AttemptKind) -> String {
   case kind {
     AttemptSucceeded -> "succeeded"
@@ -161,17 +148,6 @@ fn attempt_kind_to_string(kind: AttemptKind) -> String {
     AttemptCrashed -> "crashed"
     AttemptTimedOut -> "timed_out"
     AttemptInterrupted -> "interrupted"
-  }
-}
-
-fn attempt_kind_from_string(raw: String) -> Result(AttemptKind, Nil) {
-  case raw {
-    "succeeded" -> Ok(AttemptSucceeded)
-    "failed" -> Ok(AttemptFailed)
-    "crashed" -> Ok(AttemptCrashed)
-    "timed_out" -> Ok(AttemptTimedOut)
-    "interrupted" -> Ok(AttemptInterrupted)
-    _ -> Error(Nil)
   }
 }
 
@@ -186,18 +162,6 @@ fn decision_kind_to_string(kind: DecisionKind) -> String {
   }
 }
 
-fn decision_kind_from_string(raw: String) -> Result(DecisionKind, Nil) {
-  case raw {
-    "retry" -> Ok(DecisionRetry)
-    "continue" -> Ok(DecisionContinue)
-    "abort" -> Ok(DecisionAbort)
-    "hold" -> Ok(DecisionHold)
-    "crashed" -> Ok(DecisionCrashed)
-    "timed_out" -> Ok(DecisionTimedOut)
-    _ -> Error(Nil)
-  }
-}
-
 fn undo_kind_to_string(kind: UndoKind) -> String {
   case kind {
     UndoUndone -> "undone"
@@ -207,186 +171,129 @@ fn undo_kind_to_string(kind: UndoKind) -> String {
   }
 }
 
-fn undo_kind_from_string(raw: String) -> Result(UndoKind, Nil) {
-  case raw {
-    "undone" -> Ok(UndoUndone)
-    "failed" -> Ok(UndoFailedKind)
-    "crashed" -> Ok(UndoCrashedKind)
-    "timed_out" -> Ok(UndoTimedOutKind)
-    _ -> Error(Nil)
-  }
-}
-
-/// Declares a field whose wire representation is a native string but whose
-/// Gleam representation is a closed enum, via an explicit total
-/// `to_string`/partial `from_string` pair. Built directly on
-/// `sinal/fields.field` (same construction `fields.string` itself uses),
-/// so this stays inside Sinal's public field API with no extra FFI.
-fn closed_string_field(
-  key: String,
-  to_string: fn(a) -> String,
-  from_string: fn(String) -> Result(a, Nil),
-) -> fields.Fields(a) {
-  fields.field(
-    atom.create(key),
-    fn(value) { Ok(dynamic.string(to_string(value))) },
-    fn(raw) {
-      case decode.run(raw, decode.string) {
-        Error(_) ->
-          Error(fields.FieldDecodeError("Expected a native BEAM string"))
-        Ok(str) ->
-          case from_string(str) {
-            Ok(value) -> Ok(value)
-            Error(Nil) ->
-              Error(fields.FieldDecodeError(
-                "Unrecognized " <> key <> " kind: " <> str,
-              ))
-          }
-      }
-    },
-  )
-}
-
 /// The `[saga, run, start]` event descriptor.
 pub fn run_started() -> Event(RunStartMeasurements, RunMetadata) {
-  let name = [atom.create("saga"), atom.create("run"), atom.create("start")]
   let measurements =
-    fields.imap(
-      fields.int(atom.create("system_time")),
-      RunStartMeasurements,
-      fn(m) { m.system_time },
-    )
-  let assert Ok(meta_pair) =
-    fields.pair(
-      fields.string(atom.create("workflow")),
-      fields.int(atom.create("run")),
-    )
-  let metadata =
-    fields.imap(meta_pair, fn(pair) { RunMetadata(pair.0, pair.1) }, fn(m) {
-      #(m.workflow, m.run)
+    fields.record({
+      use system_time <- fields.parameter
+      RunStartMeasurements(system_time:)
     })
-  let assert Ok(event) = sinal.event(name, measurements, metadata)
-  event
+    |> fields.and(fields.int("system_time"), fn(m: RunStartMeasurements) {
+      m.system_time
+    })
+    |> fields.build
+  let metadata =
+    fields.record({
+      use workflow <- fields.parameter
+      use run <- fields.parameter
+      RunMetadata(workflow:, run:)
+    })
+    |> fields.and(fields.string("workflow"), fn(m: RunMetadata) { m.workflow })
+    |> fields.and(fields.int("run"), fn(m) { m.run })
+    |> fields.build
+  sinal.event(["saga", "run", "start"], measurements, metadata)
 }
 
 /// The `[saga, run, stop]` event descriptor.
 pub fn run_stopped() -> Event(RunStopMeasurements, RunStopMetadata) {
-  let name = [atom.create("saga"), atom.create("run"), atom.create("stop")]
-  let assert Ok(meas_pair1) =
-    fields.pair(
-      fields.int(atom.create("duration")),
-      fields.int(atom.create("undone")),
-    )
-  let assert Ok(meas_pair2) =
-    fields.pair(
-      fields.int(atom.create("undo_failures")),
-      fields.int(atom.create("interrupted")),
-    )
-  let assert Ok(meas_all) = fields.pair(meas_pair1, meas_pair2)
   let measurements =
-    fields.imap(
-      meas_all,
-      fn(p) {
-        let #(#(duration, undone), #(undo_failures, interrupted)) = p
-        RunStopMeasurements(duration, undone, undo_failures, interrupted)
-      },
-      fn(m) { #(#(m.duration, m.undone), #(m.undo_failures, m.interrupted)) },
-    )
-  let assert Ok(meta_pair1) =
-    fields.pair(
-      fields.string(atom.create("workflow")),
-      fields.int(atom.create("run")),
-    )
-  let assert Ok(meta_all) =
-    fields.pair(
-      meta_pair1,
-      closed_string_field(
-        "outcome",
-        outcome_kind_to_string,
-        outcome_kind_from_string,
-      ),
-    )
+    fields.record({
+      use duration <- fields.parameter
+      use undone <- fields.parameter
+      use undo_failures <- fields.parameter
+      use interrupted <- fields.parameter
+      RunStopMeasurements(duration:, undone:, undo_failures:, interrupted:)
+    })
+    |> fields.and(fields.int("duration"), fn(m: RunStopMeasurements) {
+      m.duration
+    })
+    |> fields.and(fields.int("undone"), fn(m) { m.undone })
+    |> fields.and(fields.int("undo_failures"), fn(m) { m.undo_failures })
+    |> fields.and(fields.int("interrupted"), fn(m) { m.interrupted })
+    |> fields.build
   let metadata =
-    fields.imap(
-      meta_all,
-      fn(p) {
-        let #(#(workflow, run), outcome) = p
-        RunStopMetadata(workflow, run, outcome)
-      },
-      fn(m) { #(#(m.workflow, m.run), m.outcome) },
+    fields.record({
+      use workflow <- fields.parameter
+      use run <- fields.parameter
+      use outcome <- fields.parameter
+      RunStopMetadata(workflow:, run:, outcome:)
+    })
+    |> fields.and(fields.string("workflow"), fn(m: RunStopMetadata) {
+      m.workflow
+    })
+    |> fields.and(fields.int("run"), fn(m) { m.run })
+    |> fields.and(
+      fields.enum(
+        "outcome",
+        [OutcomeCompleted, OutcomeFailed, OutcomeCancelled, OutcomeUnresolved],
+        outcome_kind_to_string,
+      ),
+      fn(m) { m.outcome },
     )
-  let assert Ok(event) = sinal.event(name, measurements, metadata)
-  event
+    |> fields.build
+  sinal.event(["saga", "run", "stop"], measurements, metadata)
 }
 
 /// The `[saga, step, start]` event descriptor.
 pub fn step_started() -> Event(StepStartMeasurements, StepMetadata) {
-  let name = [atom.create("saga"), atom.create("step"), atom.create("start")]
   let measurements =
-    fields.imap(
-      fields.int(atom.create("system_time")),
-      StepStartMeasurements,
-      fn(m) { m.system_time },
-    )
-  let metadata = step_metadata_fields()
-  let assert Ok(event) = sinal.event(name, measurements, metadata)
-  event
-}
-
-fn step_metadata_fields() -> fields.Fields(StepMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      fields.string(atom.create("workflow")),
-      fields.int(atom.create("run")),
-    )
-  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("step")))
-  let assert Ok(p3) = fields.pair(p2, fields.int(atom.create("attempt")))
-  fields.imap(
-    p3,
-    fn(p) {
-      let #(#(#(workflow, run), step), attempt) = p
-      StepMetadata(workflow, run, step, attempt)
-    },
-    fn(m) { #(#(#(m.workflow, m.run), m.step), m.attempt) },
-  )
+    fields.record({
+      use system_time <- fields.parameter
+      StepStartMeasurements(system_time:)
+    })
+    |> fields.and(fields.int("system_time"), fn(m: StepStartMeasurements) {
+      m.system_time
+    })
+    |> fields.build
+  let metadata =
+    fields.record({
+      use workflow <- fields.parameter
+      use run <- fields.parameter
+      use step <- fields.parameter
+      use attempt <- fields.parameter
+      StepMetadata(workflow:, run:, step:, attempt:)
+    })
+    |> fields.and(fields.string("workflow"), fn(m: StepMetadata) { m.workflow })
+    |> fields.and(fields.int("run"), fn(m) { m.run })
+    |> fields.and(fields.string("step"), fn(m) { m.step })
+    |> fields.and(fields.int("attempt"), fn(m) { m.attempt })
+    |> fields.build
+  sinal.event(["saga", "step", "start"], measurements, metadata)
 }
 
 /// The `[saga, step, stop]` event descriptor.
 pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
-  let name = [atom.create("saga"), atom.create("step"), atom.create("stop")]
-  let measurements =
-    fields.imap(
-      fields.int(atom.create("duration")),
-      StepStopMeasurements,
-      fn(m) { m.duration },
-    )
-  let assert Ok(p1) =
-    fields.pair(
-      fields.string(atom.create("workflow")),
-      fields.int(atom.create("run")),
-    )
-  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("step")))
-  let assert Ok(p3) = fields.pair(p2, fields.int(atom.create("attempt")))
-  let assert Ok(p4) =
-    fields.pair(
-      p3,
-      closed_string_field(
-        "result",
-        attempt_kind_to_string,
-        attempt_kind_from_string,
-      ),
-    )
   let metadata =
-    fields.imap(
-      p4,
-      fn(p) {
-        let #(#(#(#(workflow, run), step), attempt), result) = p
-        StepStopMetadata(workflow, run, step, attempt, result)
-      },
-      fn(m) { #(#(#(#(m.workflow, m.run), m.step), m.attempt), m.result) },
+    fields.record({
+      use workflow <- fields.parameter
+      use run <- fields.parameter
+      use step <- fields.parameter
+      use attempt <- fields.parameter
+      use result <- fields.parameter
+      StepStopMetadata(workflow:, run:, step:, attempt:, result:)
+    })
+    |> fields.and(fields.string("workflow"), fn(m: StepStopMetadata) {
+      m.workflow
+    })
+    |> fields.and(fields.int("run"), fn(m) { m.run })
+    |> fields.and(fields.string("step"), fn(m) { m.step })
+    |> fields.and(fields.int("attempt"), fn(m) { m.attempt })
+    |> fields.and(
+      fields.enum(
+        "result",
+        [
+          AttemptSucceeded,
+          AttemptFailed,
+          AttemptCrashed,
+          AttemptTimedOut,
+          AttemptInterrupted,
+        ],
+        attempt_kind_to_string,
+      ),
+      fn(m) { m.result },
     )
-  let assert Ok(event) = sinal.event(name, measurements, metadata)
-  event
+    |> fields.build
+  sinal.event(["saga", "step", "stop"], stop_measurements(), metadata)
 }
 
 /// The `[saga, step, compensate, stop]` event descriptor.
@@ -394,81 +301,76 @@ pub fn compensation_stopped() -> Event(
   StepStopMeasurements,
   CompensationMetadata,
 ) {
-  let name = [
-    atom.create("saga"),
-    atom.create("step"),
-    atom.create("compensate"),
-    atom.create("stop"),
-  ]
-  let measurements =
-    fields.imap(
-      fields.int(atom.create("duration")),
-      StepStopMeasurements,
-      fn(m) { m.duration },
-    )
-  let assert Ok(p1) =
-    fields.pair(
-      fields.string(atom.create("workflow")),
-      fields.int(atom.create("run")),
-    )
-  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("step")))
-  let assert Ok(p3) = fields.pair(p2, fields.int(atom.create("attempt")))
-  let assert Ok(p4) =
-    fields.pair(
-      p3,
-      closed_string_field(
-        "decision",
-        decision_kind_to_string,
-        decision_kind_from_string,
-      ),
-    )
   let metadata =
-    fields.imap(
-      p4,
-      fn(p) {
-        let #(#(#(#(workflow, run), step), attempt), decision) = p
-        CompensationMetadata(workflow, run, step, attempt, decision)
-      },
-      fn(m) { #(#(#(#(m.workflow, m.run), m.step), m.attempt), m.decision) },
+    fields.record({
+      use workflow <- fields.parameter
+      use run <- fields.parameter
+      use step <- fields.parameter
+      use attempt <- fields.parameter
+      use decision <- fields.parameter
+      CompensationMetadata(workflow:, run:, step:, attempt:, decision:)
+    })
+    |> fields.and(fields.string("workflow"), fn(m: CompensationMetadata) {
+      m.workflow
+    })
+    |> fields.and(fields.int("run"), fn(m) { m.run })
+    |> fields.and(fields.string("step"), fn(m) { m.step })
+    |> fields.and(fields.int("attempt"), fn(m) { m.attempt })
+    |> fields.and(
+      fields.enum(
+        "decision",
+        [
+          DecisionRetry,
+          DecisionContinue,
+          DecisionAbort,
+          DecisionHold,
+          DecisionCrashed,
+          DecisionTimedOut,
+        ],
+        decision_kind_to_string,
+      ),
+      fn(m) { m.decision },
     )
-  let assert Ok(event) = sinal.event(name, measurements, metadata)
-  event
+    |> fields.build
+  sinal.event(
+    ["saga", "step", "compensate", "stop"],
+    stop_measurements(),
+    metadata,
+  )
 }
 
 /// The `[saga, step, undo, stop]` event descriptor.
 pub fn undo_stopped() -> Event(StepStopMeasurements, UndoMetadata) {
-  let name = [
-    atom.create("saga"),
-    atom.create("step"),
-    atom.create("undo"),
-    atom.create("stop"),
-  ]
-  let measurements =
-    fields.imap(
-      fields.int(atom.create("duration")),
-      StepStopMeasurements,
-      fn(m) { m.duration },
-    )
-  let assert Ok(p1) =
-    fields.pair(
-      fields.string(atom.create("workflow")),
-      fields.int(atom.create("run")),
-    )
-  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("step")))
-  let assert Ok(p3) =
-    fields.pair(
-      p2,
-      closed_string_field("result", undo_kind_to_string, undo_kind_from_string),
-    )
   let metadata =
-    fields.imap(
-      p3,
-      fn(p) {
-        let #(#(workflow, run), step) = p.0
-        UndoMetadata(workflow, run, step, p.1)
-      },
-      fn(m) { #(#(#(m.workflow, m.run), m.step), m.result) },
+    fields.record({
+      use workflow <- fields.parameter
+      use run <- fields.parameter
+      use step <- fields.parameter
+      use result <- fields.parameter
+      UndoMetadata(workflow:, run:, step:, result:)
+    })
+    |> fields.and(fields.string("workflow"), fn(m: UndoMetadata) { m.workflow })
+    |> fields.and(fields.int("run"), fn(m) { m.run })
+    |> fields.and(fields.string("step"), fn(m) { m.step })
+    |> fields.and(
+      fields.enum(
+        "result",
+        [UndoUndone, UndoFailedKind, UndoCrashedKind, UndoTimedOutKind],
+        undo_kind_to_string,
+      ),
+      fn(m) { m.result },
     )
-  let assert Ok(event) = sinal.event(name, measurements, metadata)
-  event
+    |> fields.build
+  sinal.event(["saga", "step", "undo", "stop"], stop_measurements(), metadata)
+}
+
+fn stop_measurements() -> fields.Fields(StepStopMeasurements) {
+  fields.record({
+    use duration <- fields.parameter
+    StepStopMeasurements(duration:)
+  })
+  |> fields.and(fields.int("duration"), fn(m: StepStopMeasurements) {
+    m.duration
+  })
+  |> fields.build
 }
