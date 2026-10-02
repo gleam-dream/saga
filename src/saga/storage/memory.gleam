@@ -1,15 +1,34 @@
-/// An in-memory adapter owned by a dedicated process. It outlives execution
-/// workers, but not the VM. Dropping it explicitly releases its resources.
+//// Stores one execution's checkpoint in memory, in a dedicated process.
+////
+//// Use this adapter for tests and for `saga/durable` runs that must survive
+//// the loss of their runner but not of the VM. `new` spawns an unlinked
+//// process that holds the record; it outlives the runners that use it and
+//// stops only when `close` is called or the VM stops. Use
+//// `saga/storage/file` when a run must survive VM shutdown.
+////
+//// ```gleam
+//// import saga/storage/memory
+////
+//// let memory = memory.new()
+//// let storage = memory.storage(memory)
+//// // ... durable.start_or_reconnect(storage, ..) and durable.drive(storage, ..)
+//// memory.close(memory)
+//// ```
+
 import saga/storage.{type Storage}
 
+/// The process that holds one in-memory record.
 pub type Memory
 
+/// Spawns an unlinked process holding no record.
 @external(erlang, "saga_storage", "memory_new")
 pub fn new() -> Memory
 
+/// Stops the process and discards its record.
 @external(erlang, "saga_storage", "memory_close")
 pub fn close(memory: Memory) -> Nil
 
+/// Returns the `Storage` operations for this memory's record.
 pub fn storage(memory: Memory) -> Storage {
   storage.Storage(
     create: fn(data) { create(memory, data) },

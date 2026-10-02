@@ -1,39 +1,65 @@
-/// Run lifecycle for a `saga.Workflow`: config and its validation, starting
-/// a run, waiting for or inspecting its outcome, and cancellation.
-///
-/// **Who learns the outcome.** `run` returns it; `start` delivers it to the
-/// starting process, which alone may `await` it; `start_reporting` delivers
-/// it as one message to a caller-supplied `Subject`, which a surviving
-/// process can hold even after the starting process exits, or which the
-/// starting process can add to its own `Selector`. In every case the
-/// starting process owns the run: its exit cancels the run, which still
-/// settles and rolls back before ending.
-///
-/// `run`/`start`/`await`/`cancel`/`progress` are implemented with bounded
-/// concurrency, retry/compensation, reverse-order undo, a run deadline,
-/// per-step timeouts, and cancellation settlement of active siblings.
-///
-/// **Resource bounds.** Worst-case run time is bounded by
-/// `deadline + settle_timeout + (undone entries + compensations) *
-/// cleanup_timeout`: once a run stops admitting new work (on a step
-/// failure, the deadline, or a cancellation), in-flight attempts and
-/// compensations are given up to `settle_timeout` to finish on their own
-/// before being killed, and each compensation decision or undo action
-/// individually is bounded by `cleanup_timeout`.
-///
-/// **Cancellation never reverses an unknown effect.** A step whose attempt
-/// or compensation is killed — by its own `timeout`, or by the settle
-/// window closing — is reported `interrupted`: its effect is unknown and is
-/// never journaled or undone. Only steps that are known to have completed
-/// are undone.
-///
-/// **Known results and unknown effects.** Every action a run performs — a
-/// step attempt, a compensation decision, an undo — ends either with a
-/// known result (it returned `Ok` or a typed error) or with an unknown
-/// effect (it crashed or its process exited, it was killed at its time
-/// bound, or it was killed when the settle window closed).
-/// `unknown_effects(outcome)` names every action of the second kind, for
-/// every outcome kind; it is `[]` exactly when every action returned.
+//// Runs a `saga.Workflow`: run configuration and its validation, starting
+//// a run, waiting for or inspecting its outcome, and cancellation.
+////
+//// Use this module to execute a workflow defined with `saga` in memory.
+//// `run` is the ordinary path: it starts a run and blocks until it ends.
+//// `start` and `start_reporting` run without blocking; `await`, `progress`
+//// and `cancel` act on the returned `Execution`. `saga/durable` drives the
+//// same workflow with saved checkpoints and returns the same `Outcome`, and
+//// `saga/testing` polls `progress` for tests.
+////
+//// ```gleam
+//// import gleam/option.{Some}
+//// import saga/execution
+////
+//// let config =
+////   execution.Config(..execution.config(), max_concurrency: 4, deadline: Some(5000))
+//// case execution.run(workflow, "order-1", config) {
+////   Ok(execution.Completed(receipt)) -> Ok(receipt)
+////   Ok(outcome) -> Error(execution.unknown_effects(outcome))
+////   Error(_run_error) -> Error([])
+//// }
+//// ```
+////
+//// **Defaults.** `config()` gives one concurrent task per scheduler, no run
+//// deadline, a 60 second per-attempt `step_timeout`, a 5 second
+//// `settle_timeout` and a 5 second `cleanup_timeout`. `start` waits up to 5
+//// seconds for the run's coordinator to start. `run` waits until the run
+//// ends.
+////
+//// **Who learns the outcome.** `run` returns it; `start` delivers it to the
+//// starting process, which alone may `await` it; `start_reporting` delivers
+//// it as one message to a caller-supplied `Subject`, which a surviving
+//// process can hold even after the starting process exits, or which the
+//// starting process can add to its own `Selector`. In every case the
+//// starting process owns the run: its exit cancels the run, which still
+//// settles and rolls back before ending.
+////
+//// **Resource bounds.** Once a run stops admitting new work (on a step
+//// failure, the deadline, or a cancellation), in-flight attempts and
+//// compensations get up to `settle_timeout` to finish on their own before
+//// they are killed, and each compensation decision or undo action is
+//// bounded by `cleanup_timeout`. With a `deadline`, worst-case run time is
+//// therefore `deadline + settle_timeout + (undone entries + compensations) *
+//// cleanup_timeout`. Without one, a run lasts as long as its steps: each
+//// attempt is bounded by its timeout, if it has one, and each step by its
+//// attempt budget and the `RetryAfter` delays its `compensate` decider
+//// chooses.
+////
+//// **Cancellation never reverses an unknown effect.** A step whose attempt
+//// or compensation is killed — by its own `timeout`, or by the settle
+//// window closing — is reported `interrupted`: its effect is unknown and is
+//// never journaled or undone. Only steps that are known to have completed
+//// are undone.
+////
+//// **Known results and unknown effects.** Every action a run performs — a
+//// step attempt, a compensation decision, an undo — ends either with a
+//// known result (it returned `Ok` or a typed error) or with an unknown
+//// effect (it crashed or its process exited, it was killed at its time
+//// bound, or it was killed when the settle window closed).
+//// `unknown_effects(outcome)` names every action of the second kind, for
+//// every outcome kind; it is `[]` exactly when every action returned.
+
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}

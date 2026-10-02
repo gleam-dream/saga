@@ -1,7 +1,27 @@
-/// Reusable contract checks for third-party storage adapters. Every fixture
-/// must address a fresh execution and allow concurrent callers in one VM.
-/// These checks exercise the storage protocol; they do not certify cross-node
-/// fencing, media durability, or power-loss behavior.
+//// Checks a storage adapter against the `saga/storage` contract.
+////
+//// Use this module from a third-party adapter's own tests; it needs no test
+//// framework. `run` creates a fresh fixture for each scenario and checks
+//// atomic creation, unchanged data after refused writes, exclusive
+//// ownership, revision and generation checks, cancellation races, release,
+//// and ownership recovery after process death. Every fixture must address a
+//// fresh execution and allow concurrent callers in one VM. The memory and
+//// file adapters pass the same checks. A pass covers the storage protocol
+//// within one VM; it does not certify cross-node fencing, media durability
+//// or power-loss behavior.
+////
+//// ```gleam
+//// import saga/storage/conformance
+////
+//// let result =
+////   conformance.run(fn() {
+////     let resource = create_fresh_test_execution()
+////     Ok(conformance.Fixture(adapter.storage(resource), fn() {
+////       delete_test_execution(resource)
+////     }))
+////   }, 5000)
+//// ```
+
 import gleam/erlang/process
 import gleam/list
 import gleam/result

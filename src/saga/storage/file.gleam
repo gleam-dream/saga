@@ -1,8 +1,24 @@
-/// A reference file adapter. One Erlang VM may access a path at a time.
-/// Uses synced writes and atomic replacement; paths must be canonical absolute
-/// paths. Cross-VM writers and power-loss directory durability are unsupported.
+//// Stores one execution's checkpoint in a file, so a durable run can be
+//// recovered in a fresh VM.
+////
+//// Use this adapter when a `saga/durable` run must survive VM shutdown and
+//// one VM at a time accesses the file. It writes a synced temporary file
+//// and atomically renames it over the path, and keeps ownership locks
+//// within the VM. Paths must be canonical absolute paths, and the caller
+//// creates the parent directory. Concurrent VMs, path aliases and
+//// power-loss durability of the directory are unsupported. Use
+//// `saga/storage/memory` when a run need not outlive the VM.
+////
+//// ```gleam
+//// import saga/storage/file
+////
+//// let storage = file.open("/var/lib/shop/checkout-123.saga")
+//// ```
+
 import saga/storage.{type Storage}
 
+/// Returns the `Storage` for the execution saved at `path`. Opening does no
+/// I/O; each operation reads or writes the file.
 pub fn open(path: String) -> Storage {
   storage.Storage(
     create: fn(data) { create(path, data) },

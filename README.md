@@ -23,7 +23,7 @@ pub type CheckoutError {
   OutOfStock
 }
 
-pub fn build_checkout(order_id: String) {
+pub fn checkout() {
   saga.define("checkout", fn(input) {
     let reserved =
       input
@@ -34,22 +34,23 @@ pub fn build_checkout(order_id: String) {
             False -> Error(OutOfStock)
           }
         })
-        |> saga.undo(fn(_id, _reserved) { release_inventory(order_id) }),
+        |> saga.undo(fn(id, _reserved) { release_inventory(id) }),
       )
     reserved
     |> saga.perform(saga.step("charge_payment", fn(id) { charge(id) }))
   })
 }
 
-pub fn run_checkout(order_id: String) {
-  let assert Ok(workflow) = build_checkout(order_id)
+pub fn run_checkout(workflow, order_id: String) {
   execution.run(workflow, order_id, execution.config())
 }
 ```
 
-`define` validates the workflow once (names, attempt budgets, timeouts, and
-that every `Port` used belongs to this build); `execution.run` blocks until
-the run finishes and returns `Completed`, `Failed(cause, settlement)`,
+Define the workflow once, at startup, and run it for each order: the order
+id is the run's input, not part of the definition. `define` validates the
+workflow once (names, attempt budgets, timeouts, and that every `Port` used
+belongs to this build); `execution.run` blocks until the run finishes and
+returns `Completed`, `CompletedWithUnknownEffects`, `Failed(cause, settlement)`,
 `Cancelled(reason, settlement)`, or `Unresolved(step, evidence, settlement)`.
 
 ## The advanced path
