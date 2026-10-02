@@ -98,6 +98,11 @@ increments toward the first local-execution release.
 
 ### Changed
 
+- **`gleam_stdlib` range widened to `>= 0.70.0 and < 2.0.0`** in saga,
+  `examples/order_consumer` and `bench`, so an application can combine
+  saga with packages that need `gleam_stdlib` 1.x. Each manifest now
+  resolves `gleam_stdlib` 1.0.5; no source change was needed.
+
 - **Performance: the workflow build function now runs exactly once, at
   `define`, never again per run.** Previously every `execution.run`/`start`
   re-evaluated the builder fresh and checked its shape against the
