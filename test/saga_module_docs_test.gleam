@@ -2,7 +2,7 @@ import gleam/list
 import gleam/string
 import gleeunit/should
 
-@external(erlang, "module_docs_ffi", "public_sources")
+@external(erlang, "saga_module_docs_ffi", "public_sources")
 fn public_sources() -> List(#(String, String))
 
 /// `gleam docs` renders a module doc only from `////` lines; a `///` comment
