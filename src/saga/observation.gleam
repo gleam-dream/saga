@@ -173,112 +173,94 @@ fn undo_kind_to_string(kind: UndoKind) -> String {
 
 /// The `[saga, run, start]` event descriptor.
 pub fn run_started() -> Event(RunStartMeasurements, RunMetadata) {
-  let measurements =
-    fields.record({
-      use system_time <- fields.parameter
-      RunStartMeasurements(system_time:)
-    })
-    |> fields.and(fields.int("system_time"), fn(m: RunStartMeasurements) {
+  let measurements = {
+    use system_time <- fields.include(fields.int("system_time"), get: fn(m) {
       m.system_time
     })
-    |> fields.build
-  let metadata =
-    fields.record({
-      use workflow <- fields.parameter
-      use run <- fields.parameter
-      RunMetadata(workflow:, run:)
+    fields.success(RunStartMeasurements(system_time:))
+  }
+  let metadata = {
+    use workflow <- fields.include(fields.string("workflow"), get: fn(m) {
+      m.workflow
     })
-    |> fields.and(fields.string("workflow"), fn(m: RunMetadata) { m.workflow })
-    |> fields.and(fields.int("run"), fn(m) { m.run })
-    |> fields.build
+    use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    fields.success(RunMetadata(workflow:, run:))
+  }
   sinal.event(["saga", "run", "start"], measurements, metadata)
 }
 
 /// The `[saga, run, stop]` event descriptor.
 pub fn run_stopped() -> Event(RunStopMeasurements, RunStopMetadata) {
-  let measurements =
-    fields.record({
-      use duration <- fields.parameter
-      use undone <- fields.parameter
-      use undo_failures <- fields.parameter
-      use interrupted <- fields.parameter
-      RunStopMeasurements(duration:, undone:, undo_failures:, interrupted:)
-    })
-    |> fields.and(fields.int("duration"), fn(m: RunStopMeasurements) {
+  let measurements = {
+    use duration <- fields.include(fields.int("duration"), get: fn(m) {
       m.duration
     })
-    |> fields.and(fields.int("undone"), fn(m) { m.undone })
-    |> fields.and(fields.int("undo_failures"), fn(m) { m.undo_failures })
-    |> fields.and(fields.int("interrupted"), fn(m) { m.interrupted })
-    |> fields.build
-  let metadata =
-    fields.record({
-      use workflow <- fields.parameter
-      use run <- fields.parameter
-      use outcome <- fields.parameter
-      RunStopMetadata(workflow:, run:, outcome:)
+    use undone <- fields.include(fields.int("undone"), get: fn(m) { m.undone })
+    use undo_failures <- fields.include(fields.int("undo_failures"), get: fn(m) {
+      m.undo_failures
     })
-    |> fields.and(fields.string("workflow"), fn(m: RunStopMetadata) {
+    use interrupted <- fields.include(fields.int("interrupted"), get: fn(m) {
+      m.interrupted
+    })
+    fields.success(RunStopMeasurements(
+      duration:,
+      undone:,
+      undo_failures:,
+      interrupted:,
+    ))
+  }
+  let metadata = {
+    use workflow <- fields.include(fields.string("workflow"), get: fn(m) {
       m.workflow
     })
-    |> fields.and(fields.int("run"), fn(m) { m.run })
-    |> fields.and(
+    use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use outcome <- fields.include(
       fields.enum(
         "outcome",
         [OutcomeCompleted, OutcomeFailed, OutcomeCancelled, OutcomeUnresolved],
         outcome_kind_to_string,
       ),
-      fn(m) { m.outcome },
+      get: fn(m) { m.outcome },
     )
-    |> fields.build
+    fields.success(RunStopMetadata(workflow:, run:, outcome:))
+  }
   sinal.event(["saga", "run", "stop"], measurements, metadata)
 }
 
 /// The `[saga, step, start]` event descriptor.
 pub fn step_started() -> Event(StepStartMeasurements, StepMetadata) {
-  let measurements =
-    fields.record({
-      use system_time <- fields.parameter
-      StepStartMeasurements(system_time:)
-    })
-    |> fields.and(fields.int("system_time"), fn(m: StepStartMeasurements) {
+  let measurements = {
+    use system_time <- fields.include(fields.int("system_time"), get: fn(m) {
       m.system_time
     })
-    |> fields.build
-  let metadata =
-    fields.record({
-      use workflow <- fields.parameter
-      use run <- fields.parameter
-      use step <- fields.parameter
-      use attempt <- fields.parameter
-      StepMetadata(workflow:, run:, step:, attempt:)
+    fields.success(StepStartMeasurements(system_time:))
+  }
+  let metadata = {
+    use workflow <- fields.include(fields.string("workflow"), get: fn(m) {
+      m.workflow
     })
-    |> fields.and(fields.string("workflow"), fn(m: StepMetadata) { m.workflow })
-    |> fields.and(fields.int("run"), fn(m) { m.run })
-    |> fields.and(fields.string("step"), fn(m) { m.step })
-    |> fields.and(fields.int("attempt"), fn(m) { m.attempt })
-    |> fields.build
+    use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
+    use attempt <- fields.include(fields.int("attempt"), get: fn(m) {
+      m.attempt
+    })
+    fields.success(StepMetadata(workflow:, run:, step:, attempt:))
+  }
   sinal.event(["saga", "step", "start"], measurements, metadata)
 }
 
 /// The `[saga, step, stop]` event descriptor.
 pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
-  let metadata =
-    fields.record({
-      use workflow <- fields.parameter
-      use run <- fields.parameter
-      use step <- fields.parameter
-      use attempt <- fields.parameter
-      use result <- fields.parameter
-      StepStopMetadata(workflow:, run:, step:, attempt:, result:)
-    })
-    |> fields.and(fields.string("workflow"), fn(m: StepStopMetadata) {
+  let metadata = {
+    use workflow <- fields.include(fields.string("workflow"), get: fn(m) {
       m.workflow
     })
-    |> fields.and(fields.int("run"), fn(m) { m.run })
-    |> fields.and(fields.string("step"), fn(m) { m.step })
-    |> fields.and(fields.int("attempt"), fn(m) { m.attempt })
-    |> fields.and(
+    use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
+    use attempt <- fields.include(fields.int("attempt"), get: fn(m) {
+      m.attempt
+    })
+    use result <- fields.include(
       fields.enum(
         "result",
         [
@@ -290,9 +272,10 @@ pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
         ],
         attempt_kind_to_string,
       ),
-      fn(m) { m.result },
+      get: fn(m) { m.result },
     )
-    |> fields.build
+    fields.success(StepStopMetadata(workflow:, run:, step:, attempt:, result:))
+  }
   sinal.event(["saga", "step", "stop"], stop_measurements(), metadata)
 }
 
@@ -301,22 +284,16 @@ pub fn compensation_stopped() -> Event(
   StepStopMeasurements,
   CompensationMetadata,
 ) {
-  let metadata =
-    fields.record({
-      use workflow <- fields.parameter
-      use run <- fields.parameter
-      use step <- fields.parameter
-      use attempt <- fields.parameter
-      use decision <- fields.parameter
-      CompensationMetadata(workflow:, run:, step:, attempt:, decision:)
-    })
-    |> fields.and(fields.string("workflow"), fn(m: CompensationMetadata) {
+  let metadata = {
+    use workflow <- fields.include(fields.string("workflow"), get: fn(m) {
       m.workflow
     })
-    |> fields.and(fields.int("run"), fn(m) { m.run })
-    |> fields.and(fields.string("step"), fn(m) { m.step })
-    |> fields.and(fields.int("attempt"), fn(m) { m.attempt })
-    |> fields.and(
+    use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
+    use attempt <- fields.include(fields.int("attempt"), get: fn(m) {
+      m.attempt
+    })
+    use decision <- fields.include(
       fields.enum(
         "decision",
         [
@@ -329,9 +306,16 @@ pub fn compensation_stopped() -> Event(
         ],
         decision_kind_to_string,
       ),
-      fn(m) { m.decision },
+      get: fn(m) { m.decision },
     )
-    |> fields.build
+    fields.success(CompensationMetadata(
+      workflow:,
+      run:,
+      step:,
+      attempt:,
+      decision:,
+    ))
+  }
   sinal.event(
     ["saga", "step", "compensate", "stop"],
     stop_measurements(),
@@ -341,36 +325,28 @@ pub fn compensation_stopped() -> Event(
 
 /// The `[saga, step, undo, stop]` event descriptor.
 pub fn undo_stopped() -> Event(StepStopMeasurements, UndoMetadata) {
-  let metadata =
-    fields.record({
-      use workflow <- fields.parameter
-      use run <- fields.parameter
-      use step <- fields.parameter
-      use result <- fields.parameter
-      UndoMetadata(workflow:, run:, step:, result:)
+  let metadata = {
+    use workflow <- fields.include(fields.string("workflow"), get: fn(m) {
+      m.workflow
     })
-    |> fields.and(fields.string("workflow"), fn(m: UndoMetadata) { m.workflow })
-    |> fields.and(fields.int("run"), fn(m) { m.run })
-    |> fields.and(fields.string("step"), fn(m) { m.step })
-    |> fields.and(
+    use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
+    use result <- fields.include(
       fields.enum(
         "result",
         [UndoUndone, UndoFailedKind, UndoCrashedKind, UndoTimedOutKind],
         undo_kind_to_string,
       ),
-      fn(m) { m.result },
+      get: fn(m) { m.result },
     )
-    |> fields.build
+    fields.success(UndoMetadata(workflow:, run:, step:, result:))
+  }
   sinal.event(["saga", "step", "undo", "stop"], stop_measurements(), metadata)
 }
 
 fn stop_measurements() -> fields.Fields(StepStopMeasurements) {
-  fields.record({
-    use duration <- fields.parameter
-    StepStopMeasurements(duration:)
-  })
-  |> fields.and(fields.int("duration"), fn(m: StepStopMeasurements) {
+  use duration <- fields.include(fields.int("duration"), get: fn(m) {
     m.duration
   })
-  |> fields.build
+  fields.success(StepStopMeasurements(duration:))
 }
