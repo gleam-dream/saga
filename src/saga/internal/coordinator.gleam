@@ -21,8 +21,7 @@
 ///
 /// `saga/observation` events are emitted after each corresponding state
 /// transition, from this process; a raising Sinal handler cannot change the
-/// run's outcome (`sinal.emit`'s own dispatch isolates handler failure, and
-/// this module ignores `emit`'s `Result`).
+/// run's outcome (`sinal.emit`'s own dispatch isolates handler failure).
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Monitor, type Pid, type Subject, type Timer}
 import gleam/int
@@ -2131,8 +2130,8 @@ fn build_progress(state: RunState(o, e, u)) -> Progress {
 
 // ---------------------------------------------------------------------------
 // Observations (saga/observation, via Sinal). Emission always happens after
-// the corresponding state transition above and its `Result` is discarded:
-// observations never control the run.
+// the corresponding state transition above: observations never control the
+// run.
 // ---------------------------------------------------------------------------
 
 fn address_to_string(address: StepAddress) -> String {
@@ -2148,13 +2147,11 @@ fn address_to_string(address: StepAddress) -> String {
 
 fn emit_run_started(workflow_name: String, run_id: Int) -> Nil {
   let event = observation.run_started()
-  let _ =
-    sinal.emit(
-      event,
-      observation.RunStartMeasurements(system_time: ffi.system_time()),
-      observation.RunMetadata(workflow: workflow_name, run: run_id),
-    )
-  Nil
+  sinal.emit(
+    event,
+    observation.RunStartMeasurements(system_time: ffi.system_time()),
+    observation.RunMetadata(workflow: workflow_name, run: run_id),
+  )
 }
 
 fn emit_run_stopped(
@@ -2185,22 +2182,20 @@ fn emit_run_stopped(
     Unresolved(_, _, _) -> observation.OutcomeUnresolved
   }
   let event = observation.run_stopped()
-  let _ =
-    sinal.emit(
-      event,
-      observation.RunStopMeasurements(
-        duration: duration,
-        undone: undone,
-        undo_failures: undo_failures,
-        interrupted: interrupted,
-      ),
-      observation.RunStopMetadata(
-        workflow: state.workflow_name,
-        run: state.run_id,
-        outcome: kind,
-      ),
-    )
-  Nil
+  sinal.emit(
+    event,
+    observation.RunStopMeasurements(
+      duration: duration,
+      undone: undone,
+      undo_failures: undo_failures,
+      interrupted: interrupted,
+    ),
+    observation.RunStopMetadata(
+      workflow: state.workflow_name,
+      run: state.run_id,
+      outcome: kind,
+    ),
+  )
 }
 
 fn emit_step_started(
@@ -2209,18 +2204,16 @@ fn emit_step_started(
   attempt: Int,
 ) -> Nil {
   let event = observation.step_started()
-  let _ =
-    sinal.emit(
-      event,
-      observation.StepStartMeasurements(system_time: ffi.system_time()),
-      observation.StepMetadata(
-        workflow: state.workflow_name,
-        run: state.run_id,
-        step: address_to_string(address),
-        attempt: attempt,
-      ),
-    )
-  Nil
+  sinal.emit(
+    event,
+    observation.StepStartMeasurements(system_time: ffi.system_time()),
+    observation.StepMetadata(
+      workflow: state.workflow_name,
+      run: state.run_id,
+      step: address_to_string(address),
+      attempt: attempt,
+    ),
+  )
 }
 
 fn emit_step_stopped(
@@ -2231,19 +2224,17 @@ fn emit_step_stopped(
   duration: Int,
 ) -> Nil {
   let event = observation.step_stopped()
-  let _ =
-    sinal.emit(
-      event,
-      observation.StepStopMeasurements(duration: duration),
-      observation.StepStopMetadata(
-        workflow: state.workflow_name,
-        run: state.run_id,
-        step: address_to_string(address),
-        attempt: attempt,
-        result: result,
-      ),
-    )
-  Nil
+  sinal.emit(
+    event,
+    observation.StepStopMeasurements(duration: duration),
+    observation.StepStopMetadata(
+      workflow: state.workflow_name,
+      run: state.run_id,
+      step: address_to_string(address),
+      attempt: attempt,
+      result: result,
+    ),
+  )
 }
 
 fn emit_compensation_stopped(
@@ -2254,19 +2245,17 @@ fn emit_compensation_stopped(
   duration: Int,
 ) -> Nil {
   let event = observation.compensation_stopped()
-  let _ =
-    sinal.emit(
-      event,
-      observation.StepStopMeasurements(duration: duration),
-      observation.CompensationMetadata(
-        workflow: state.workflow_name,
-        run: state.run_id,
-        step: address_to_string(address),
-        attempt: attempt,
-        decision: decision,
-      ),
-    )
-  Nil
+  sinal.emit(
+    event,
+    observation.StepStopMeasurements(duration: duration),
+    observation.CompensationMetadata(
+      workflow: state.workflow_name,
+      run: state.run_id,
+      step: address_to_string(address),
+      attempt: attempt,
+      decision: decision,
+    ),
+  )
 }
 
 fn emit_undo_stopped(
@@ -2276,18 +2265,16 @@ fn emit_undo_stopped(
   duration: Int,
 ) -> Nil {
   let event = observation.undo_stopped()
-  let _ =
-    sinal.emit(
-      event,
-      observation.StepStopMeasurements(duration: duration),
-      observation.UndoMetadata(
-        workflow: state.workflow_name,
-        run: state.run_id,
-        step: address_to_string(address),
-        result: result,
-      ),
-    )
-  Nil
+  sinal.emit(
+    event,
+    observation.StepStopMeasurements(duration: duration),
+    observation.UndoMetadata(
+      workflow: state.workflow_name,
+      run: state.run_id,
+      step: address_to_string(address),
+      result: result,
+    ),
+  )
 }
 
 /// Runtime-independent execution progress. Node positions refer to the checked
