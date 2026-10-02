@@ -6,7 +6,7 @@ licenses = ["Apache-2.0"]
 description = "External acceptance consumer for saga's public API: an order-checkout workflow written against only saga's public modules."
 
 [dependencies]
-gleam_stdlib = ">= 0.70.0 and < 1.0.0"
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 saga = { path = "../.." }
 sinal = { path = "../../../sinal" }
