@@ -98,6 +98,24 @@ increments toward the first local-execution release.
 
 ### Changed
 
+- **Module docs render.** All 11 public modules wrote their module doc as
+  `///` before the imports, which `gleam docs` attaches to the first
+  definition, so no module page had an introduction. Each now starts with a
+  `////` module doc that states its responsibility, when to use it, and how
+  it relates to the other modules; `saga`, `saga/execution` and
+  `saga/durable` include an example. The rewrite drops statements that no
+  longer matched behavior: `saga/durable` said storage is supplied by
+  integrations (saga ships memory and file adapters), `saga/execution`
+  stated a worst-case run time that holds only with a `deadline`, and the
+  `saga` module doc and `define`'s doc narrated earlier designs. Every
+  `saga/codec` function and the undocumented `saga/durable`, `storage`,
+  `reconciliation` and `storage/memory` definitions now have docs, and
+  `AttemptFailure`'s doc no longer marks timeouts as a future increment. A
+  test (`module_docs_test`) fails if a public module lacks a `////` doc.
+- **README common path defines the workflow once.** The example built a
+  new workflow for every order id; it now defines `checkout()` once and
+  passes the order id as the run's input, and the outcome list includes
+  `CompletedWithUnknownEffects`. No API change.
 - **`gleam_stdlib` range widened to `>= 0.70.0 and < 2.0.0`** in saga,
   `examples/order_consumer` and `bench`, so an application can combine
   saga with packages that need `gleam_stdlib` 1.x. Each manifest now

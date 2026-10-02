@@ -1,13 +1,27 @@
-/// Package-owned Sinal event descriptors for a run's lifecycle: run
-/// start/stop, step start/stop, compensation decisions, and undo outcomes.
-///
-/// Every descriptor here is built from a trusted, non-empty constant atom
-/// list, so `sinal.event` cannot fail for it (`let assert Ok(_)` is sound).
-/// `saga/internal/coordinator` emits these strictly after the state
-/// transition they describe; `sinal.emit` errors are ignored there, because
-/// observations never control a run. Applications attach their own Sinal
-/// handlers to these descriptors with `sinal.observe`/`sinal.attach` — this
-/// module owns the events themselves, not handler registration.
+//// Defines the Sinal events a run emits: run start and stop, step start and
+//// stop, compensation decisions, and undo outcomes.
+////
+//// Use this module to observe runs started with `saga/execution` or
+//// `saga/durable`. Each function returns a typed `sinal.Event` descriptor;
+//// attach a handler to it with `sinal.observe` or `sinal.attach`. This
+//// module owns the events, not handler registration.
+////
+//// A run's coordinator emits each event after the state change it
+//// describes, with `sinal.emit`. Handlers therefore run synchronously in
+//// the coordinator process: a slow handler delays the run. An emit error is
+//// ignored, because observations never control a run.
+////
+//// ```gleam
+//// import saga/observation
+//// import sinal
+////
+//// let assert Ok(id) = sinal.handler_id("checkout-run-stopped")
+//// let assert Ok(attachment) =
+////   sinal.observe(id, observation.run_stopped(), fn(_measurements, metadata) {
+////     log_outcome(metadata.workflow, metadata.outcome)
+////   })
+//// ```
+
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom

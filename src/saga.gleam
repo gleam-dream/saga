@@ -1,21 +1,47 @@
-/// Typed workflow authoring: steps, undo, compensation and recovery
-/// vocabulary, typed ports, composition, and definition validation.
-///
-/// A `Workflow(input, output, error, undo_error)` is a pure description. Its
-/// builder closure is evaluated exactly once, at `define` time (to validate
-/// names, attempts, timeouts, and to compute the workflow's static node
-/// graph) — never again by any run. Dependencies are expressed through
-/// typed `Port` values rather than names, so wiring is checked by the
-/// compiler: no step ever looks up a dependency by name in a shared map,
-/// and no *authoring*-time value ever passes through `Dynamic` or an
-/// unsafe cast. Per-run values do live in one central, run-scoped store
-/// (`saga/internal/store`) keyed by node id — a deliberate trade for O(1)
-/// reads instead of the O(N) per-node-mailbox reads an earlier design used
-/// (see `bench/RESULTS.md` and the design-decisions note in README.md);
-/// that store is the *only* place in this package with an unsafe coercion,
-/// and it is sound by construction — see `saga/internal/store`'s doc
-/// comment. `Workflow`'s own doc comment states precisely which two
-/// functions are allowed to invoke a builder at all.
+//// Defines typed saga workflows: steps, their undo and compensation, the
+//// typed ports that connect them, and validation of the whole graph.
+////
+//// Use this module to describe a workflow once, then run it with
+//// `saga/execution` (in memory) or `saga/durable` (with saved checkpoints).
+//// A `Workflow(input, output, error, undo_error)` is a pure description:
+//// `define` evaluates its builder exactly once, validates step names,
+//// attempt budgets, timeouts and port ownership, and records the static
+//// step graph. No run evaluates the builder again, so one `Workflow` value
+//// serves every run, each with its own input.
+////
+//// Dependencies are typed `Port` values, not names: `perform` schedules a
+//// step on a port and returns a port for its output, and `map`, `both`,
+//// `all` and `choose` combine ports. The compiler checks the wiring.
+////
+//// A step returns `Ok(output)` or a typed `Error(error)`. `undo` registers
+//// the action that reverses a completed step when a later step fails;
+//// `compensate` decides, after a failed attempt, whether to retry, continue
+//// with a substitute output, abort, or hold. `embed` and `map_errors`
+//// compose one workflow into another. `recoverable`, `restore_undo`,
+//// `reconcile_undo` and `reconcile_compensation` add what `saga/durable`
+//// needs to recover a step after a restart.
+////
+//// ```gleam
+//// import saga
+//// import saga/execution
+////
+//// pub fn checkout() {
+////   saga.define("checkout", fn(order_id) {
+////     order_id
+////     |> saga.perform(
+////       saga.step("reserve_inventory", reserve)
+////       |> saga.undo(fn(_order_id, reservation) { release(reservation) }),
+////     )
+////     |> saga.perform(saga.step("charge_payment", charge))
+////   })
+//// }
+////
+//// pub fn run_checkout(order_id: String) {
+////   let assert Ok(workflow) = checkout()
+////   execution.run(workflow, order_id, execution.config())
+//// }
+//// ```
+
 import gleam/dict.{type Dict}
 import gleam/int
 import gleam/list
@@ -46,8 +72,7 @@ pub type Attempt {
 }
 
 /// Why one attempt did not succeed: the step's own `run` returned an
-/// application error, the attempt task crashed, or (increment 2) it timed
-/// out.
+/// application error, the attempt task crashed, or it timed out.
 pub type AttemptFailure(e) {
   Returned(error: e)
   Crashed(crash: Crash)
@@ -1242,15 +1267,12 @@ pub opaque type Workflow(i, o, e, u) {
 /// step names, attempt budgets, timeouts, and that every port used belongs
 /// to this evaluation. All errors are collected, not just the first. This
 /// one evaluation also *is* the workflow's graph construction for running
-/// it — no run ever evaluates `build` again (see `Workflow`'s doc comment),
-/// so the former "must be pure and deterministic because a real run
-/// re-evaluates it" requirement is gone: nothing about running this
-/// `Workflow` depends on calling `build` a second time and getting the
-/// same answer. (`build` is still called again — exactly once — *at
-/// another workflow's own `define` evaluation* if this one is later
-/// composed in with `embed`; that is that *other* `define`'s own graph
-/// construction, not a run of this one. `map_errors` never calls `build`
-/// at all — see its own doc comment.)
+/// it — no run evaluates `build` again (see `Workflow`'s doc comment), so
+/// running this `Workflow` never depends on `build` returning the same
+/// graph twice. (`build` is called once more *at another workflow's own
+/// `define` evaluation* if this one is later composed in with `embed`; that
+/// is the other `define`'s graph construction, not a run of this one.
+/// `map_errors` never calls `build` at all — see its own doc comment.)
 pub fn define(
   name: String,
   build: fn(Port(i, e, u)) -> Port(o, e, u),

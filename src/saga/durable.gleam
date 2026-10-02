@@ -1,5 +1,40 @@
-/// Optional persistence for the canonical `saga.Workflow` and its existing
-/// concurrent runner. Storage and delivery are supplied by integrations.
+//// Runs a `saga.Workflow` with saved checkpoints, so that a run survives
+//// the loss of its runner and can be recovered, read or cancelled later.
+////
+//// Use this module when a run must outlive the process or VM that started
+//// it. It runs the same workflow and the same runner as `saga/execution`
+//// and returns the same `execution.Outcome`; local runs need none of it.
+//// `prepare` attaches `saga/codec` codecs and a compatibility stamp to an
+//// existing workflow. A `saga/storage.Storage` value saves one execution's
+//// checkpoint: `saga/storage/memory` and `saga/storage/file` are the
+//// included adapters, and `saga/storage/conformance` checks a third-party
+//// one. Waking or scheduling a runner after a restart is left to the
+//// caller. A step that may leave an unknown effect is made recoverable with
+//// `saga.recoverable`; recovery that cannot decide its effect suspends the
+//// run with `RecoveryRequired(saga/reconciliation.Required)`.
+////
+//// ```gleam
+//// import saga/codec
+//// import saga/durable
+//// import saga/execution
+//// import saga/storage/memory
+////
+//// let text = codec.text()
+//// let assert Ok(persistence) =
+////   durable.prepare(workflow, "1", text, text, text, text)
+//// let memory = memory.new()
+//// let storage = memory.storage(memory)
+//// let assert Ok(reference) =
+////   durable.start_or_reconnect(storage, "checkout-123", persistence, "order-123")
+//// let outcome = durable.drive(storage, reference, persistence, execution.config())
+//// let status = durable.read(storage, reference, persistence)
+//// memory.close(memory)
+//// ```
+////
+//// `drive` waits until the run ends or suspends, with no timeout. The
+//// caller's exit does not cancel the run; only `cancel` does. See
+//// DURABILITY.md for the storage contract and recovery rules.
+
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -13,6 +48,7 @@ import saga/internal/ffi
 import saga/reconciliation
 import saga/storage.{type Storage}
 
+/// Why a durable operation failed or a run suspended.
 pub type Error {
   StorageError(storage.Error)
   InvalidDefinition(String)
@@ -40,14 +76,18 @@ pub opaque type Persistence(i, o, e, u) {
   )
 }
 
+/// Identifies one saved execution by the id given to `start_or_reconnect`.
 pub opaque type Reference {
   Reference(id: String)
 }
 
+/// Returns the execution id of a reference.
 pub fn reference_id(reference: Reference) -> String {
   reference.id
 }
 
+/// A saved execution's state: not finished, suspended with a saved reason,
+/// or finished with its outcome.
 pub type Status(o, e, u) {
   Pending
   Suspended(reason: Error)
@@ -66,6 +106,9 @@ type Envelope(o, e, u) {
   )
 }
 
+/// Checks that every step of `workflow` can be restored and attaches the
+/// root codecs and a compatibility stamp built from `version`, the graph
+/// and every codec version. Does not build a second graph.
 pub fn prepare(
   workflow: Workflow(i, o, e, u),
   version: String,
@@ -98,6 +141,10 @@ pub fn prepare(
   ))
 }
 
+/// Saves a new execution with `input` under `id`, or reconnects to the one
+/// already saved there. Reconnecting succeeds only for the same id,
+/// compatible definition and encoded input; a different input returns
+/// `InputMismatch`. Does not run anything; call `drive`.
 pub fn start_or_reconnect(
   storage: Storage,
   id: String,
@@ -122,6 +169,7 @@ pub fn start_or_reconnect(
   }
 }
 
+/// Reads the saved state of an execution without a live runner.
 pub fn read(
   storage: Storage,
   reference: Reference,
@@ -135,6 +183,9 @@ pub fn read(
   })
 }
 
+/// Records cancellation for an unfinished execution. A running `drive`
+/// observes it at its next checkpoint and rolls back. Does nothing for a
+/// finished execution.
 pub fn cancel(
   storage: Storage,
   reference: Reference,

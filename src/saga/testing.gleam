@@ -1,10 +1,31 @@
-/// Test-support helpers for synchronizing with a running `saga.Workflow`,
-/// built entirely on `saga/execution`'s public `progress` API. Saga
-/// deliberately ships nothing here beyond this one polling helper: the rest
-/// of what a test needs to coordinate with a blocked step (a gate the step
-/// body enters, released by the test) is generic BEAM concurrency, not
-/// anything Saga-specific — see README.md's "Testing workflows" section for
-/// a trimmed recipe.
+//// Waits in tests until a running workflow reaches a state, by polling
+//// `saga/execution.progress`.
+////
+//// Use `wait_until` in a test that started a run with `execution.start` and
+//// must act once a step reaches some state, for example to cancel the run
+//// while a step is blocked. The rest of what such a test needs (a gate the
+//// step body enters and the test releases) is ordinary BEAM concurrency;
+//// see README.md's "Testing workflows" section for a recipe.
+////
+//// ```gleam
+//// import gleam/list
+//// import saga/execution
+//// import saga/testing
+////
+//// let assert Ok(run) = execution.start(workflow, input, execution.config())
+//// let attempting = fn(progress: execution.Progress) {
+////   list.any(progress.steps, fn(step) {
+////     case step.state {
+////       execution.Attempting(_) -> True
+////       _ -> False
+////     }
+////   })
+//// }
+//// let assert Ok(_progress) =
+////   testing.wait_until(run, matching: attempting, within: 1000)
+//// execution.cancel(run)
+//// ```
+
 import saga/execution.{type Execution, type Progress}
 import saga/internal/ffi
 
