@@ -41,13 +41,13 @@ pub type Ticket {
 /// workflow and a `map_errors`-adapted step — all reading from and writing
 /// to the same per-run `Store`.
 pub fn heterogeneous_values_flow_correctly_test() {
-  let assert Ok(inner) =
+  let inner =
     saga.define("inner", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       input
       |> saga.perform(saga.step("double", fn(x: Int) { Ok(x * 2) }))
     })
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("outer", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       // Shared producer: one node, read by several differently-typed
       // consumers below (fan-out over one store slot).
@@ -142,7 +142,7 @@ pub fn heterogeneous_values_flow_correctly_test() {
 /// `Workflow` value (built once), proving one run's `Store` never leaks
 /// into another's despite sharing the identical node graph.
 pub fn heterogeneous_values_isolated_across_runs_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("outer2", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       let produced =
         input |> saga.perform(saga.step("produce", fn(x: Int) { Ok(x) }))

@@ -67,7 +67,7 @@ pub type CodecError {
 }
 
 /// A codec over `gleam/json`: `encode` builds the JSON of a value or refuses
-/// it with a message, and `decoder` reads it back. `durable.new` rejects an
+/// it with a message, and `decoder` reads it back. `durable.new` panics on an
 /// empty version.
 pub fn json(
   version: String,
@@ -87,7 +87,7 @@ pub fn json(
 
 /// A codec from a version and two text conversions, for a format other
 /// than JSON. `decode` must accept every text `encode` produces.
-/// `durable.new` rejects an empty version.
+/// `durable.new` panics on an empty version.
 pub fn new(
   version: String,
   encode: fn(a) -> Result(String, String),

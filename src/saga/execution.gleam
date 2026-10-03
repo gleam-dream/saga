@@ -980,27 +980,47 @@ pub fn kind(outcome: Outcome(o, e, u)) -> telemetry.OutcomeKind {
   }
 }
 
-/// Describes a cause for logs, naming the step. It does not render the
-/// application error `e`; describe that with the application's own code.
-pub fn describe_cause(cause: Cause(e)) -> String {
+/// Describes a cause for logs, naming the step and rendering the step's
+/// error `e` with `describe_error`, for example
+/// `"step publish returned an error: HTTP 500"`.
+pub fn describe_cause(
+  cause: Cause(e),
+  error describe_error: fn(e) -> String,
+) -> String {
   case cause {
-    StepFailed(step, _) ->
-      "step " <> saga.address_to_string(step) <> " returned an error"
+    StepFailed(step, error) ->
+      "step "
+      <> saga.address_to_string(step)
+      <> " returned an error: "
+      <> describe_error(error)
     StepCrashed(step, crash) ->
       "step " <> saga.address_to_string(step) <> " crashed: " <> crash.reason
     StepTimedOut(step) ->
       "step " <> saga.address_to_string(step) <> " timed out"
-    RetryLimitReached(step, _) ->
+    RetryLimitReached(step, last) ->
       "step "
       <> saga.address_to_string(step)
-      <> " used its whole attempt budget"
-    RetrySuperseded(step, _) ->
+      <> " used its whole attempt budget; the last attempt "
+      <> describe_attempt_failure(last, describe_error)
+    RetrySuperseded(step, last) ->
       "step "
       <> saga.address_to_string(step)
-      <> " could not retry because the run was already stopping"
+      <> " could not retry because the run was already stopping; the last attempt "
+      <> describe_attempt_failure(last, describe_error)
     OutputCrashed(crash) ->
       "computing the workflow's output crashed: " <> crash.reason
     DeadlineExceeded -> "the run passed its deadline"
+  }
+}
+
+fn describe_attempt_failure(
+  failure: saga.AttemptFailure(e),
+  describe_error: fn(e) -> String,
+) -> String {
+  case failure {
+    saga.Returned(error) -> "returned an error: " <> describe_error(error)
+    saga.Crashed(crash) -> "crashed: " <> crash.reason
+    saga.TimedOut -> "timed out"
   }
 }
 

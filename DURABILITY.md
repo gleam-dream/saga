@@ -14,8 +14,9 @@ Local use requires no codecs, storage, database, or job system.
 | Delivery integration (caller) | Waking a runner, scheduling jobs, capacity, and delivery recovery                                                 |
 
 Persistence is an execution capability. `durable.new` checks an existing
-workflow and attaches root codecs and a compatibility stamp; it does not
-construct a second graph.
+workflow and attaches root codecs and a compatibility stamp built from the
+workflow version (`"1"`, changed with `durable.with_version`), the graph and
+every codec version; it does not construct a second graph.
 
 ## Example
 
@@ -34,11 +35,11 @@ let action =
   |> saga.undo(fn(undo) { refund(undo.input, undo.output, undo.key.idempotency) })
   |> durable.recoverable(version: "1", input: order, output: text, resolve: lookup_charge)
   |> durable.resolve_undo(lookup_refund)
-let assert Ok(workflow) = saga.define("checkout", saga.perform(_, action))
+let workflow = saga.define("checkout", saga.perform(_, action))
 
 // The same workflow remains usable with execution.run(workflow, input, config).
-let assert Ok(persistence) =
-  durable.new(workflow, version: "1", input: order, output: text, error: text, undo_error: text)
+let persistence =
+  durable.new(workflow, input: order, output: text, error: text, undo_error: text)
 let assert Ok(store) = memory.start()
 let assert Ok(run) =
   durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout:123", input: "order-123")
@@ -59,9 +60,11 @@ or depending on runner internals.
   The decision becomes a scheduled, saved Bool value. Only the selected branch
   executes, including nested choices. Shared dependencies still execute once.
 - `durable.recoverable(step, version:, input:, output:, resolve:)` adds
-  persistence capability to a step. Every step must have it before
-  `durable.new` accepts the graph; `new` returns `NotPersistable` with every
-  problem it finds. Choice decisions supply their own codec.
+  persistence capability to a step. Every step must have it: `durable.new`
+  panics on a graph that cannot be persisted, naming every step without
+  `recoverable`, every compensating step without `restore_undo`, and every
+  empty step or codec version, because each is a bug in the source. Choice
+  decisions supply their own codec.
 - `saga.effect` gives each attempt an `EffectKey`. Its `idempotency` is the
   same for every attempt of the step in one execution and survives restarts;
   its `attempt_key` is unique per attempt. Send `idempotency` downstream as
@@ -69,7 +72,7 @@ or depending on runner internals.
   interrupted attempt had. An undo has its own key.
 - `saga.undo` keeps undo reconstruction automatically. Every persistent
   compensating step declares `durable.restore_undo`, including an explicit
-  `saga.NoUndo` factory when it never returns undo; `durable.new` rejects a
+  `saga.NoUndo` factory when it never returns undo; `durable.new` panics on a
   missing declaration before any effect. Checkpointing rejects an actual
   `Continue` undo when the factory returns `NoUndo`. The factory must be pure;
   it may run during checkpoint validation and restoration.
@@ -130,8 +133,10 @@ The recovery rules are:
    other. After a restart, a decision that was in flight goes to the
    compensation resolver (rule 5), and an attempt whose result was not yet
    saved goes to its effect resolver (rule 3); a `Failed` answer that the
-   classifier marks is recorded as unknown again. A journaled error is never
-   replayed as if it were known.
+   classifier marks is recorded as unknown again, and then follows the step's
+   `saga.on_unknown`: by default the execution finishes `Unresolved` with
+   that error as evidence and undoes nothing; with `RollBack` it fails and
+   rolls back. A journaled error is never replayed as if it were known.
 
 Resolvers must establish absence or use downstream idempotency. Storage alone
 cannot promise exactly-once external effects. Reverse completion-order undo,
@@ -152,10 +157,14 @@ waits at most `timeout` milliseconds.
   outcome is returned once it is saved; a finished execution returns its
   saved outcome at once.
 - On timeout, `drive` stops the runner and returns `DriveTimedOut`. When the
-  process that called `drive` exits, the runner stops by itself. Either way
-  in-flight attempts are killed, the claim is released, and the last
-  checkpoint stays: the next `drive` resumes and asks each interrupted
-  attempt's resolver what happened. This is never cancellation.
+  process that called `drive` exits, the runner stops by itself. When the
+  runner is killed or crashes while the caller lives, `drive` returns
+  `RunnerLost`. In every case in-flight attempts are killed, the claim is
+  released at once (by `drive` itself when the runner could not), and the
+  last checkpoint stays: the next `drive` resumes and asks each interrupted
+  attempt's resolver what happened. This is never cancellation. Only when
+  the runner's VM is lost does the claim wait for the storage to notice, as
+  a lease that expires.
 - Every storage call from the runner is bounded by the storage's call
   timeout (5 s by default, `storage.with_call_timeout`); a slower call stops
   the runner with `StorageFailure(TimedOut)`.
@@ -163,7 +172,9 @@ waits at most `timeout` milliseconds.
   linked to the runner. A renewal that finds the claim taken over stops the
   runner with `StorageFailure(StaleOwner)`.
 - Concurrent `drive`s of one execution contend through the storage: all but
-  one return `StorageFailure(Busy)`.
+  one return `StorageFailure(Busy)`. Retry `Busy` no sooner than the
+  storage's owner-loss window (saga_postgres's lease, 30 s by default), so
+  that a delivery system's retry or snooze limit outlasts a lost VM's lease.
 
 `durable.error_kind` classifies every error into `Busy`, `Transient`,
 `NeedsReconciliation`, `Incompatible` or `Defect`, so a job handler can map
@@ -261,8 +272,10 @@ lost owner get `owner_loss_within` on top.
 The suite checks atomic creation, unchanged data after refused writes,
 exclusive claims, claims as values, revision and generation checks,
 cancellation races, release, that a live owner keeps its claim past the
-owner-loss window, that a lost owner's claim ends within it, and the
-`unfinished` listing. The memory, file and PostgreSQL adapters run this same
+owner-loss window, that a lost owner's claim ends within it, the
+`unfinished` listing, and that a `durable.drive` whose runner is killed
+frees the execution at once for the next drive, which resumes from the
+checkpoint. The memory, file and PostgreSQL adapters run this same
 suite. A passing result establishes these protocol checks from one VM;
 adapter authors must separately test distributed fencing and media
 durability claims.
@@ -324,7 +337,10 @@ budgets without repeating either callback. Public tests also cover mapped
 resolver results, every recovery decision, a second restart before Continue
 undo, configuration order, early undo eligibility, typed failures, failed
 suspension recording, and adapter conformance. Durable tests also cover a
-bounded `drive` (timeout and caller exit stop the runner and release its
-claim), lease renewal detecting a takeover, slow storage calls, the
+bounded `drive` (timeout, caller exit and a killed runner stop the runner
+and release its claim, the last through the conformance suite for every
+adapter), lease renewal detecting a takeover, slow storage calls, the
 checkpoint size limit, the `unfinished` listing, one storage serving many
-executions, and "maybe sent" errors recorded as unknown across a restart.
+executions, and "maybe sent" errors recorded as unknown across a restart,
+holding the execution `Unresolved` by default and rolling back with
+`saga.on_unknown(saga.RollBack)`.

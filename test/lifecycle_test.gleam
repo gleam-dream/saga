@@ -27,7 +27,7 @@ pub fn deadline_interrupts_run_test() {
   let gate = probe.new_gate()
   let undo_counter = probe.new_counter()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let a =
         input
@@ -68,7 +68,7 @@ pub fn deadline_interrupts_run_test() {
 /// The deadline fires while a step is waiting on its `RetryAfter` backoff:
 /// the wait is interrupted immediately rather than left to elapse.
 pub fn deadline_during_backoff_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -94,7 +94,7 @@ pub fn deadline_during_backoff_test() {
 /// terminal `StepTimedOut`.
 pub fn step_timeout_reports_timed_out_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -123,7 +123,7 @@ pub fn step_timeout_recovery_can_retry_test() {
   let gate = probe.new_gate()
   let counter = probe.new_counter()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -171,7 +171,7 @@ pub fn step_timeout_recovery_can_retry_test() {
 /// mistaken for a fresh attempt's result.
 pub fn late_result_after_timeout_is_discarded_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -208,7 +208,7 @@ pub fn late_result_after_timeout_is_discarded_test() {
 /// `UndoTimedOut`, and rollback continues to the next journal entry.
 pub fn undo_timeout_recorded_and_rollback_continues_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let a =
         input
@@ -241,7 +241,7 @@ pub fn undo_timeout_recorded_and_rollback_continues_test() {
 /// terminal cause.
 pub fn compensation_timeout_recorded_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -282,7 +282,7 @@ pub fn cancel_with_active_siblings_test() {
   let blocked_gate = probe.new_gate()
   let undo_counter = probe.new_counter()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let releasable =
         input
@@ -343,7 +343,7 @@ pub fn cancel_with_active_siblings_test() {
 
 /// Cancelling a run that has already completed is a harmless no-op.
 pub fn cancel_after_completion_is_noop_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -355,7 +355,7 @@ pub fn cancel_after_completion_is_noop_test() {
 /// `cancel` may be called any number of times; it is idempotent.
 pub fn cancel_is_idempotent_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -382,7 +382,7 @@ pub fn cancel_is_idempotent_test() {
 /// (mailbox order), that completion counts as completed and is undone on
 /// rollback rather than reported `interrupted`.
 pub fn completion_processed_before_cancel_is_undone_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -427,7 +427,7 @@ pub fn owner_exit_cancels_and_rolls_back_test() {
   let coordinator_pid_subject = process.new_subject()
   let step_gate = probe.new_gate()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -480,7 +480,7 @@ pub fn owner_exit_cancels_and_rolls_back_test() {
 /// and its spawned task processes die with it (no leaked processes).
 pub fn coordinator_kill_terminates_tasks_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -521,7 +521,7 @@ fn wait_until_dead(pid: process.Pid, timeout_ms: Int) -> Nil {
 
 /// Only the process that called `start` may `await` an `Execution`.
 pub fn await_not_owner_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -538,7 +538,7 @@ pub fn await_not_owner_test() {
 /// A second `await` after the outcome has already been consumed returns
 /// `AlreadyAwaited` rather than hanging or timing out.
 pub fn await_twice_already_awaited_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -553,7 +553,7 @@ pub fn await_twice_already_awaited_test() {
 /// short-circuit it: it is derived entirely from a fresh monitor's
 /// immediate `noproc` plus an empty mailbox.
 pub fn await_twice_is_prompt_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -576,7 +576,7 @@ pub fn await_twice_is_prompt_test() {
 /// consumed by the first call — settles as `AlreadyAwaited`.
 pub fn await_after_lost_then_second_await_is_prompt_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -622,7 +622,7 @@ pub fn coordinator_killed_mid_await_reports_lost_test() {
     probe.flush_mailbox()
     let mailbox_before = probe.mailbox_length()
     let gate = probe.new_gate()
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("wf", fn(input) {
         input
         |> saga.perform(
@@ -661,7 +661,7 @@ pub fn coordinator_killed_mid_await_reports_lost_test() {
 /// process-dictionary flag that would otherwise accumulate one entry per
 /// `Execution`.
 pub fn await_does_not_grow_process_dictionary_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -677,7 +677,7 @@ pub fn await_does_not_grow_process_dictionary_test() {
 /// calling process's own process dictionary, nor leave anything behind in
 /// its mailbox.
 pub fn run_does_not_grow_process_dictionary_or_mailbox_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -703,7 +703,7 @@ fn system_time_ms() -> Int {
 /// succeed once the run actually finishes.
 pub fn await_timeout_then_success_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(

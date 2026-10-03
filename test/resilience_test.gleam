@@ -26,7 +26,7 @@ pub type DemoUndoError {
 
 pub fn run_does_not_leak_monitor_down_test() {
   probe.flush_mailbox()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("l", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -44,7 +44,7 @@ pub fn run_does_not_leak_monitor_down_test() {
 
 pub fn await_does_not_leak_monitor_down_test() {
   probe.flush_mailbox()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("l2", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -60,7 +60,7 @@ pub fn await_does_not_leak_monitor_down_test() {
 // ---------------------------------------------------------------------------
 
 pub fn progress_after_end_reports_execution_ended_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("p", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -79,7 +79,7 @@ pub fn progress_after_end_reports_execution_ended_test() {
 // ---------------------------------------------------------------------------
 
 pub fn throw_reported_as_throw_class_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("t", fn(input) {
       input
       |> saga.perform(
@@ -115,7 +115,7 @@ pub fn throw_reported_as_throw_class_test() {
 pub fn retry_refused_while_settling_is_distinct_cause_test() {
   let decider_gate = probe.new_gate()
   let fail_gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let a =
         input
@@ -198,7 +198,7 @@ fn collect_step_stop_durations(
 
 pub fn step_stopped_reports_real_duration_test() {
   let collector = process.new_subject()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("dur", fn(input) {
       input
       |> saga.perform(
@@ -224,7 +224,7 @@ pub fn step_stopped_reports_real_duration_test() {
 pub fn settle_sweep_kill_emits_attempt_interrupted_test() {
   let collector = process.new_subject()
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("interrupt", fn(input) {
       let blocked =
         input

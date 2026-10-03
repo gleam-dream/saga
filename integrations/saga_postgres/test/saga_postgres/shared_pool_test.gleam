@@ -43,13 +43,12 @@ pub fn one_pool_serves_the_application_and_saga_test() {
       output: codec.text(),
       resolve: fn(_, _) { durable.NotSent },
     )
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("record-order", fn(order) { saga.perform(order, record) })
   let text = codec.text()
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,

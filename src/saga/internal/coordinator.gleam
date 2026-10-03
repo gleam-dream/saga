@@ -1041,13 +1041,18 @@ fn handle_attempt_done(
                 ActionReturnedUnknown,
               )
           }
-          case recover {
-            None ->
+          let assert Ok(n) = dict.get(state.nodes, node_id)
+          case recover, unknown, n.rolls_back_unknown, failure {
+            // An unknown effect with no decision grants no rollback
+            // authority unless the step opted in (`saga.on_unknown`).
+            None, True, False, Returned(error) ->
+              hold_terminal(state, node_id, error)
+            None, _, _, _ ->
               fail_terminal(state, node_id, failure, case unknown {
                 True -> telemetry.AttemptUnknown
                 False -> attempt_result_kind(failure)
               })
-            Some(prepare_recovery) ->
+            Some(prepare_recovery), _, _, _ ->
               start_recovery_from_returned(
                 state,
                 node_id,
@@ -1729,14 +1734,55 @@ fn fail_terminal_retry_limit(
 ) -> RunState(o, e, u) {
   let address = node_address(state, node_id)
   let assert Ok(last) = dict.get(state.last_failure, node_id)
-  let cause = RetryLimitReached(address, last)
-  let state =
-    RunState(
-      ..state,
-      running: state.running - 1,
-      state: dict.insert(state.state, node_id, NodeFailedTerminal),
+  let assert Ok(n) = dict.get(state.nodes, node_id)
+  let last_unknown =
+    list.contains(
+      state.unknown_effects,
+      UnknownEffect(
+        address,
+        StepAttempt(attempt_number_for(state, node_id)),
+        ActionReturnedUnknown,
+      ),
     )
-  begin_settling(state, TriggerFailure(cause))
+  let state = RunState(..state, running: state.running - 1)
+  case last, last_unknown && !n.rolls_back_unknown {
+    // The decider asked for another attempt, not for rollback, and the
+    // last attempt's effect is unknown.
+    Returned(error), True -> begin_unresolved(state, node_id, error)
+    _, _ -> {
+      let state =
+        RunState(
+          ..state,
+          state: dict.insert(state.state, node_id, NodeFailedTerminal),
+        )
+      begin_settling(state, TriggerFailure(RetryLimitReached(address, last)))
+    }
+  }
+}
+
+/// A step ended with an error that `saga.unknown_when` classified, with no
+/// decision about it: like a `Hold(error)` decision, the run ends
+/// `Unresolved` and nothing is undone.
+fn hold_terminal(
+  state: RunState(o, e, u),
+  node_id: Int,
+  error: e,
+) -> RunState(o, e, u) {
+  let address = node_address(state, node_id)
+  let attempt_number = attempt_number_for(state, node_id)
+  let duration = duration_since_started(state, node_id)
+  emit_step_stopped(
+    state,
+    address,
+    attempt_number,
+    telemetry.AttemptUnknown,
+    duration,
+  )
+  begin_unresolved(
+    RunState(..state, running: state.running - 1),
+    node_id,
+    error,
+  )
 }
 
 /// A `Hold` decision grants no rollback authority for its own step. If it

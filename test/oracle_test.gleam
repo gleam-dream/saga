@@ -137,7 +137,7 @@ fn run_d1() -> #(
   List(#(String, String)),
 ) {
   let events = new_recorder()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d1", fn(input) {
       let a =
         input
@@ -198,7 +198,7 @@ fn run_d2() -> #(
   List(#(String, String)),
 ) {
   let events = new_recorder()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d2", fn(input) {
       let e1 =
         input
@@ -357,7 +357,7 @@ fn run_d3() -> #(
   let events = new_recorder()
   let slow_gate = new_manual_gate()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d3", fn(input) {
       let slow =
         input
@@ -467,7 +467,7 @@ fn trace_d3() -> Nil {
 
 fn run_d4() -> #(execution.Outcome(Nil, DemoError, DemoUndoError), Int) {
   let events = new_recorder()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d4", fn(input) {
       input
       |> saga.perform(
@@ -520,7 +520,7 @@ fn run_d5() -> #(
   List(#(String, String)),
 ) {
   let events = new_recorder()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d5", fn(input) {
       input
       |> saga.perform(
@@ -634,7 +634,7 @@ fn run_d6() -> #(execution.Outcome(List(Int), DemoError, DemoUndoError), Int) {
     })
   }
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d6", fn(input) {
       let assert [first, ..rest] =
         ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]
@@ -681,7 +681,7 @@ fn run_d7() -> #(
   Int,
 ) {
   let events = new_recorder()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("d7", fn(input) {
       let producer =
         input

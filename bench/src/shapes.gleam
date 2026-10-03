@@ -76,7 +76,7 @@ pub fn chain(
   n: Int,
   build_count: Counter,
 ) -> Result(Workflow(Int, Int, BenchError, Nil), List(saga.DefinitionError)) {
-  saga.define("chain_" <> int.to_string(n), fn(input) {
+  saga.try_define("chain_" <> int.to_string(n), fn(input) {
     counter.increment(build_count)
     range(1, n)
     |> list.fold(input, fn(port, i) {
@@ -98,7 +98,7 @@ pub fn fan(
   Workflow(Int, List(Int), BenchError, Nil),
   List(saga.DefinitionError),
 ) {
-  saga.define("fan_" <> int.to_string(n), fn(input) {
+  saga.try_define("fan_" <> int.to_string(n), fn(input) {
     counter.increment(build_count)
     let produced =
       saga.perform(input, saga.step("produce", fn(x: Int) { Ok(x) }))
@@ -131,7 +131,7 @@ pub fn wide(
   List(saga.DefinitionError),
 ) {
   let window = 4
-  saga.define("wide_" <> int.to_string(n), fn(input) {
+  saga.try_define("wide_" <> int.to_string(n), fn(input) {
     counter.increment(build_count)
     let roots =
       range(1, window)

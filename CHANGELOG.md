@@ -6,6 +6,54 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
+### Follow-up fixes (wave 3)
+
+Every breaking change below has a before and after in the "Follow-up fixes"
+section of [docs/migration-wave-3.md](docs/migration-wave-3.md).
+
+#### Breaking
+
+- **An unknown effect holds the run by default.** A returned error that
+  `saga.unknown_when` marks, with no `compensate` decision to settle it,
+  ended the run `Failed` and undid the completed steps, so an uncertain
+  payment released the stock reserved before it (support_desk). The run now
+  ends `Unresolved(step, error, settlement)`, undoes nothing and lists the
+  completed steps in `settlement.held`, as a `Hold(error)` decision does.
+  The same applies when the decider asked for a retry the attempt budget no
+  longer allows after an unknown attempt, and to a resolver's `Failed`
+  answer after a durable restart. A decider's explicit `Abort` still rolls
+  back. New: `saga.on_unknown(step, policy)` with `saga.OnUnknown`:
+  `Reconcile` (default) or `RollBack`, which restores the previous
+  behavior. Crashes and timeouts are unchanged.
+- **`saga.define` returns the `Workflow`** and panics on a definition
+  defect, with a message naming the workflow and every offending step
+  (decision 4). `saga.try_define` keeps the `Result(Workflow,
+List(DefinitionError))` for workflows built from runtime data.
+- **`durable.new` is total and defaults the version.** It takes
+  `(workflow, input:, output:, error:, undo_error:)`, starts at workflow
+  version `"1"`, and panics, naming every step and codec, on a workflow
+  that cannot be persisted. `durable.with_version(persistence, version)`
+  changes the version and panics on an empty one. `durable.NotPersistable`
+  and `durable.PersistenceProblem` are removed.
+- **`execution.describe_cause(cause, error: describe)`** renders the step's
+  error with `describe`: `"step publish returned an error: HTTP 500"`
+  (research_agent). A retry-limit cause also describes its last attempt.
+
+#### Fixed
+
+- **A killed runner no longer keeps its claim.** When the runner process
+  was killed or crashed while `drive`'s caller lived, `drive` returned
+  `RunnerLost` without releasing the claim, so every later `drive` was
+  `Busy` for the whole lease (30 s on saga_postgres) and a grind job could
+  reach its snooze limit first (checkout). `drive` now releases the claim
+  as soon as the runner exits abnormally, keeping the checkpoint; a runner
+  that raises exits abnormally too, so its heartbeat and in-flight attempts
+  stop. Lease expiry remains the fallback when the runner's node is lost.
+  `saga/storage/conformance` checks it for every adapter: a drive whose
+  runner is killed must leave the execution claimable at once.
+- The README and DURABILITY.md say to retry `Busy` no sooner than the
+  storage's owner-loss window, such as saga_postgres's lease.
+
 ### Release API redesign (wave 3)
 
 Every breaking change below has a before and after in
@@ -42,7 +90,8 @@ Every breaking change below has a before and after in
   `CompensationStatus` are removed. `saga.map_step_errors` keeps the codecs
   and maps resolver answers forward instead of dropping them.
 - **One durable `Run` handle, one storage per store.** `durable.new(workflow,
-version:, input:, output:, error:, undo_error:)` replaces `prepare`.
+input:, output:, error:, undo_error:)` replaces `prepare` (its `version:`
+  moved to `durable.with_version` in the follow-up fixes).
   `durable.start_or_reconnect(persistence, storage, id:, input:)` returns a
   `Run`, which `drive`, `read`, `cancel`, `id` and `with_correlation` take;
   `durable.reconnect` attaches by id. Storage operations take the execution
@@ -53,7 +102,8 @@ version:, input:, output:, error:, undo_error:)` replaces `prepare`.
   is released and the last checkpoint stays (CHK-6). This is never
   cancellation; the next `drive` resumes.
 - **Typed durable errors.** `StorageError` is `StorageFailure`;
-  `InvalidDefinition(String)` is `NotPersistable(List(PersistenceProblem))`;
+  `InvalidDefinition(String)` is removed (`durable.new` panics instead; see
+  the follow-up fixes);
   `CodecFailure` carries a `Boundary` and a `codec.CodecError`;
   `InvalidCheckpoint` carries a `CheckpointProblem`; `RecoveryRequired`
   carries `durable.Required(step: StepAddress, action: execution.Action,

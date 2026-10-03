@@ -14,7 +14,7 @@ pub type DemoUndoError {
 
 pub fn retry_until_success_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -36,7 +36,7 @@ pub fn retry_until_success_test() {
 }
 
 pub fn retry_limit_triggers_rollback_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -57,7 +57,7 @@ pub fn retry_limit_triggers_rollback_test() {
 
 pub fn compensation_receives_attempt_numbers_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -91,7 +91,7 @@ pub fn compensation_receives_attempt_numbers_test() {
 
 pub fn compensation_decisions_test() {
   // Abort: fails immediately with the given error.
-  let assert Ok(abort_wf) =
+  let abort_wf =
     saga.define("abort_wf", fn(input) {
       input
       |> saga.perform(
@@ -109,7 +109,7 @@ pub fn compensation_decisions_test() {
   }
 
   // No compensation attached at all: a single failure is terminal.
-  let assert Ok(no_compensate_wf) =
+  let no_compensate_wf =
     saga.define("no_compensate_wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(_x: Int) { Error(Boom) }))
     })
@@ -122,7 +122,7 @@ pub fn compensation_decisions_test() {
 
   // RetryAfter: eventually succeeds after a delayed retry.
   let retry_counter = probe.new_counter()
-  let assert Ok(retry_after_wf) =
+  let retry_after_wf =
     saga.define("retry_after_wf", fn(input) {
       input
       |> saga.perform(

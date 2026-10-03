@@ -27,7 +27,7 @@ fn text_step(name: String, run: fn(String) -> Result(String, String)) {
 }
 
 fn echo_workflow() -> saga.Workflow(String, String, String, String) {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("echo", fn(input) {
       saga.perform(input, text_step("echo", fn(value) { Ok(value <> "!") }))
     })
@@ -38,10 +38,9 @@ fn prepare(
   workflow: saga.Workflow(String, String, String, String),
 ) -> durable.Persistence(String, String, String, String) {
   let text = codec.text()
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,
@@ -174,7 +173,7 @@ pub fn persistent_concurrent_shared_dependency_test() {
       Ok(value <> name)
     })
   }
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("parallel", fn(input) {
       let shared =
         saga.perform(input, text_step("shared", fn(value) { Ok(value <> "!") }))
@@ -206,7 +205,7 @@ pub fn saved_success_and_uncertain_effect_resume_test() {
   let events = process.new_subject()
   let owner = process.new_subject()
   let build = fn(recovering) {
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("recover", fn(input) {
         input
         |> saga.perform(
@@ -264,7 +263,7 @@ pub fn rollback_resumes_uncertain_undo_test() {
   let events = process.new_subject()
   let owner = process.new_subject()
   let build = fn(recovering) {
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("undo", fn(input) {
         input
         |> saga.perform(
@@ -315,7 +314,7 @@ pub fn undo_resolver_not_sent_replays_the_undo_test() {
   let events = process.new_subject()
   let owner = process.new_subject()
   let build = fn(recovering) {
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("undo-replay", fn(input) {
         input
         |> saga.perform(
@@ -370,7 +369,7 @@ pub fn persisted_choice_survives_fresh_definition_test() {
   let entered = process.new_subject()
   let owner = process.new_subject()
   let build = fn(recovering) {
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("choice-recovery", fn(input) {
         saga.choose(
           input,
@@ -443,7 +442,7 @@ pub fn restart_recovers_two_concurrent_admissions_test() {
         },
       )
     }
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("two", fn(input) {
         saga.both(
           saga.perform(input, branch("a")),
@@ -502,8 +501,7 @@ pub fn retry_and_continue_share_local_semantics_test() {
       output: codec.text(),
       resolve: fn(_, _) { durable.MaybeSent },
     )
-  let assert Ok(workflow) =
-    saga.define("retry", fn(input) { saga.perform(input, step) })
+  let workflow = saga.define("retry", fn(input) { saga.perform(input, step) })
   let store = start_memory()
   drive(start(prepare(workflow), memory.storage(store), "retry"))
   |> should.equal(Ok(execution.Completed("x-continued")))
@@ -524,16 +522,19 @@ pub fn incompatible_definition_refused_before_callbacks_test() {
       process.send(events, Nil)
       Ok(value)
     })
-  let assert Ok(changed) =
+  let changed =
     durable.new(
       echo_workflow(),
-      version: "2",
       input: text,
       output: changed_codec,
       error: text,
       undo_error: text,
     )
   durable.reconnect(changed, backend, id: "versioned")
+  |> should.equal(Error(durable.IncompatibleDefinition))
+  // A new workflow version alone is refused too.
+  let bumped = prepare(echo_workflow()) |> durable.with_version("2")
+  durable.reconnect(bumped, backend, id: "versioned")
   |> should.equal(Error(durable.IncompatibleDefinition))
   process.receive(events, 0) |> should.equal(Error(Nil))
   memory.stop(store)
@@ -554,10 +555,9 @@ pub fn cancellation_racing_completion_wins_test() {
       Ok,
     )
   let text = codec.text()
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       echo_workflow(),
-      version: "1",
       input: text,
       output: root_codec,
       error: text,
@@ -575,7 +575,7 @@ pub fn cancellation_racing_completion_wins_test() {
 pub fn cancellation_reconciles_admitted_absence_without_dispatch_test() {
   let entered = process.new_subject()
   let owner = process.new_subject()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("cancel-admitted", fn(input) {
       saga.perform(
         input,
@@ -609,7 +609,7 @@ pub fn cancellation_reconciles_admitted_absence_without_dispatch_test() {
 pub fn bad_input_codec_prevents_effect_test() {
   let effects = process.new_subject()
   let bad = codec.new("bad", fn(_) { Error("cannot encode") }, Ok)
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("bad-codec", fn(input) {
       saga.perform(
         input,
@@ -649,7 +649,7 @@ pub fn bad_input_codec_prevents_effect_test() {
 
 pub fn failed_commit_prevents_dispatch_test() {
   let effects = process.new_subject()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("refused", fn(input) {
       saga.perform(
         input,
@@ -696,7 +696,7 @@ pub fn parallel_rollback_covers_both_completed_branches_test() {
       resolve: fn(_, _) { durable.MaybeSent },
     )
   }
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("rollback-order", fn(input) {
       let a = saga.perform(input, branch("a"))
       let b = saga.perform(input, branch("b"))
@@ -728,8 +728,11 @@ pub fn parallel_rollback_covers_both_completed_branches_test() {
   memory.stop(store)
 }
 
-/// `new` lists every problem at once, with typed addresses.
-pub fn new_lists_every_persistence_problem_test() {
+@external(erlang, "saga_test_panic", "message")
+fn panic_message(body: fn() -> a) -> Result(String, Nil)
+
+/// `new` panics naming every problem at once: they are source bugs.
+pub fn new_names_every_persistence_problem_test() {
   let step =
     saga.step("compensate", fn(value) { Error(value) })
     |> saga.compensate(1, fn(failed) {
@@ -741,7 +744,7 @@ pub fn new_lists_every_persistence_problem_test() {
       output: codec.text(),
       resolve: fn(_, _) { durable.MaybeSent },
     )
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("eligibility", fn(input) {
       input
       |> saga.perform(step)
@@ -749,23 +752,27 @@ pub fn new_lists_every_persistence_problem_test() {
     })
   let text = codec.text()
   let empty = codec.new("", Ok, Ok)
-  let assert Error(durable.NotPersistable(problems)) =
-    durable.new(
-      workflow,
-      version: "",
-      input: text,
-      output: empty,
-      error: text,
-      undo_error: text,
-    )
-  problems
-  |> should.equal([
-    durable.EmptyWorkflowVersion,
-    durable.EmptyStepVersion(at("compensate")),
-    durable.MissingRestoreUndo(at("compensate")),
-    durable.MissingRecoverable(at("plain")),
-    durable.EmptyCodecVersion(durable.RunOutput),
-  ])
+  let assert Ok(message) =
+    panic_message(fn() {
+      durable.new(
+        workflow,
+        input: text,
+        output: empty,
+        error: text,
+        undo_error: text,
+      )
+    })
+  [
+    "workflow \"eligibility\" cannot be persisted",
+    "step compensate has an empty version",
+    "step compensate compensates but has no durable.restore_undo",
+    "step plain has no durable.recoverable",
+    "the codec of the workflow output has an empty version",
+  ]
+  |> list.each(fn(part) { string.contains(message, part) |> should.be_true })
+  let assert Ok(message) =
+    panic_message(fn() { prepare(echo_workflow()) |> durable.with_version("") })
+  string.contains(message, "needs a non-empty version") |> should.be_true
 }
 
 pub fn interrupted_compensation_requires_explicit_resolution_test() {
@@ -786,7 +793,7 @@ pub fn interrupted_compensation_requires_explicit_resolution_test() {
         output: codec.text(),
         resolve: fn(_, _) { durable.MaybeSent },
       )
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("compensation-recovery", fn(input) {
         saga.perform(input, step)
       })
@@ -862,7 +869,7 @@ fn resolve_interrupted(
         output: codec.text(),
         resolve: fn(_, _) { durable.MaybeSent },
       )
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("decision", fn(input) { saga.perform(input, step) })
     prepare(workflow)
   }
@@ -981,7 +988,7 @@ pub fn compensation_continue_restores_undo_after_second_restart_test() {
           }
         },
       )
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("restore-continue", fn(input) {
         input |> saga.perform(first) |> saga.perform(second)
       })
@@ -1081,7 +1088,7 @@ pub fn suspension_recording_reports_both_failures_test() {
       output: codec.text(),
       resolve: fn(_, _) { durable.MaybeSent },
     )
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("recording", fn(input) { saga.perform(input, step) })
   let persistence = prepare(workflow)
   let store = start_memory()
@@ -1126,7 +1133,7 @@ pub fn false_undo_declaration_blocks_continue_commit_test() {
       output: codec.text(),
       resolve: fn(_, _) { durable.MaybeSent },
     )
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("false-declaration", fn(input) { saga.perform(input, step) })
   let store = start_memory()
   let run = start(prepare(workflow), memory.storage(store), "false")
@@ -1151,7 +1158,7 @@ fn blocking_workflow(
   entered: process.Subject(process.Pid),
   recovered: Bool,
 ) -> saga.Workflow(String, String, String, String) {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("blocking", fn(input) {
       saga.perform(
         input,
@@ -1264,7 +1271,7 @@ pub fn slow_storage_call_times_out_test() {
 /// A checkpoint above the size limit suspends the run before any effect.
 pub fn checkpoint_size_is_bounded_test() {
   let effects = process.new_subject()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("large", fn(input) {
       saga.perform(
         input,
@@ -1430,8 +1437,7 @@ pub fn classified_error_survives_a_restart_in_its_decision_test() {
         output: codec.text(),
         resolve: fn(_, _) { durable.MaybeSent },
       )
-    let assert Ok(workflow) =
-      saga.define("maybe", fn(input) { saga.perform(input, step) })
+    let workflow = saga.define("maybe", fn(input) { saga.perform(input, step) })
     prepare(workflow)
   }
   let store = start_memory()
@@ -1449,19 +1455,23 @@ pub fn classified_error_survives_a_restart_in_its_decision_test() {
   memory.stop(store)
 }
 
-/// An attempt interrupted before its result was saved goes to its effect
-/// resolver; a `Failed` answer the classifier marks is recorded as unknown.
-pub fn classified_resolver_failure_is_recorded_as_unknown_test() {
+/// After a restart, a resolver's `Failed` that `unknown_when` classifies
+/// follows `on_unknown`: by default the execution finishes `Unresolved`
+/// and keeps the reservation made before the payment; with `RollBack` it
+/// fails and releases it.
+pub fn classified_resolver_failure_follows_on_unknown_test() {
   let entered = process.new_subject()
   let owner = process.new_subject()
-  let make = fn(recovering) {
-    let step =
+  let released = process.new_subject()
+  let make = fn(recovering, policy) {
+    let charge =
       saga.step("charge", fn(value) {
         process.send(entered, Nil)
         process.sleep_forever()
         Ok(value)
       })
       |> saga.unknown_when(fn(error) { error == "maybe charged" })
+      |> saga.on_unknown(policy)
       |> durable.recoverable(
         version: "1",
         input: codec.text(),
@@ -1473,22 +1483,53 @@ pub fn classified_resolver_failure_is_recorded_as_unknown_test() {
           }
         },
       )
-    let assert Ok(workflow) =
-      saga.define("maybe-resolved", fn(input) { saga.perform(input, step) })
+    let reserve =
+      saga.step("reserve", fn(value) { Ok(value) })
+      |> saga.undo(fn(_) {
+        process.send(released, Nil)
+        Ok(Nil)
+      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) { durable.MaybeSent },
+      )
+    let workflow =
+      saga.define("maybe-resolved", fn(input) {
+        input |> saga.perform(reserve) |> saga.perform(charge)
+      })
     prepare(workflow)
   }
   let store = start_memory()
   let backend = stores.watched(memory.storage(store), owner)
-  let result = drive_later(start(make(False), backend, "maybe-resolved"))
-  let assert Ok(pid) = process.receive(owner, 1000)
-  let assert Ok(Nil) = process.receive(entered, 1000)
-  kill_and_wait(pid)
-  let _ = process.receive(result, 1000)
-  let assert Ok(outcome) =
-    drive(reconnect(make(True), backend, "maybe-resolved"))
-  let assert execution.Failed(execution.StepFailed(_, "maybe charged"), _) =
-    outcome
-  let assert [unknown] = execution.unknown_effects(outcome)
+  let interrupt = fn(id, policy) {
+    let result = drive_later(start(make(False, policy), backend, id))
+    let assert Ok(pid) = process.receive(owner, 1000)
+    let assert Ok(Nil) = process.receive(entered, 1000)
+    kill_and_wait(pid)
+    process.receive(result, 1000) |> should.equal(Ok(Error(durable.RunnerLost)))
+    let resumed = drive(reconnect(make(True, policy), backend, id))
+    // Forget the resuming runner.
+    let assert Ok(_) = process.receive(owner, 0)
+    resumed
+  }
+  let assert Ok(held) = interrupt("held", saga.Reconcile)
+  let assert execution.Unresolved(step, "maybe charged", settlement) = held
+  step |> should.equal(at("charge"))
+  settlement.held |> should.equal([at("reserve")])
+  let assert [unknown] = execution.unknown_effects(held)
   unknown.ending |> should.equal(execution.ActionReturnedUnknown)
+  process.receive(released, 50) |> should.equal(Error(Nil))
+  // The saved outcome survives a reconnect.
+  durable.read(reconnect(make(True, saga.Reconcile), backend, "held"))
+  |> should.equal(Ok(durable.Finished(held)))
+  let assert Ok(rolled_back) = interrupt("rolled-back", saga.RollBack)
+  let assert execution.Failed(
+    execution.StepFailed(_, "maybe charged"),
+    settlement,
+  ) = rolled_back
+  settlement.undone |> should.equal([at("reserve")])
+  process.receive(released, 1000) |> should.equal(Ok(Nil))
   memory.stop(store)
 }

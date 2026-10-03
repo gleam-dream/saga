@@ -54,7 +54,7 @@ fn at(name: String) -> saga.StepAddress {
 /// plain `Completed`, even though the step has a recovery decider.
 pub fn retried_typed_errors_complete_with_known_effects_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -78,7 +78,7 @@ pub fn retried_typed_errors_complete_with_known_effects_test() {
 /// attempt's effect unknown: the run completes with that attempt named.
 pub fn crash_retried_to_success_is_an_unknown_effect_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -112,7 +112,7 @@ pub fn crash_retried_to_success_is_an_unknown_effect_test() {
 /// A crash the decider answers with `Continue` is still an unknown effect:
 /// the replacement output is known, the crashed attempt is not.
 pub fn crash_continued_is_an_unknown_effect_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -136,7 +136,7 @@ pub fn crash_continued_is_an_unknown_effect_test() {
 pub fn timeout_retried_to_success_is_an_unknown_effect_test() {
   let gate = probe.new_gate()
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -168,7 +168,7 @@ pub fn timeout_retried_to_success_is_an_unknown_effect_test() {
 /// A step with a decider whose single attempt returns a typed error and is
 /// aborted fails with nothing unknown.
 pub fn typed_error_aborted_fails_with_known_effects_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -192,7 +192,7 @@ pub fn typed_error_aborted_fails_with_known_effects_test() {
 /// with a typed error. The cause is `StepFailed`, as for an ordinary typed
 /// failure, but the crashed attempt is named as an unknown effect.
 pub fn crash_aborted_with_typed_error_is_an_unknown_effect_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -220,7 +220,7 @@ pub fn crash_aborted_with_typed_error_is_an_unknown_effect_test() {
 /// an unknown effect.
 pub fn sibling_crash_in_settle_window_is_an_unknown_effect_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let a =
         input
@@ -258,7 +258,7 @@ pub fn sibling_crash_in_settle_window_is_an_unknown_effect_test() {
 /// attempt that returned a typed error.
 pub fn retry_limit_names_each_crashed_attempt_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -285,7 +285,7 @@ pub fn retry_limit_names_each_crashed_attempt_test() {
 /// A compensation decision that crashes, or outlives `cleanup_timeout`, is
 /// an unknown effect of that decision, numbered by the attempt it decided.
 pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
-  let assert Ok(crashing) =
+  let crashing =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -301,7 +301,7 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
   |> should.equal([#("s", execution.StepCompensation(1), Crashed)])
 
   let gate = probe.new_gate()
-  let assert Ok(hanging) =
+  let hanging =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -323,7 +323,7 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
 /// outlives `cleanup_timeout` is an unknown effect of that undo.
 pub fn undo_crash_and_timeout_are_unknown_effects_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let refused =
         input
@@ -370,7 +370,7 @@ pub fn undo_crash_and_timeout_are_unknown_effects_test() {
 /// it as interrupted; a completed, undone step is not an unknown effect.
 pub fn cancel_interrupting_an_attempt_is_an_unknown_effect_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -403,7 +403,7 @@ pub fn cancel_interrupting_an_attempt_is_an_unknown_effect_test() {
 /// interrupted, and named as such.
 pub fn cancel_interrupting_a_compensation_is_an_unknown_effect_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -433,7 +433,7 @@ pub fn cancel_interrupting_a_compensation_is_an_unknown_effect_test() {
 /// A crash the decider answers with `Hold` is unresolved, and the crashed
 /// attempt is named as an unknown effect.
 pub fn crash_held_is_an_unknown_effect_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -455,7 +455,7 @@ pub fn crash_held_is_an_unknown_effect_test() {
 
 /// A typed error the decider holds leaves nothing unknown.
 pub fn typed_error_held_has_known_effects_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -485,7 +485,7 @@ fn maybe_sent(error: DemoError) -> Bool {
 pub fn retried_maybe_sent_error_completes_with_unknown_effects_test() {
   let keys = process.new_subject()
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -522,7 +522,7 @@ pub fn retried_maybe_sent_error_completes_with_unknown_effects_test() {
 
 /// A held order after "maybe sent" names the attempt in its settlement.
 pub fn held_maybe_sent_error_is_named_in_the_settlement_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -542,11 +542,12 @@ pub fn held_maybe_sent_error_is_named_in_the_settlement_test() {
   |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
 }
 
-/// Without a decider, the classified error ends the run like any error and
-/// is still named; an error the classifier rejects is a known result.
+/// Without a decider, the classified error ends the run `Unresolved` with
+/// the error as evidence and is named; an error the classifier rejects is a
+/// known result and fails the run.
 pub fn classified_error_without_decider_is_named_test() {
   let make = fn(error) {
-    let assert Ok(workflow) =
+    let workflow =
       saga.define("wf", fn(input) {
         input
         |> saga.perform(
@@ -558,7 +559,8 @@ pub fn classified_error_without_decider_is_named_test() {
     outcome
   }
   let unknown = make(MaybeSent)
-  let assert execution.Failed(execution.StepFailed(_, MaybeSent), _) = unknown
+  let assert execution.Unresolved(step, MaybeSent, _) = unknown
+  step |> should.equal(at("charge"))
   effects(unknown)
   |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
   let known = make(Boom)
@@ -566,10 +568,137 @@ pub fn classified_error_without_decider_is_named_test() {
   effects(known) |> should.equal([])
 }
 
+/// A stock reservation followed by a payment whose outcome is unknown: the
+/// run is built with `on_unknown` set to `policy`, or left at its default.
+fn reserve_then_pay(
+  released: process.Subject(Nil),
+  attempts: Int,
+  policy: Result(saga.OnUnknown, Nil),
+) {
+  let pay =
+    saga.step("pay", fn(_x: Int) { Error(MaybeSent) })
+    |> saga.unknown_when(maybe_sent)
+  let pay = case policy {
+    Ok(policy) -> saga.on_unknown(pay, policy)
+    Error(Nil) -> pay
+  }
+  let pay = case attempts {
+    1 -> pay
+    _ ->
+      saga.compensate(pay, max_attempts: attempts, with: fn(_) { saga.Retry })
+  }
+  saga.define("reserve_then_pay", fn(input) {
+    input
+    |> saga.perform(
+      saga.step("reserve", fn(x: Int) { Ok(x) })
+      |> saga.undo(fn(_) {
+        process.send(released, Nil)
+        Ok(Nil)
+      }),
+    )
+    |> saga.perform(pay)
+  })
+}
+
+/// By default an unknown payment holds the reservation for reconciliation:
+/// the run is `Unresolved` and nothing is undone.
+pub fn unknown_effect_holds_earlier_steps_by_default_test() {
+  let released = process.new_subject()
+  [Error(Nil), Ok(saga.Reconcile)]
+  |> list.each(fn(policy) {
+    let assert Ok(outcome) =
+      execution.run(
+        reserve_then_pay(released, 1, policy),
+        5,
+        execution.config(),
+      )
+    let assert execution.Unresolved(step, MaybeSent, settlement) = outcome
+    step |> should.equal(at("pay"))
+    settlement.held |> should.equal([at("reserve")])
+    settlement.undone |> should.equal([])
+    effects(outcome)
+    |> should.equal([#("pay", execution.StepAttempt(1), ReturnedUnknown)])
+  })
+  process.receive(released, 50) |> should.equal(Error(Nil))
+}
+
+/// `on_unknown(RollBack)` opts into compensation: the run fails and the
+/// reservation is released.
+pub fn on_unknown_roll_back_undoes_earlier_steps_test() {
+  let released = process.new_subject()
+  let assert Ok(outcome) =
+    execution.run(
+      reserve_then_pay(released, 1, Ok(saga.RollBack)),
+      5,
+      execution.config(),
+    )
+  let assert execution.Failed(execution.StepFailed(step, MaybeSent), settlement) =
+    outcome
+  step |> should.equal(at("pay"))
+  settlement.undone |> should.equal([at("reserve")])
+  effects(outcome)
+  |> should.equal([#("pay", execution.StepAttempt(1), ReturnedUnknown)])
+  process.receive(released, 1000) |> should.equal(Ok(Nil))
+}
+
+/// A decider that keeps retrying an unknown payment past its budget asked
+/// for no rollback: the run holds. With `RollBack` it fails and undoes.
+pub fn exhausted_retries_after_an_unknown_effect_follow_on_unknown_test() {
+  let released = process.new_subject()
+  let assert Ok(held) =
+    execution.run(
+      reserve_then_pay(released, 2, Error(Nil)),
+      5,
+      execution.config(),
+    )
+  let assert execution.Unresolved(_, MaybeSent, settlement) = held
+  settlement.held |> should.equal([at("reserve")])
+  process.receive(released, 50) |> should.equal(Error(Nil))
+  let assert Ok(failed) =
+    execution.run(
+      reserve_then_pay(released, 2, Ok(saga.RollBack)),
+      5,
+      execution.config(),
+    )
+  let assert execution.Failed(
+    execution.RetryLimitReached(_, saga.Returned(MaybeSent)),
+    settlement,
+  ) = failed
+  settlement.undone |> should.equal([at("reserve")])
+  process.receive(released, 1000) |> should.equal(Ok(Nil))
+}
+
+/// A decider's explicit `Abort` grants rollback authority whatever the
+/// policy says.
+pub fn an_aborting_decider_still_rolls_back_an_unknown_effect_test() {
+  let released = process.new_subject()
+  let workflow =
+    saga.define("abort_unknown", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("reserve", fn(x: Int) { Ok(x) })
+        |> saga.undo(fn(_) {
+          process.send(released, Nil)
+          Ok(Nil)
+        }),
+      )
+      |> saga.perform(
+        saga.step("pay", fn(_x: Int) { Error(MaybeSent) })
+        |> saga.unknown_when(maybe_sent)
+        |> saga.compensate(max_attempts: 1, with: fn(_) { saga.Abort(Boom) }),
+      )
+    })
+  let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
+  let assert execution.Failed(execution.StepFailed(_, Boom), settlement) =
+    outcome
+  settlement.undone |> should.equal([at("reserve")])
+  process.receive(released, 1000) |> should.equal(Ok(Nil))
+}
+
 /// The classifier applies before `map_step_errors`, in the step's own
 /// vocabulary, and survives the mapping.
 pub fn classifier_survives_error_mapping_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -581,7 +710,7 @@ pub fn classifier_survives_error_mapping_test() {
       )
     })
   let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
-  let assert execution.Failed(execution.StepFailed(_, "mapped"), _) = outcome
+  let assert execution.Unresolved(_, "mapped", _) = outcome
   effects(outcome)
   |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
 }

@@ -151,6 +151,7 @@ pub fn map_errors(
     timeout: a_node.timeout,
     undoable: a_node.undoable,
     compensates: a_node.compensates,
+    rolls_back_unknown: a_node.rolls_back_unknown,
     prepare_attempt: fn(attempt, run_store) {
       let body = a_node.prepare_attempt(attempt, run_store)
       fn() { map_attempt_result(body(), map_error, map_undo_error) }
@@ -259,6 +260,9 @@ fn map_attempt_result(
 /// configured `undo`/`compensate`, independent of what a particular
 /// attempt's closures happen to return at run time (kept for the static
 /// `StepDescriptor`, which must not run any step to answer).
+/// `rolls_back_unknown` is the step's `saga.on_unknown(RollBack)`: whether
+/// an error classified unknown, with no decision to settle it, rolls the
+/// run back instead of ending it unresolved.
 pub type Node(e, u) {
   Node(
     id: Int,
@@ -270,6 +274,7 @@ pub type Node(e, u) {
     timeout: Option(Int),
     undoable: Bool,
     compensates: Bool,
+    rolls_back_unknown: Bool,
     prepare_attempt: fn(Attempt, Store) -> fn() -> AttemptResult(e, u),
     prepare_crash_recovery: Option(
       fn(AttemptFailure(e), Attempt, Store) -> fn() -> ErasedRecovery(e, u),

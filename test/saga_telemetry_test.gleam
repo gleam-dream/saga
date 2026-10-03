@@ -138,7 +138,7 @@ fn undo_kind_string(kind: telemetry.UndoKind) -> String {
 /// step, and `run_stop:completed`.
 pub fn observation_events_test() {
   let collector = new_collector()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("obs_completed", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -158,7 +158,7 @@ pub fn observation_events_test() {
 /// is emitted, and the undo's outcome is observed via `undo_stop`.
 pub fn observation_events_failed_with_undo_failure_test() {
   let collector = new_collector()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("obs_failed", fn(input) {
       let a =
         input
@@ -185,7 +185,7 @@ pub fn observation_events_failed_with_undo_failure_test() {
 pub fn observation_events_cancelled_test() {
   let collector = new_collector()
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("obs_cancelled", fn(input) {
       input
       |> saga.perform(
@@ -233,7 +233,7 @@ pub fn step_timeout_with_decider_emits_step_stopped_test() {
       }),
     ])
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -291,7 +291,7 @@ pub fn step_timeout_without_decider_reports_real_duration_test() {
       }),
     ])
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -317,7 +317,7 @@ pub fn step_timeout_without_decider_reports_real_duration_test() {
 /// the failure is reported through `on_failure`, never re-raised into the
 /// coordinator) — the run's outcome is unaffected.
 pub fn raising_handler_does_not_change_outcome_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("obs_raising", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -338,7 +338,7 @@ pub fn raising_handler_does_not_change_outcome_test() {
 pub fn correlation_reaches_every_event_test() {
   let seen = process.new_subject()
   let assert Ok(order) = correlation.from_string("order-42")
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("correlated", fn(input) {
       input
       |> saga.perform(
@@ -383,7 +383,7 @@ pub fn correlation_reaches_every_event_test() {
 pub fn outcome_kind_is_shared_with_run_stop_test() {
   let kinds = process.new_subject()
   let attempts = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("kinds", fn(input) {
       input
       |> saga.perform(
@@ -416,12 +416,22 @@ pub fn outcome_kind_is_shared_with_run_stop_test() {
   |> should.equal("completed_with_unknown_effects")
 }
 
-pub fn describe_cause_names_the_step_test() {
+pub fn describe_cause_names_the_step_and_its_error_test() {
   let address =
     saga.StepAddress(scope: ["checkout"], name: "charge", occurrence: 1)
-  execution.describe_cause(execution.StepTimedOut(address))
+  let describe = fn(error: String) { "HTTP " <> error }
+  execution.describe_cause(execution.StepFailed(address, "500"), describe)
+  |> should.equal("step checkout/charge returned an error: HTTP 500")
+  execution.describe_cause(
+    execution.RetryLimitReached(address, saga.Returned("503")),
+    error: describe,
+  )
+  |> should.equal(
+    "step checkout/charge used its whole attempt budget; the last attempt returned an error: HTTP 503",
+  )
+  execution.describe_cause(execution.StepTimedOut(address), describe)
   |> should.equal("step checkout/charge timed out")
-  execution.describe_cause(execution.DeadlineExceeded)
+  execution.describe_cause(execution.DeadlineExceeded, describe)
   |> should.equal("the run passed its deadline")
 }
 

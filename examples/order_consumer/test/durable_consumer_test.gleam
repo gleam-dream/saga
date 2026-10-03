@@ -116,17 +116,16 @@ fn payment_workflow(
       output: receipt_codec(),
       resolve: fn(_charge, _key) { durable.MaybeSent },
     )
-  let assert Ok(workflow) = saga.define("payment", saga.perform(_, pay))
+  let workflow = saga.define("payment", saga.perform(_, pay))
   workflow
 }
 
 pub fn durable_payment_with_caller_types_test() {
   let calls = process.new_subject()
   let workflow = payment_workflow(calls)
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: charge_codec(),
       output: receipt_codec(),
       error: error_codec(),
@@ -159,20 +158,9 @@ pub fn durable_payment_with_caller_types_test() {
 }
 
 pub fn durable_errors_are_classified_test() {
-  let calls = process.new_subject()
   let assert Ok(store) = memory.start()
   let text = codec.text()
-  let assert Error(durable.NotPersistable(problems)) =
-    durable.new(
-      payment_workflow(calls),
-      version: "1",
-      input: charge_codec(),
-      output: receipt_codec(),
-      error: error_codec(),
-      undo_error: codec.new("", fn(_) { Ok("") }, fn(_) { Ok(Nil) }),
-    )
-  problems |> should_be([durable.EmptyCodecVersion(durable.RunUndoError)])
-  let assert Ok(echo_workflow) =
+  let echo_workflow =
     saga.define("echo", fn(input) {
       saga.perform(
         input,
@@ -185,10 +173,9 @@ pub fn durable_errors_are_classified_test() {
           ),
       )
     })
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       echo_workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,
@@ -216,7 +203,7 @@ pub fn durable_errors_are_classified_test() {
 
 pub fn public_durable_choice_test() {
   let text = codec.text()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("consumer", fn(input) {
       saga.choose(
         input,
@@ -250,10 +237,9 @@ pub fn public_durable_choice_test() {
     })
   let assert Ok(execution.Completed("input-right")) =
     execution.run(workflow, "input", execution.config())
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,
@@ -329,12 +315,11 @@ pub fn public_compensation_configuration_test() {
       output: text,
       resolve: fn(_, _) { durable.MaybeSent },
     )
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("compensation", fn(input) { saga.perform(input, step) })
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,

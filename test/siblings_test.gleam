@@ -20,7 +20,7 @@ pub fn failure_with_active_siblings_settles_test() {
   let slow_gate = probe.new_gate()
   let slow_undo_counter = probe.new_counter()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("siblings", fn(input) {
       let slow =
         input

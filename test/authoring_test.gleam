@@ -1,5 +1,6 @@
 import gleam/erlang/process
 import gleam/list
+import gleam/string
 import gleeunit/should
 import saga
 
@@ -11,9 +12,32 @@ pub type DemoUndoError {
   UndoBoom
 }
 
+@external(erlang, "saga_test_panic", "message")
+fn panic_message(body: fn() -> a) -> Result(String, Nil)
+
+/// A source workflow's defects are bugs: `define` panics naming the
+/// workflow and every offending step.
+pub fn define_panics_naming_every_defect_test() {
+  let assert Ok(message) =
+    panic_message(fn() {
+      saga.define("wf", fn(input) {
+        input
+        |> saga.perform(
+          saga.step("a", fn(x: Int) -> Result(Int, Nil) { Ok(x) })
+          |> saga.timeout(0),
+        )
+        |> saga.perform(saga.step("", fn(x: Int) { Ok(x) }))
+      })
+    })
+  string.contains(message, "saga.define: workflow \"wf\" is invalid")
+  |> should.be_true
+  string.contains(message, "step a has timeout 0 ms") |> should.be_true
+  string.contains(message, "a step name is empty") |> should.be_true
+}
+
 pub fn define_rejects_empty_names_test() {
   let result =
-    saga.define("", fn(input) {
+    saga.try_define("", fn(input) {
       input |> saga.perform(saga.step("a", fn(x) { Ok(x) }))
     })
   case result {
@@ -25,7 +49,7 @@ pub fn define_rejects_empty_names_test() {
 
 pub fn define_rejects_empty_step_names_test() {
   let result =
-    saga.define("wf", fn(input) {
+    saga.try_define("wf", fn(input) {
       input |> saga.perform(saga.step("", fn(x) { Ok(x) }))
     })
   case result {
@@ -43,7 +67,7 @@ pub fn define_rejects_empty_step_names_test() {
 
 pub fn define_rejects_invalid_attempts_test() {
   let result =
-    saga.define("wf", fn(input) {
+    saga.try_define("wf", fn(input) {
       input
       |> saga.perform(
         saga.step("a", fn(x: Int) { Ok(x) })
@@ -67,7 +91,7 @@ pub fn define_rejects_invalid_attempts_test() {
 
 pub fn define_rejects_invalid_timeout_test() {
   let result =
-    saga.define("wf", fn(input) {
+    saga.try_define("wf", fn(input) {
       input
       |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }) |> saga.timeout(0))
     })
@@ -85,7 +109,7 @@ pub fn define_rejects_invalid_timeout_test() {
 }
 
 pub fn describe_lists_steps_and_dependencies_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("checkout", fn(input) {
       let a = input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))
       let b = a |> saga.perform(saga.step("b", fn(x: Int) { Ok(x + 1) }))
@@ -103,7 +127,7 @@ pub fn describe_lists_steps_and_dependencies_test() {
 }
 
 pub fn repeated_step_occurrences_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let a = input |> saga.perform(saga.step("dup", fn(x: Int) { Ok(x + 1) }))
       a |> saga.perform(saga.step("dup", fn(x: Int) { Ok(x + 1) }))
@@ -118,7 +142,7 @@ pub fn repeated_step_occurrences_test() {
 }
 
 pub fn describe_reports_capabilities_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -144,7 +168,7 @@ pub fn foreign_port_rejected_test() {
   let captured = capture_port_from_first_definition()
 
   let result =
-    saga.define("second", fn(_input) {
+    saga.try_define("second", fn(_input) {
       captured |> saga.perform(saga.step("consumer", fn(v: Int) { Ok(v) }))
     })
 
@@ -167,7 +191,7 @@ fn capture_port_from_first_definition() -> saga.Port(
   DemoUndoError,
 ) {
   let holder = process.new_subject()
-  let assert Ok(_) =
+  let _ =
     saga.define("first", fn(input) {
       let port = input |> saga.perform(saga.step("a", fn(v: Int) { Ok(v) }))
       process.send(holder, port)
@@ -178,7 +202,7 @@ fn capture_port_from_first_definition() -> saga.Port(
 }
 
 fn inner_workflow() -> saga.Workflow(Int, Int, DemoError, DemoUndoError) {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("inner", fn(input) {
       input |> saga.perform(saga.step("inner_step", fn(x: Int) { Ok(x + 1) }))
     })
@@ -186,7 +210,7 @@ fn inner_workflow() -> saga.Workflow(Int, Int, DemoError, DemoUndoError) {
 }
 
 pub fn embedded_workflow_scopes_addresses_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("outer", fn(input) {
       let embedded = input |> saga.embed(inner_workflow())
       embedded |> saga.perform(saga.step("outer_step", fn(x: Int) { Ok(x) }))
@@ -208,7 +232,7 @@ pub fn embedded_workflow_scopes_addresses_test() {
 /// under the same nested scope path, disambiguated by occurrence — not
 /// merged into one node and not collapsed into the parent's own scope.
 pub fn repeated_embed_scopes_and_disambiguates_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("outer", fn(input) {
       let a = input |> saga.embed(inner_workflow())
       let b = a |> saga.embed(inner_workflow())
@@ -250,7 +274,7 @@ pub fn embed_rejects_builder_returning_foreign_port_test() {
   // splice it into a different, unrelated `define`'s own evaluation — see
   // `Workflow`'s doc comment) ignores `input` and returns a port stashed
   // from a third, unrelated `define` call below.
-  let assert Ok(wf) =
+  let wf =
     saga.define("nd9", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       let assert Ok(n) = process.receive(calls, 0)
       process.send(calls, n + 1)
@@ -263,7 +287,7 @@ pub fn embed_rejects_builder_returning_foreign_port_test() {
       }
     })
 
-  let assert Ok(_source) =
+  let _source =
     saga.define("source9", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       let p = input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
       process.send(stash, p)
@@ -273,7 +297,7 @@ pub fn embed_rejects_builder_returning_foreign_port_test() {
   // `embed` here is `wf`'s second builder invocation (the first happened
   // inside `wf`'s own `define` above): it takes the `_ ->` branch and
   // returns the port stashed from `source9`'s unrelated `define`.
-  let result = saga.define("outer9b", fn(input) { saga.embed(input, wf) })
+  let result = saga.try_define("outer9b", fn(input) { saga.embed(input, wf) })
   case result {
     Error(errors) ->
       list.any(errors, fn(e) {
@@ -306,7 +330,7 @@ pub fn embed_rejects_map_errors_builder_returning_foreign_port_test() {
   process.send(calls, 0)
   let stash = process.new_subject()
 
-  let assert Ok(wf) =
+  let wf =
     saga.define("nd9m", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       let assert Ok(n) = process.receive(calls, 0)
       process.send(calls, n + 1)
@@ -320,7 +344,7 @@ pub fn embed_rejects_map_errors_builder_returning_foreign_port_test() {
     })
   let mapped = saga.map_errors(wf, error: fn(e) { e }, undo_error: fn(u) { u })
 
-  let assert Ok(_source) =
+  let _source =
     saga.define("source9m", fn(input: saga.Port(Int, DemoError, DemoUndoError)) {
       let p = input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
       process.send(stash, p)
@@ -331,7 +355,8 @@ pub fn embed_rejects_map_errors_builder_returning_foreign_port_test() {
   // original builder under a shadow scope — this is `wf`'s second
   // invocation, taking the `_ ->` branch and returning the port stashed
   // from `source9m`'s unrelated `define`.
-  let result = saga.define("outer9m", fn(input) { saga.embed(input, mapped) })
+  let result =
+    saga.try_define("outer9m", fn(input) { saga.embed(input, mapped) })
   case result {
     Error(errors) ->
       list.any(errors, fn(e) {
@@ -346,7 +371,7 @@ pub fn embed_rejects_map_errors_builder_returning_foreign_port_test() {
 }
 
 pub fn shared_dependency_creates_one_node_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("diamond", fn(input) {
       let order =
         input |> saga.perform(saga.step("order", fn(x: Int) { Ok(x + 1) }))
@@ -382,7 +407,7 @@ pub fn map_step_errors_translates_run_and_undo_test() {
       undo_error: fn(_u: DemoUndoError) { "mapped-undo-error" },
     )
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("mapped_wf", fn(input) { input |> saga.perform(mapped) })
 
   let assert [descriptor] = saga.describe(workflow)

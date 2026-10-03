@@ -22,7 +22,7 @@ import support/probe
 /// ran exactly once (at `define`), never again for `map_errors`.
 pub fn map_errors_reuses_validated_graph_test() {
   let calls = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("nd", fn(input: saga.Port(Int, Nil, Nil)) {
       probe.counter_enter(calls)
       case probe.total_entries(calls) {
@@ -68,7 +68,7 @@ pub fn map_errors_reuses_validated_graph_test() {
 pub fn map_errors_stale_port_does_not_crash_run_test() {
   let calls = probe.new_counter()
   let stashed = process.new_subject()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("nd2", fn(input: saga.Port(Int, Nil, Nil)) {
       probe.counter_enter(calls)
       case probe.total_entries(calls) {
@@ -100,7 +100,7 @@ pub fn map_errors_stale_port_does_not_crash_run_test() {
 /// original). Nothing else ever invokes a builder.
 pub fn builder_runs_once_per_define_and_once_per_embed_test() {
   let inner_calls = probe.new_counter()
-  let assert Ok(inner) =
+  let inner =
     saga.define("inner", fn(input: saga.Port(Int, Nil, Nil)) {
       probe.counter_enter(inner_calls)
       input |> saga.perform(saga.step("double", fn(x: Int) { Ok(x * 2) }))
@@ -129,7 +129,7 @@ pub fn builder_runs_once_per_define_and_once_per_embed_test() {
   // the *original* inner builder (embed's translating `build`, validated
   // by the outer define's own one evaluation) -- never two, never zero.
   let outer_calls = probe.new_counter()
-  let assert Ok(outer) =
+  let outer =
     saga.define("outer", fn(input: saga.Port(Int, Nil, Nil)) {
       probe.counter_enter(outer_calls)
       saga.embed(input, mapped)

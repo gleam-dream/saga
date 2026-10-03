@@ -23,10 +23,9 @@ type Persistence =
 
 fn prepare(workflow: saga.Workflow(String, String, String, String)) {
   let text = codec.text()
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,
@@ -42,7 +41,7 @@ fn one_step(
   body: fn(String) -> Result(String, String),
   resolved: Subject(String),
 ) -> Persistence {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("one-step", fn(input) {
       saga.perform(
         input,
@@ -75,6 +74,18 @@ fn listed(store: Storage, id: String) -> Bool {
 /// The same storage, reporting the process that claims (the runner) to
 /// `owner`, with the same renewal.
 fn watched(backend: Storage, owner: Subject(Pid)) -> Storage {
+  watched_releasing(backend, owner, fn(claim) {
+    storage.do_release(backend, claim)
+  })
+}
+
+/// Like `watched`, with `release` replaced, to stand in for a release that
+/// never reaches the database.
+fn watched_releasing(
+  backend: Storage,
+  owner: Subject(Pid),
+  release: fn(storage.Claim) -> Result(Nil, storage.Error),
+) -> Storage {
   let rebuilt =
     storage.new(
       create: fn(id, data) { storage.do_create(backend, id, data) },
@@ -88,7 +99,7 @@ fn watched(backend: Storage, owner: Subject(Pid)) -> Storage {
         result
       },
       commit: fn(claim, change) { storage.do_commit(backend, claim, change) },
-      release: fn(claim) { storage.do_release(backend, claim) },
+      release: release,
       cancel: fn(id) { storage.do_cancel(backend, id) },
       unfinished: fn(limit) { storage.do_unfinished(backend, limit) },
     )
@@ -170,11 +181,13 @@ pub fn a_live_runner_keeps_its_claim_past_the_lease_test() {
   support.drop(connection, schema)
 }
 
-pub fn a_killed_runner_is_resumed_after_its_lease_test() {
+/// A runner killed while `drive`'s caller lives loses its claim at once:
+/// the next drive resumes without waiting for the lease.
+pub fn a_killed_runner_frees_its_execution_at_once_test() {
   use connection <- support.using_pool(4)
   let schema = support.schema()
   let store =
-    support.migrated(connection, schema, lease) |> saga_postgres.storage
+    support.migrated(connection, schema, 30_000) |> saga_postgres.storage
   let owner = process.new_subject()
   let entered = process.new_subject()
   let resolved = process.new_subject()
@@ -195,7 +208,47 @@ pub fn a_killed_runner_is_resumed_after_its_lease_test() {
   })
   let assert Ok(runner) = process.receive(owner, 5000)
   let assert Ok(Nil) = process.receive(entered, 5000)
-  // The runner dies without releasing its claim.
+  kill_and_wait(runner)
+  process.receive(result, 5000)
+  |> should.equal(Ok(Error(durable.RunnerLost)))
+  // The 30 s lease does not matter: drive released the claim.
+  listed(store, id) |> should.be_true
+  let assert Ok(resumed) = durable.reconnect(persistence, store, id:)
+  durable.drive(resumed, timeout: 10_000)
+  |> should.equal(Ok(execution.Completed("x recovered")))
+  process.receive(resolved, 0) |> should.equal(Ok("x"))
+  process.receive(entered, 0) |> should.equal(Error(Nil))
+  support.drop(connection, schema)
+}
+
+/// When no release reaches the database, as when the runner's VM is lost,
+/// the claim ends when its lease expires.
+pub fn a_lost_release_falls_back_to_the_lease_test() {
+  use connection <- support.using_pool(4)
+  let schema = support.schema()
+  let store =
+    support.migrated(connection, schema, lease) |> saga_postgres.storage
+  let owner = process.new_subject()
+  let entered = process.new_subject()
+  let resolved = process.new_subject()
+  let persistence =
+    one_step(
+      fn(_value) {
+        process.send(entered, Nil)
+        process.sleep_forever()
+        Error("unreachable")
+      },
+      resolved,
+    )
+  let id = support.id()
+  let run =
+    start(persistence, watched_releasing(store, owner, fn(_) { Ok(Nil) }), id)
+  let result = process.new_subject()
+  process.spawn_unlinked(fn() {
+    process.send(result, durable.drive(run, timeout: 30_000))
+  })
+  let assert Ok(runner) = process.receive(owner, 5000)
+  let assert Ok(Nil) = process.receive(entered, 5000)
   kill_and_wait(runner)
   process.receive(result, 5000)
   |> should.equal(Ok(Error(durable.RunnerLost)))

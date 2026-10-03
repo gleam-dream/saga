@@ -6,7 +6,9 @@
 //// values (any holder may commit; a rebuilt claim with another token is
 //// refused), revision and generation checks, cancellation races, release,
 //// that a live owner keeps its claim, that a lost owner's claim ends within
-//// `owner_loss_within` milliseconds, and the `unfinished` listing. One
+//// `owner_loss_within` milliseconds, the `unfinished` listing, and that a
+//// `saga/durable` drive whose runner is killed frees the execution at once
+//// for the next drive, which resumes from the checkpoint. One
 //// fixture may serve several executions, as a database pool does. The
 //// memory, file and PostgreSQL adapters pass the same checks.
 ////
@@ -38,6 +40,10 @@ import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
+import saga
+import saga/codec
+import saga/durable
+import saga/execution
 import saga/internal/ffi
 import saga/storage.{type Claim, type Storage, type Stored}
 
@@ -88,6 +94,7 @@ pub fn run(
       owner_loss,
       live_owner_keeps_claim,
       unfinished_listing,
+      killed_runner,
     ],
     fn(check) {
       use fixture <- result.try(fresh() |> result.map_error(SetupFailed))
@@ -613,5 +620,117 @@ fn stays_busy(
       process.sleep(every)
       stays_busy(s, id, until, every)
     }
+  }
+}
+
+/// A drive whose runner is killed while its caller lives returns
+/// `RunnerLost` and frees the execution: the next drive claims it at once,
+/// well inside `owner_loss_within`, and resumes from the checkpoint.
+fn killed_runner(s: Storage, _within: Int) -> Result(Nil, Failure) {
+  let id = fresh_id()
+  let runners = process.new_subject()
+  let entered = process.new_subject()
+  let watched = reporting_claims(s, runners)
+  let assert Ok(run) =
+    durable.start_or_reconnect(
+      blocking(entered, False),
+      watched,
+      id: id,
+      input: "x",
+    )
+  let lost = process.new_subject()
+  process.spawn(fn() { process.send(lost, durable.drive(run, timeout: 5000)) })
+  use runner <- result.try(
+    process.receive(runners, 5000)
+    |> result.replace_error(UnexpectedResult("killed-runner claim")),
+  )
+  use _ <- result.try(
+    process.receive(entered, 5000)
+    |> result.replace_error(UnexpectedResult("killed-runner attempt")),
+  )
+  process.kill(runner)
+  use _ <- result.try(equal(
+    process.receive(lost, 5000),
+    Ok(Error(durable.RunnerLost)),
+    "a killed runner's drive returns RunnerLost",
+  ))
+  use resumed <- result.try(
+    durable.reconnect(blocking(entered, True), s, id: id)
+    |> result.replace_error(UnexpectedResult("killed-runner reconnect")),
+  )
+  equal(
+    durable.drive(resumed, timeout: 5000),
+    Ok(execution.Completed("x recovered")),
+    "the next drive after a killed runner claims at once and resumes",
+  )
+}
+
+/// One durable step that blocks until its runner dies; after a restart
+/// (`recovered`), its resolver reports the attempt completed.
+fn blocking(
+  entered: process.Subject(Nil),
+  recovered: Bool,
+) -> durable.Persistence(String, String, String, String) {
+  let text = codec.text()
+  let workflow =
+    saga.define("saga-conformance-killed-runner", fn(input) {
+      saga.perform(
+        input,
+        saga.step("block", fn(value) {
+          process.send(entered, Nil)
+          process.sleep_forever()
+          Ok(value)
+        })
+          |> durable.recoverable(
+            version: "1",
+            input: text,
+            output: text,
+            resolve: fn(value, _) {
+              case recovered {
+                True -> durable.Completed(value <> " recovered")
+                False -> durable.MaybeSent
+              }
+            },
+          ),
+      )
+    })
+  durable.new(
+    workflow,
+    input: text,
+    output: text,
+    error: text,
+    undo_error: text,
+  )
+  |> durable.with_config(execution.config() |> execution.without_step_timeout)
+}
+
+/// The storage under test, reporting each process that claims through it
+/// (a durable runner) to `runners`. It keeps the storage's renewal and call
+/// timeout.
+fn reporting_claims(
+  s: Storage,
+  runners: process.Subject(process.Pid),
+) -> Storage {
+  let rebuilt =
+    storage.new(
+      create: fn(id, data) { storage.do_create(s, id, data) },
+      load: fn(id) { storage.do_load(s, id) },
+      claim: fn(id) {
+        let claimed = storage.do_claim(s, id)
+        case claimed {
+          Ok(_) -> process.send(runners, process.self())
+          Error(_) -> Nil
+        }
+        claimed
+      },
+      commit: fn(claim, change) { storage.do_commit(s, claim, change) },
+      release: fn(claim) { storage.do_release(s, claim) },
+      cancel: fn(id) { storage.do_cancel(s, id) },
+      unfinished: fn(limit) { storage.do_unfinished(s, limit) },
+    )
+    |> storage.with_call_timeout(storage.call_timeout(s))
+  case storage.renewal(s) {
+    Some(#(every, renew)) -> storage.with_renewal(rebuilt, every:, renew:)
+    None -> rebuilt
   }
 }

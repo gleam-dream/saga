@@ -115,7 +115,9 @@ saga.effect("charge", charge)
 A returned error the classifier marks is named in `execution.unknown_effects`
 with the new ending `execution.ActionReturnedUnknown`. A test or report that
 expected a plain `Completed` after a retried "maybe sent" error now sees
-`CompletedWithUnknownEffects` (CHK-3).
+`CompletedWithUnknownEffects` (CHK-3). Since the follow-up fixes, such an
+error with no decision to settle it ends the run `Unresolved` instead of
+rolling back; see "Follow-up fixes".
 
 ### Persistence modifiers moved to `saga/durable`
 
@@ -256,7 +258,8 @@ case effect.ending {
 
 ### New
 
-`kind(outcome) -> telemetry.OutcomeKind`, `describe_cause(cause)`,
+`kind(outcome) -> telemetry.OutcomeKind`, `describe_cause(cause)` (it takes
+`error:` since the follow-up fixes),
 `describe_config_error(error)`, and the setters above.
 
 ## `saga/telemetry` (was `saga/observation`)
@@ -298,6 +301,9 @@ durable.prepare(workflow, "1", input_codec, output_codec, error_codec, undo_code
 // after
 durable.new(workflow, version: "1", input: input_codec, output: output_codec, error: error_codec, undo_error: undo_codec)
 ```
+
+The follow-up fixes make `new` total and move `version:` to
+`durable.with_version`; see "Follow-up fixes".
 
 ### One `Run` handle; storage addressed by id
 
@@ -673,3 +679,163 @@ publisher's idempotency header), and `recoverable`/`restore_undo` move to
 `execution.Config(..)` becomes setters; telemetry handlers that pattern-match
 the metadata records positionally need labels, and can attribute saga events
 by `metadata.execution`.
+
+## Follow-up fixes
+
+Four changes after the wave 3 re-runs of checkout, support_desk and
+research_agent. Each one is breaking; the fifth item is a fix with no API
+change.
+
+### An unknown effect holds the run unless the step opts into rollback
+
+A returned error that `unknown_when` marks, with no `compensate` decision to
+settle it, used to end the run `Failed` and undo the completed steps. It now
+ends the run `Unresolved(step, error, settlement)` and undoes nothing, as a
+`Hold(error)` decision does: `settlement.held` lists the steps left in place.
+The same rule applies when the decider asked for a retry that the attempt
+budget no longer allows after an unknown attempt (the cause was
+`RetryLimitReached`), and to a resolver's `Failed` answer after a durable
+restart. A decider's explicit `Abort` still rolls back; crashes and timeouts
+are unchanged.
+
+```gleam
+// before: a `Hold` decider kept the reservation of an uncertain payment
+saga.step("pay", pay)
+|> saga.unknown_when(is_maybe_sent)
+|> saga.compensate(max_attempts: 1, with: fn(failed) {
+  case failed.failure {
+    saga.Returned(error) -> saga.Hold(error)
+    _ -> saga.Abort(Interrupted)
+  }
+})
+// after: holding is the default
+saga.step("pay", pay)
+|> saga.unknown_when(is_maybe_sent)
+```
+
+To keep the previous rollback, opt in with `on_unknown`:
+
+```gleam
+// before: Failed(StepFailed(step, MaybeSent), settlement) and the earlier steps undone
+saga.step("pay", pay) |> saga.unknown_when(is_maybe_sent)
+// after: the same outcome
+saga.step("pay", pay)
+|> saga.unknown_when(is_maybe_sent)
+|> saga.on_unknown(saga.RollBack)
+```
+
+A `case` on the outcome that matched `Failed(StepFailed(_, MaybeSent), _)`
+for such a step matches `Unresolved(_, MaybeSent, _)` instead.
+
+### `saga.define` returns the `Workflow`
+
+A definition defect is a bug in the source (decision 4), so `define` panics
+with a message that names the workflow and every offending step.
+`saga.try_define` keeps the `Result` for workflows built from runtime data.
+
+```gleam
+// before
+let assert Ok(workflow) = saga.define("checkout", build)
+// after
+let workflow = saga.define("checkout", build)
+
+// before: names from runtime data
+case saga.define(config.name, build) {
+  Ok(workflow) -> Ok(workflow)
+  Error(errors) -> Error(list.map(errors, saga.describe_definition_error))
+}
+// after
+case saga.try_define(config.name, build) {
+  Ok(workflow) -> Ok(workflow)
+  Error(errors) -> Error(list.map(errors, saga.describe_definition_error))
+}
+```
+
+### `durable.new` is total and defaults the version
+
+`new` drops `version:` and starts at workflow version `"1"`;
+`durable.with_version` sets another and panics on an empty one. A workflow
+that cannot be persisted (a step without `recoverable`, a compensating step
+without `restore_undo`, an empty step or codec version) panics with a
+message naming every step and codec. `NotPersistable` and
+`PersistenceProblem` are removed.
+
+```gleam
+// before
+let assert Ok(persistence) =
+  durable.new(workflow, version: "1", input: order, output: text, error: text, undo_error: text)
+// after
+let persistence =
+  durable.new(workflow, input: order, output: text, error: text, undo_error: text)
+
+// before
+let assert Ok(persistence) =
+  durable.new(workflow, version: "2", input: order, output: text, error: text, undo_error: text)
+// after
+let persistence =
+  durable.new(workflow, input: order, output: text, error: text, undo_error: text)
+  |> durable.with_version("2")
+```
+
+A version of `"1"` keeps the stamp of executions saved before this change.
+
+### `execution.describe_cause` renders the step's error
+
+`describe_cause` takes a describer for the step's error type and includes
+its text; a retry-limit or superseded-retry cause also describes the last
+attempt.
+
+```gleam
+// before: "step publish returned an error"
+case cause {
+  execution.StepFailed(_, PublishError(_, detail)) -> "publish failed: " <> detail
+  _ -> execution.describe_cause(cause)
+}
+// after: "step publish returned an error: HTTP 500"
+execution.describe_cause(cause, error: describe_publish_error)
+```
+
+### A killed runner releases its claim
+
+No API change. When the runner process is killed or crashes while `drive`'s
+caller lives, `drive` releases the claim before it returns `RunnerLost`, so
+the next `drive` resumes at once from the checkpoint instead of returning
+`StorageFailure(Busy)` until saga_postgres's 30 s lease expires. A grind job
+that snoozed `Busy` for the lease only to cover this case may snooze for
+less, but should still snooze `Busy` for at least the storage's owner-loss
+window: the lease remains the fallback when the runner's node is lost.
+`saga/storage/conformance` now also drives a durable run, kills its runner,
+and requires the next drive to claim and resume at once; a third-party
+adapter passes it without change unless its `release` depends on the
+calling process.
+
+```gleam
+// before: the killed runner's claim blocked the next drive for the lease
+let assert Error(durable.RunnerLost) = lost
+let assert Error(durable.StorageFailure(storage.Busy)) = durable.drive(run, timeout: 10_000)
+// after
+let assert Error(durable.RunnerLost) = lost
+let assert Ok(outcome) = durable.drive(run, timeout: 10_000)
+```
+
+### Dependents
+
+- **fabric/integrations/fabric_saga**: `src` builds unchanged. Its tests
+  replace `let assert Ok(workflow) = saga.define(..)` with `let workflow =
+saga.define(..)` (8 sites); with that change all 39 tests pass. A refund
+  marked with `unknown_when` now ends `Unresolved`, which the tool already
+  reports as uncertain.
+- **fabric/consumers/app**, **fabric/experiments/workflow_composition**:
+  `saga.define` (1 and 3 sites).
+- **oversight/apps/checkout**: `saga.define` (2 sites), `durable.new` drops
+  `version: "1"`, and `execution.describe_cause` (1 site) takes `error:`.
+  Its payment and shipment deciders decide every unknown error explicitly,
+  so the outcomes do not change. The `Busy` snooze can stay at the lease.
+- **oversight/apps/support_desk**: `saga.define` (1 site). The refund step
+  has no decider, so an unknown refund now ends `Unresolved` instead of
+  `Failed`; a workflow whose uncertain step follows a payment needs no
+  `Hold` decider any more.
+- **oversight/apps/research_agent**: `saga.define` (1 site), `durable.new`
+  drops `version:`, and `publish.describe` can call
+  `execution.describe_cause(cause, error: ..)` instead of matching
+  `StepFailed` for the detail.

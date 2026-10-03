@@ -55,7 +55,7 @@ fn schedulers_online() -> Int {
 /// 60 second wait) to keep the test fast.
 pub fn default_step_timeout_bounds_a_hung_step_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -84,7 +84,7 @@ pub fn default_step_timeout_bounds_a_hung_step_test() {
 /// schedule, well before the (longer) default would have fired.
 pub fn step_timeout_overrides_default_when_shorter_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -116,7 +116,7 @@ pub fn step_timeout_overrides_default_when_shorter_test() {
 /// pre-empt a step that explicitly asked for more time.
 pub fn step_timeout_overrides_default_when_longer_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -141,7 +141,7 @@ pub fn step_timeout_overrides_default_when_longer_test() {
 /// finishing step still completes normally.
 pub fn step_timeout_none_disables_the_default_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -168,7 +168,7 @@ pub type DemoUndoError {
 
 pub fn invalid_config_rejected_before_start_test() {
   let coordinator_counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -201,7 +201,7 @@ pub fn invalid_config_rejected_before_start_test() {
 }
 
 pub fn every_config_error_variant_is_reachable_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -236,7 +236,7 @@ pub fn every_config_error_variant_is_reachable_test() {
 /// Every setter is accepted at its boundary value, and `without_step_timeout`
 /// is the explicit opt-out of the default per-attempt timeout.
 pub fn boundary_values_are_accepted_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
@@ -256,7 +256,7 @@ pub fn boundary_values_are_accepted_test() {
 /// 10 ms, a requested hour-long backoff retries at once and the run ends.
 pub fn retry_after_delay_is_capped_test() {
   let attempts = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -282,7 +282,7 @@ pub fn retry_after_delay_is_capped_test() {
 pub fn default_retry_delay_cap_is_five_minutes_test() {
   let delays = process.new_subject()
   let attempts = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -316,7 +316,7 @@ pub fn default_retry_delay_cap_is_five_minutes_test() {
 }
 
 pub fn concurrent_runs_are_isolated_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x * 2) }))
     })
@@ -333,7 +333,7 @@ pub fn concurrent_runs_are_isolated_test() {
 }
 
 pub fn map_panic_crashes_attempt_not_coordinator_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
@@ -348,7 +348,7 @@ pub fn map_panic_crashes_attempt_not_coordinator_test() {
   }
 
   // The coordinator itself survived: a second, independent run still works.
-  let assert Ok(workflow2) =
+  let workflow2 =
     saga.define("wf2", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x + 1) }))
     })
@@ -359,7 +359,7 @@ pub fn map_panic_crashes_attempt_not_coordinator_test() {
 
 pub fn killed_step_task_is_crash_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -408,7 +408,7 @@ fn atom_kill() -> a {
 /// run both sequentially and concurrently.
 pub fn build_function_runs_exactly_once_test() {
   let call_count = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       probe.counter_enter(call_count)
       input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))

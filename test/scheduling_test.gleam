@@ -15,7 +15,7 @@ pub type DemoUndoError {
 }
 
 pub fn sequential_dependency_order_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("seq", fn(input) {
       let a = input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))
       let b = a |> saga.perform(saga.step("b", fn(x: Int) { Ok(x * 2) }))
@@ -30,7 +30,7 @@ pub fn sequential_dependency_order_test() {
 
 pub fn shared_dependency_executes_once_test() {
   let counter = probe.new_counter()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("diamond", fn(input) {
       let order =
         input
@@ -55,7 +55,7 @@ pub fn shared_dependency_executes_once_test() {
 }
 
 pub fn independent_steps_run_in_distinct_processes_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("parallel", fn(input) {
       let a =
         input |> saga.perform(saga.step("a", fn(_x: Int) { Ok(erlang_self()) }))
@@ -85,7 +85,7 @@ pub fn max_concurrency_bounds_running_attempts_test() {
     })
   }
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("fanout", fn(input) {
       let steps =
         list_range(1, 10)
@@ -175,7 +175,7 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
       Ok(x)
     })
   }
-  let assert Ok(wf) =
+  let wf =
     saga.define("rc", fn(input) {
       let a =
         input
@@ -293,7 +293,7 @@ pub fn siblings_admitted_in_builder_order_test() {
     })
   }
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("fanout_order", fn(input) {
       let steps =
         ["first", "second", "third", "fourth", "fifth"]
