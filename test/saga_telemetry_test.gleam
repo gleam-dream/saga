@@ -1,6 +1,6 @@
 import gleam/erlang/process.{type Subject}
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option, None}
 import gleam/time/duration
 import gleeunit/should
 import saga
@@ -377,11 +377,11 @@ pub fn correlation_reaches_every_event_test() {
     "run_start", "step_start", "step_stop", "step_start", "step_stop",
     "undo_stop", "run_stop",
   ])
-  list.all(received, fn(event) { event.1 == Some(order) && event.2 == None })
+  list.all(received, fn(event) { event.1 == order && event.2 == None })
   |> should.be_true
 }
 
-/// Without a correlation the field is absent, and `execution.kind` gives
+/// `execution.kind` gives
 /// `CompletedWithUnknownEffects` its own kind, as `run_stop` does.
 pub fn outcome_kind_is_shared_with_run_stop_test() {
   let kinds = process.new_subject()
@@ -413,8 +413,8 @@ pub fn outcome_kind_is_shared_with_run_stop_test() {
   let assert execution.CompletedWithUnknownEffects(1, [_]) = outcome
   execution.kind(outcome)
   |> should.equal(telemetry.OutcomeCompletedWithUnknownEffects)
-  process.receive(kinds, 1000)
-  |> should.equal(Ok(#(telemetry.OutcomeCompletedWithUnknownEffects, None)))
+  let assert Ok(#(kind, _correlation)) = process.receive(kinds, 1000)
+  kind |> should.equal(telemetry.OutcomeCompletedWithUnknownEffects)
   telemetry.outcome_kind_name(execution.kind(outcome))
   |> should.equal("completed_with_unknown_effects")
 }
@@ -439,9 +439,9 @@ pub fn describe_cause_names_the_step_and_its_error_test() {
 }
 
 fn drain(
-  subject: Subject(#(String, Option(Correlation), Option(String))),
-  acc: List(#(String, Option(Correlation), Option(String))),
-) -> List(#(String, Option(Correlation), Option(String))) {
+  subject: Subject(#(String, Correlation, Option(String))),
+  acc: List(#(String, Correlation, Option(String))),
+) -> List(#(String, Correlation, Option(String))) {
   case process.receive(subject, 0) {
     Ok(event) -> drain(subject, [event, ..acc])
     Error(Nil) -> list.reverse(acc)

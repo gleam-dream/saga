@@ -892,7 +892,7 @@ fn drive_claimed(
       let saved =
         Envelope(
           ..envelope,
-          correlation: option.map(settings.correlation, correlation.to_string),
+          correlation: Some(correlation.to_string(settings.correlation)),
         )
       let written =
         encode_within(saved, persistence, None)
@@ -927,7 +927,7 @@ fn drive_claimed(
       let settings =
         coordinator.Settings(
           ..settings,
-          correlation: Some(correlation.from_key(saved)),
+          correlation: correlation.from_key(saved),
         )
       use input <- result.try(
         codec.decode(persistence.input, envelope.input)
@@ -1253,7 +1253,7 @@ fn open(
 
 /// The correlation a drive of `run` would use if the execution had none
 /// saved: the handle's, or `from_key(id)`.
-fn unsaved_correlation(run: Run(i, o, e, u)) -> Option(Correlation) {
+fn unsaved_correlation(run: Run(i, o, e, u)) -> Correlation {
   execution.correlation_of(run.config, Some(run.id))
 }
 
@@ -1261,9 +1261,9 @@ fn unsaved_correlation(run: Run(i, o, e, u)) -> Option(Correlation) {
 fn saved_correlation(
   run: Run(i, o, e, u),
   envelope: Envelope(o, e, u),
-) -> Option(Correlation) {
+) -> Correlation {
   case envelope.correlation {
-    Some(saved) -> Some(correlation.from_key(saved))
+    Some(saved) -> correlation.from_key(saved)
     None -> unsaved_correlation(run)
   }
 }
@@ -1326,7 +1326,7 @@ fn frame(parts: List(String)) -> String {
 // ---------------------------------------------------------------------------
 
 fn from_checkpoint(
-  correlation: Option(Correlation),
+  correlation: Correlation,
   failure: checkpoint.Failure,
 ) -> Error {
   case failure {

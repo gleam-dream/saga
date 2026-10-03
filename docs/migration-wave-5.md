@@ -23,7 +23,7 @@ pub opaque type EffectKey
 pub fn idempotency_key(key: EffectKey) -> String
 pub fn attempt_number(key: EffectKey) -> Int
 pub fn attempt_key(key: EffectKey) -> String
-pub fn correlation_of(key: EffectKey) -> Option(Correlation)
+pub fn correlation_of(key: EffectKey) -> Correlation
 
 saga.idempotency_key(key)
 saga.attempt_number(key)
@@ -88,16 +88,50 @@ saga.effect("refund_payment", fn(refund: Refund, key) {
 })
 ```
 
-| Run                                                     | `saga.correlation_of(key)`                       |
-| ------------------------------------------------------- | ------------------------------------------------ |
-| local, `execution.with_correlation(c)`                  | `Some(c)`                                        |
-| local, none set                                         | `None`                                           |
-| durable, first drive with `durable.with_correlation(c)` | `Some(c)`, on every drive of the execution       |
-| durable, first drive with none set                      | `Some(correlation.from_key(id))`, on every drive |
-| durable, saved before this release (format 1)           | `Some(correlation.from_key(id))`                 |
+| Run                                                     | `saga.correlation_of(key)`                      |
+| ------------------------------------------------------- | ----------------------------------------------- |
+| local, `execution.with_correlation(c)`                  | `c`                                             |
+| local, none set                                         | a fresh `correlation.unique()`, chosen at start |
+| durable, first drive with `durable.with_correlation(c)` | `c`, on every drive of the execution            |
+| durable, first drive with none set                      | `correlation.from_key(id)`, on every drive      |
+| durable, saved before this release (format 1)           | `correlation.from_key(id)`                      |
 
-The value is the one the run's `saga/telemetry` events carry in
-`metadata.correlation`.
+Every run has a correlation, so there is no `None` arm to write. The
+`unique()` value is per run: it is the same in the run's steps, undos,
+deciders and events, and a second `execution.run` gets another.
+
+### Telemetry correlation is never optional
+
+`correlation: Option(Correlation)` becomes `correlation: Correlation` in six
+records: `RunMetadata`, `RunStopMetadata`, `StepMetadata`,
+`StepStopMetadata`, `CompensationMetadata` and `UndoMetadata`.
+
+```gleam
+// before
+sinal.observe(telemetry.run_stopped(), fn(_m, metadata) {
+  case metadata.correlation {
+    Some(c) -> log(c)
+    None -> log_unjoined()
+  }
+})
+// after
+sinal.observe(telemetry.run_stopped(), fn(_m, metadata) {
+  log(metadata.correlation)
+})
+```
+
+The wire encoding is unchanged, so an Erlang or Elixir handler is
+unaffected. Call sites that change (a `None` arm or an `Option` parameter that
+receives `d.correlation` / `m.correlation` of a saga event, or
+`saga.correlation_of(key)`; the apps are migrated by other agents):
+
+| Dependent                                                                  | Site                                                                                      |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `oversight/apps/checkout/src/checkout/workflow.gleam:60`                   | `case saga.correlation_of(key) { Some(c) -> .. None -> .. }` becomes the plain value      |
+| `oversight/apps/checkout/src/checkout/telemetry.gleam:119-160`             | six saga observers pass `d.correlation` to `record`, which takes an `Option`              |
+| `oversight/apps/support_desk/src/support_desk/telemetry.gleam:224-261`     | six saga observers pass `m.correlation` to `saga(..)`                                     |
+| `oversight/apps/research_agent/src/research_agent/telemetry.gleam:231-270` | four saga observers read `m.correlation`                                                  |
+| `fabric/integrations/fabric_saga/test/book_trip_test.gleam:478`            | `process.send(seen, metadata.correlation)` is a `Correlation`; the assertion drops `Some` |
 
 ### A durable execution keeps one correlation
 
@@ -123,8 +157,8 @@ durable.start_or_reconnect(persistence, storage, id: "refund-7", input: i)
 - **One extra commit.** The first drive of an execution commits once to save
   the correlation, so storage-failure injection that counts commits sees one
   more on a first drive. Later drives are unchanged.
-- **Handlers.** A handler that counted durable events with `correlation: None`
-  as uncorrelated now sees `Some`.
+- **Handlers.** A handler that counted events with `correlation: None` as
+  uncorrelated no longer sees any.
 
 Dependents that start durable executions (`checkout/jobs.gleam:86`,
 `research_agent/publish.gleam:174`) call `durable.with_correlation` on the

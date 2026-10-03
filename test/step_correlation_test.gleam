@@ -4,6 +4,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import gleam/time/duration
 import gleeunit/should
 import saga
@@ -22,16 +23,14 @@ fn order() -> Correlation {
   order
 }
 
-fn receive(
-  subject: process.Subject(Option(Correlation)),
-) -> Result(Option(Correlation), Nil) {
+fn receive(subject: process.Subject(Correlation)) -> Result(Correlation, Nil) {
   process.receive(subject, 1000)
 }
 
 /// `a` succeeds and is undone; `b` fails once and its decider aborts. Every
 /// callback reports the correlation of its key.
 fn reporting_workflow(
-  seen: process.Subject(#(String, Option(Correlation))),
+  seen: process.Subject(#(String, Correlation)),
 ) -> saga.Workflow(Int, Int, String, String) {
   saga.define("reporting", fn(input) {
     input
@@ -59,9 +58,9 @@ fn reporting_workflow(
 }
 
 fn drain(
-  seen: process.Subject(#(String, Option(Correlation))),
-  acc: List(#(String, Option(Correlation))),
-) -> List(#(String, Option(Correlation))) {
+  seen: process.Subject(#(String, Correlation)),
+  acc: List(#(String, Correlation)),
+) -> List(#(String, Correlation)) {
   case process.receive(seen, 100) {
     Ok(event) -> drain(seen, [event, ..acc])
     Error(Nil) -> list.reverse(acc)
@@ -75,24 +74,41 @@ pub fn local_callbacks_read_the_configured_correlation_test() {
     execution.run(reporting_workflow(seen), 1, config)
   drain(seen, [])
   |> should.equal([
-    #("effect a", Some(order())),
-    #("effect b", Some(order())),
-    #("decide b", Some(order())),
-    #("undo a", Some(order())),
+    #("effect a", order()),
+    #("effect b", order()),
+    #("decide b", order()),
+    #("undo a", order()),
   ])
 }
 
-pub fn local_callbacks_see_none_without_a_correlation_test() {
+/// A local run without a correlation gets a fresh one at start, which its
+/// steps and its events share; the next run gets another.
+pub fn local_run_without_a_correlation_gets_a_fresh_one_test() {
   let seen = process.new_subject()
-  let assert Ok(execution.Failed(..)) =
-    execution.run(reporting_workflow(seen), 1, execution.config())
-  drain(seen, [])
-  |> should.equal([
-    #("effect a", None),
-    #("effect b", None),
-    #("decide b", None),
-    #("undo a", None),
-  ])
+  let events = process.new_subject()
+  let plan =
+    sinal.subscriptions([
+      sinal.subscription(telemetry.run_started(), fn(_m, d) {
+        process.send(events, d.correlation)
+      }),
+    ])
+  let run = fn() {
+    let assert Ok(sinal.SubscriptionCompletion(Ok(execution.Failed(..)), [])) =
+      sinal.with_subscriptions(plan, fn() {
+        execution.run(reporting_workflow(seen), 1, execution.config())
+      })
+    let assert Ok(started) = receive(events)
+    let steps = drain(seen, [])
+    let assert [#(_, first), ..] = steps
+    list.all(steps, fn(step) { step.1 == first }) |> should.be_true
+    first |> should.equal(started)
+    list.length(steps) |> should.equal(4)
+    started
+  }
+  let first = run()
+  let second = run()
+  { first != second } |> should.be_true
+  string.byte_size(correlation.to_string(first)) |> should.equal(32)
 }
 
 /// The correlation a step reads is the one its run's events carry.
@@ -118,8 +134,8 @@ pub fn step_and_events_share_the_correlation_test() {
   let config = execution.config() |> execution.with_correlation(order())
   let assert Ok(sinal.SubscriptionCompletion(Ok(execution.Completed(1)), [])) =
     sinal.with_subscriptions(plan, fn() { execution.run(workflow, 1, config) })
-  receive(step_saw) |> should.equal(Ok(Some(order())))
-  receive(event_saw) |> should.equal(Ok(Some(order())))
+  receive(step_saw) |> should.equal(Ok(order()))
+  receive(event_saw) |> should.equal(Ok(order()))
 }
 
 fn text_persistence(
@@ -184,7 +200,7 @@ fn kill_and_wait(pid: process.Pid) -> Nil {
 }
 
 fn echo_persistence(
-  seen: process.Subject(Option(Correlation)),
+  seen: process.Subject(Correlation),
 ) -> durable.Persistence(String, String, String, String) {
   saga.define("echo", fn(input) {
     saga.perform(
@@ -217,20 +233,15 @@ pub fn durable_run_defaults_to_its_execution_id_test() {
     sinal.with_subscriptions(plan, fn() {
       drive(start(persistence, memory.storage(store), "checkout:7"))
     })
-  receive(step_saw) |> should.equal(Ok(Some(by_id)))
-  receive(event_saw) |> should.equal(Ok(Some(by_id)))
+  receive(step_saw) |> should.equal(Ok(by_id))
+  receive(event_saw) |> should.equal(Ok(by_id))
 
   let handle =
     start(persistence, memory.storage(store), "checkout:8")
     |> durable.with_correlation(order())
   let assert Ok(execution.Completed("x!")) = drive(handle)
-  receive(step_saw) |> should.equal(Ok(Some(order())))
+  receive(step_saw) |> should.equal(Ok(order()))
   memory.stop(store)
-}
-
-/// A local run has no id to derive one from.
-pub fn local_run_without_a_correlation_stays_uncorrelated_test() {
-  execution.correlation_of(execution.config(), None) |> should.equal(None)
 }
 
 /// After a restart, the resolver, the key in `RecoveryRequired`, and an undo
@@ -272,7 +283,7 @@ pub fn restart_paths_carry_the_correlation_test() {
   }
   let assert Ok(store) = memory.start()
   let backend = stores.watched(memory.storage(store), owner)
-  let by_id = Some(correlation.from_key("restart-1"))
+  let by_id = correlation.from_key("restart-1")
 
   let result = process.new_subject()
   process.spawn_unlinked(fn() {
@@ -296,7 +307,7 @@ pub fn restart_paths_carry_the_correlation_test() {
       start(build(True), backend, "restart-2")
       |> durable.with_correlation(order()),
     )
-  receive(undone) |> should.equal(Ok(Some(order())))
+  receive(undone) |> should.equal(Ok(order()))
   memory.stop(store)
 }
 
@@ -329,7 +340,7 @@ pub fn recovery_required_key_carries_the_correlation_test() {
   let assert Error(durable.RecoveryRequired(durable.Required(_, _, key))) =
     drive(reconnect(build(), backend, "uncertain-1"))
   saga.correlation_of(key)
-  |> should.equal(Some(correlation.from_key("uncertain-1")))
+  |> should.equal(correlation.from_key("uncertain-1"))
   // The first drive saved `from_key(id)`; a value supplied later is ignored.
   let assert Error(durable.RecoveryRequired(durable.Required(_, _, key))) =
     drive(
@@ -337,7 +348,7 @@ pub fn recovery_required_key_carries_the_correlation_test() {
       |> durable.with_correlation(order()),
     )
   saga.correlation_of(key)
-  |> should.equal(Some(correlation.from_key("uncertain-1")))
+  |> should.equal(correlation.from_key("uncertain-1"))
   memory.stop(store)
 }
 
@@ -390,13 +401,13 @@ pub fn restored_undo_carries_the_correlation_test() {
   let _ = process.receive(result, 1000)
   let assert Ok(execution.Failed(..)) =
     drive(reconnect(build(True), backend, "restored-1"))
-  receive(undone) |> should.equal(Ok(Some(order())))
+  receive(undone) |> should.equal(Ok(order()))
   memory.stop(store)
 }
 
 /// A gate that the first drive never leaves and the next one passes.
 fn gated(
-  seen: process.Subject(Option(Correlation)),
+  seen: process.Subject(Correlation),
   open: Bool,
 ) -> durable.Persistence(String, String, String, String) {
   saga.define("gated", fn(input) {
@@ -423,7 +434,7 @@ fn gated(
 fn interrupted_first_drive(
   backend: storage.Storage,
   id: String,
-  seen: process.Subject(Option(Correlation)),
+  seen: process.Subject(Correlation),
   handle: fn(durable.Run(String, String, String, String)) ->
     durable.Run(String, String, String, String),
 ) -> Nil {
@@ -461,8 +472,8 @@ pub fn a_later_drive_without_a_correlation_sees_the_first_drives_test() {
     sinal.with_subscriptions(plan, fn() {
       drive(reconnect(gated(seen, True), backend, "saved-1"))
     })
-  receive(seen) |> should.equal(Ok(Some(order())))
-  receive(events) |> should.equal(Ok(Some(order())))
+  receive(seen) |> should.equal(Ok(order()))
+  receive(events) |> should.equal(Ok(order()))
   memory.stop(store)
 }
 
@@ -482,7 +493,7 @@ pub fn a_later_drive_ignores_a_different_correlation_test() {
       reconnect(gated(seen, True), backend, "saved-2")
       |> durable.with_correlation(other),
     )
-  receive(seen) |> should.equal(Ok(Some(order())))
+  receive(seen) |> should.equal(Ok(order()))
   memory.stop(store)
 }
 
@@ -498,7 +509,7 @@ pub fn the_first_drive_saves_the_default_test() {
       reconnect(gated(seen, True), backend, "saved-3")
       |> durable.with_correlation(order()),
     )
-  receive(seen) |> should.equal(Ok(Some(correlation.from_key("saved-3"))))
+  receive(seen) |> should.equal(Ok(correlation.from_key("saved-3")))
   let assert Ok(stored) = storage.do_load(backend, "saved-3")
   shape(storage.data(stored)) |> should.equal(#(2, Some("saved-3")))
   memory.stop(store)
@@ -537,7 +548,7 @@ pub fn a_format_1_record_reads_as_the_execution_id_test() {
     reconnect(gated(seen, True), backend, "legacy-1")
     |> durable.with_correlation(order())
   let assert Ok(execution.Completed("x")) = drive(handle)
-  receive(seen) |> should.equal(Ok(Some(correlation.from_key("legacy-1"))))
+  receive(seen) |> should.equal(Ok(correlation.from_key("legacy-1")))
   let assert Ok(stored) = storage.do_load(backend, "legacy-1")
   shape(storage.data(stored)) |> should.equal(#(2, Some("legacy-1")))
   // A finished legacy record still reads.

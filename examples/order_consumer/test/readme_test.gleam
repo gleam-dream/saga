@@ -4,7 +4,7 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
-import gleam/option.{type Option, None, Some}
+import gleam/string
 import gleam/time/duration
 import saga
 import saga/codec
@@ -214,34 +214,28 @@ pub fn readme_unknown_effect_test() {
 
 /// A client that tags its calls with a correlation, like an HTTP client view.
 type Client {
-  Client(correlation: Option(Correlation), calls: process.Subject(String))
+  Client(correlation: Correlation, calls: process.Subject(String))
 }
 
 fn with_correlation(client: Client, correlation: Correlation) -> Client {
-  Client(..client, correlation: Some(correlation))
+  Client(..client, correlation: correlation)
 }
 
 fn call_refund(client: Client, key: String) -> Result(String, CheckoutError) {
-  let tag = case client.correlation {
-    Some(correlation) -> correlation.to_string(correlation)
-    None -> "none"
-  }
+  let tag = correlation.to_string(client.correlation)
   process.send(client.calls, tag <> " " <> key)
   Ok("refund-" <> key)
 }
 
 /// A step reads its run's correlation from the `EffectKey` it receives and
-/// passes it to its own client; a durable run without one is correlated by
-/// its execution id.
+/// passes it to its own client. Every run has one: a local run without one
+/// gets a fresh correlation, a durable run `from_key(id)`.
 pub fn readme_step_correlation_test() {
   let calls = process.new_subject()
-  let client = Client(None, calls)
+  let client = Client(correlation.from_key("unset"), calls)
   let step =
     saga.effect("refund", fn(order: String, key) {
-      let client = case saga.correlation_of(key) {
-        Some(correlation) -> with_correlation(client, correlation)
-        None -> client
-      }
+      let client = with_correlation(client, saga.correlation_of(key))
       call_refund(client, saga.idempotency_key(key) <> ":" <> order)
     })
     |> durable.recoverable(
@@ -259,10 +253,12 @@ pub fn readme_step_correlation_test() {
   let assert Ok(execution.Completed(_)) = execution.run(workflow, "o-9", config)
   let assert Ok("o-9 " <> _) = process.receive(calls, 1000)
 
-  // A local run without one has none.
+  // A local run without one gets a fresh correlation (32 hex characters).
   let assert Ok(execution.Completed(_)) =
     execution.run(workflow, "o-9", execution.config())
-  let assert Ok("none " <> _) = process.receive(calls, 1000)
+  let assert Ok(unset) = process.receive(calls, 1000)
+  let assert [tag, _] = string.split(unset, " ")
+  let assert 32 = string.length(tag)
 
   // A durable run without one carries `correlation.from_key(id)`.
   let text = codec.text()

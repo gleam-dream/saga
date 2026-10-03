@@ -1383,7 +1383,7 @@ pub fn durable_events_carry_execution_and_correlation_test() {
   let assert Ok(sinal.SubscriptionCompletion(Ok(execution.Completed("x!")), [])) =
     sinal.with_subscriptions(plan, fn() { drive(run) })
   process.receive(seen, 1000)
-  |> should.equal(Ok(#(Some("checkout:7"), Some(order))))
+  |> should.equal(Ok(#(Some("checkout:7"), order)))
   memory.stop(store)
 }
 

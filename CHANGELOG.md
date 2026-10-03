@@ -14,7 +14,7 @@ Every change below has a before and after in
 #### Added
 
 - **A step reads its run's correlation.** `saga.EffectKey` has a new field,
-  `correlation: Option(Correlation)`: the value set with
+  `correlation_of(key)`: the value set with
   `execution.with_correlation` or `durable.with_correlation`, which is also
   the `correlation` of the run's `saga/telemetry` events. `saga.effect`,
   `saga.undo` (`undo.key`), `saga.compensate` (`failed.key`) and the durable
@@ -40,14 +40,22 @@ Every change below has a before and after in
 
 #### Changed
 
-- **A durable execution is always correlated.** A handle without
-  `durable.with_correlation` used to emit `correlation: None` and give its
-  steps nothing. It now carries `correlation.from_key(id)` of its execution
-  id in its events and in its steps. A local run without a correlation
-  still carries `None`.
+- **Every execution has a correlation.** A durable execution without
+  `durable.with_correlation` carries `correlation.from_key(id)` of its
+  execution id, in its events and in its steps. A local run without
+  `execution.with_correlation` gets a fresh `correlation.unique()` at start,
+  used for its events and its steps, so no run is uncorrelated.
 
 #### Breaking
 
+- **Correlation is never optional.** `saga.correlation_of(key)` returns a
+  `Correlation`, and the `correlation` field of every `saga/telemetry`
+  metadata record changes from `Option(Correlation)` to `Correlation`:
+  `RunMetadata`, `RunStopMetadata`, `StepMetadata`, `StepStopMetadata`,
+  `CompensationMetadata` and `UndoMetadata`. The event's wire encoding is
+  unchanged (the same `correlation` key), so an Erlang or Elixir handler is
+  unaffected, and a handler that reads with `sinal/correlation.field()` still
+  decodes it as `Some`. A `None` arm on these values no longer compiles.
 - **`saga.EffectKey` is opaque.** Callers only receive it, and a record
   field broke positional code when `correlation` was added. Read it with
   `saga.idempotency_key`, `saga.attempt_number`, `saga.attempt_key` and

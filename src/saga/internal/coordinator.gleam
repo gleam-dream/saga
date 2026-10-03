@@ -266,7 +266,7 @@ type RunState(o, e, u) {
     // The ceiling applied to a `RetryAfter` delay (see `retry_after`).
     max_retry_delay: Int,
     // Labels copied into every telemetry event of this run.
-    correlation: Option(Correlation),
+    correlation: Correlation,
     execution: Option(String),
     persistence: Option(Session(e, u)),
     // A persistent run whose driver went away stops without cancelling:
@@ -372,7 +372,7 @@ pub type Settings {
     settle_timeout: Int,
     cleanup_timeout: Int,
     max_retry_delay: Int,
-    correlation: Option(Correlation),
+    correlation: Correlation,
     execution: Option(String),
   )
 }
@@ -2557,7 +2557,7 @@ fn freeze(
         Succeeded | Undoing | Undone | UndoFailedStep ->
           case n.persistence {
             Some(p) ->
-              p.freeze(state.store, step_base(state, id))
+              p.freeze(state.store, step_base(state, id), state.correlation)
               |> result.map_error(checkpoint.at(_, saved_address(n.address)))
             None -> Error(checkpoint.InvalidState(checkpoint.Malformed))
           }
