@@ -95,10 +95,10 @@ fn payment_workflow(
 ) -> saga.Workflow(Charge, Receipt, PayError, Nil) {
   let pay =
     saga.effect("pay", fn(charge: Charge, key: saga.EffectKey) {
-      process.send(calls, key.idempotency)
-      case key.attempt {
+      process.send(calls, saga.idempotency_key(key))
+      case saga.attempt_number(key) {
         1 -> Error(MaybeCharged)
-        _ -> Ok(Receipt("rcpt-" <> charge.order, key.idempotency))
+        _ -> Ok(Receipt("rcpt-" <> charge.order, saga.idempotency_key(key)))
       }
     })
     |> saga.unknown_when(fn(error) { error == MaybeCharged })

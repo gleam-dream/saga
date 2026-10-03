@@ -29,7 +29,7 @@ fn definition(
     saga.effect(name, fn(input, key) {
       case first_vm {
         True -> {
-          write_ledger(path <> "/" <> name, key.attempt_key)
+          write_ledger(path <> "/" <> name, saga.attempt_key(key))
           process.sleep(60_000)
           Ok(input <> name)
         }
@@ -41,7 +41,7 @@ fn definition(
       input: text,
       output: text,
       resolve: fn(input, key) {
-        case ledger_has(path <> "/" <> name, key.attempt_key) {
+        case ledger_has(path <> "/" <> name, saga.attempt_key(key)) {
           True -> durable.Completed(input <> name)
           False -> durable.MaybeSent
         }

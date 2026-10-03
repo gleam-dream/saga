@@ -45,8 +45,8 @@ pub fn checkout() {
     |> saga.undo(fn(undo) { release(undo.output) })
   let charge =
     saga.effect("charge_payment", fn(reservation, key) {
-      // `key.idempotency` is the same for every attempt of this step.
-      charge(reservation, idempotency_key: key.idempotency)
+      // `saga.idempotency_key(key)` is the same for every attempt of this step.
+      charge(reservation, idempotency_key: saga.idempotency_key(key))
     })
     |> saga.unknown_when(fn(error) { error == MaybeCharged })
     |> saga.compensate(max_attempts: 3, with: fn(failed) {
@@ -112,15 +112,17 @@ pub fn readme_durable_run_test() {
   let text = codec.text()
   let charge =
     saga.effect("charge", fn(order, key: saga.EffectKey) {
-      Ok("receipt-" <> order <> "-" <> key.idempotency)
+      Ok("receipt-" <> order <> "-" <> saga.idempotency_key(key))
     })
-    |> saga.undo(fn(undo) { refund(undo.output, undo.key.idempotency) })
+    |> saga.undo(fn(undo) {
+      refund(undo.output, saga.idempotency_key(undo.key))
+    })
     |> durable.recoverable(
       version: "1",
       input: order,
       output: text,
       resolve: fn(order, key) {
-        case lookup_charge(order, key.idempotency) {
+        case lookup_charge(order, saga.idempotency_key(key)) {
           Ok(Charged(receipt)) -> durable.Completed(receipt)
           Ok(NoCharge) -> durable.NotSent
           Error(_) -> durable.MaybeSent
@@ -236,11 +238,11 @@ pub fn readme_step_correlation_test() {
   let client = Client(None, calls)
   let step =
     saga.effect("refund", fn(order: String, key) {
-      let client = case key.correlation {
+      let client = case saga.correlation_of(key) {
         Some(correlation) -> with_correlation(client, correlation)
         None -> client
       }
-      call_refund(client, key.idempotency <> ":" <> order)
+      call_refund(client, saga.idempotency_key(key) <> ":" <> order)
     })
     |> durable.recoverable(
       version: "1",

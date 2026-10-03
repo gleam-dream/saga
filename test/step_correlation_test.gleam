@@ -37,21 +37,21 @@ fn reporting_workflow(
     input
     |> saga.perform(
       saga.effect("a", fn(x: Int, key) {
-        process.send(seen, #("effect a", key.correlation))
+        process.send(seen, #("effect a", saga.correlation_of(key)))
         Ok(x)
       })
       |> saga.undo(fn(undo) {
-        process.send(seen, #("undo a", undo.key.correlation))
+        process.send(seen, #("undo a", saga.correlation_of(undo.key)))
         Ok(Nil)
       }),
     )
     |> saga.perform(
       saga.effect("b", fn(_x: Int, key) {
-        process.send(seen, #("effect b", key.correlation))
+        process.send(seen, #("effect b", saga.correlation_of(key)))
         Error("boom")
       })
       |> saga.compensate(max_attempts: 2, with: fn(failed) {
-        process.send(seen, #("decide b", failed.key.correlation))
+        process.send(seen, #("decide b", saga.correlation_of(failed.key)))
         saga.Abort("boom")
       }),
     )
@@ -104,7 +104,7 @@ pub fn step_and_events_share_the_correlation_test() {
       saga.perform(
         input,
         saga.effect("only", fn(x: Int, key) {
-          process.send(step_saw, key.correlation)
+          process.send(step_saw, saga.correlation_of(key))
           Ok(x)
         }),
       )
@@ -190,7 +190,7 @@ fn echo_persistence(
     saga.perform(
       input,
       saga.effect("echo", fn(value, key) {
-        process.send(seen, key.correlation)
+        process.send(seen, saga.correlation_of(key))
         Ok(value <> "!")
       })
         |> recoverable(fn(_, _) { durable.MaybeSent }),
@@ -245,7 +245,7 @@ pub fn restart_paths_carry_the_correlation_test() {
       |> saga.perform(
         saga.step("resource", fn(value) { Ok(value) })
         |> saga.undo(fn(undo) {
-          process.send(undone, undo.key.correlation)
+          process.send(undone, saga.correlation_of(undo.key))
           case recovering {
             True -> Ok(Nil)
             False -> {
@@ -255,7 +255,7 @@ pub fn restart_paths_carry_the_correlation_test() {
           }
         })
         |> durable.resolve_undo(fn(undo) {
-          process.send(resolved, undo.key.correlation)
+          process.send(resolved, saga.correlation_of(undo.key))
           durable.NotSent
         })
         |> recoverable(fn(_, _) { durable.MaybeSent }),
@@ -263,7 +263,7 @@ pub fn restart_paths_carry_the_correlation_test() {
       |> saga.perform(
         saga.step("fail", fn(_: String) { Error("boom") })
         |> recoverable(fn(_, key) {
-          process.send(resolved, key.correlation)
+          process.send(resolved, saga.correlation_of(key))
           durable.MaybeSent
         }),
       )
@@ -328,18 +328,21 @@ pub fn recovery_required_key_carries_the_correlation_test() {
   let _ = process.receive(result, 1000)
   let assert Error(durable.RecoveryRequired(durable.Required(_, _, key))) =
     drive(reconnect(build(), backend, "uncertain-1"))
-  key.correlation |> should.equal(Some(correlation.from_key("uncertain-1")))
+  saga.correlation_of(key)
+  |> should.equal(Some(correlation.from_key("uncertain-1")))
+  // The first drive saved `from_key(id)`; a value supplied later is ignored.
   let assert Error(durable.RecoveryRequired(durable.Required(_, _, key))) =
     drive(
       reconnect(build(), backend, "uncertain-1")
       |> durable.with_correlation(order()),
     )
-  key.correlation |> should.equal(Some(order()))
+  saga.correlation_of(key)
+  |> should.equal(Some(correlation.from_key("uncertain-1")))
   memory.stop(store)
 }
 
 /// An undo restored from the checkpoint of an earlier drive runs under the
-/// correlation of the handle that rolls back.
+/// correlation that the first drive saved.
 pub fn restored_undo_carries_the_correlation_test() {
   let undone = process.new_subject()
   let owner = process.new_subject()
@@ -349,7 +352,7 @@ pub fn restored_undo_carries_the_correlation_test() {
       |> saga.perform(
         saga.step("resource", fn(value) { Ok(value) })
         |> saga.undo(fn(undo) {
-          process.send(undone, undo.key.correlation)
+          process.send(undone, saga.correlation_of(undo.key))
           Ok(Nil)
         })
         |> recoverable(fn(_, _) { durable.MaybeSent }),
@@ -373,17 +376,172 @@ pub fn restored_undo_carries_the_correlation_test() {
   let backend = stores.watched(memory.storage(store), owner)
   let result = process.new_subject()
   process.spawn_unlinked(fn() {
-    process.send(result, drive(start(build(False), backend, "restored-1")))
+    process.send(
+      result,
+      drive(
+        start(build(False), backend, "restored-1")
+        |> durable.with_correlation(order()),
+      ),
+    )
   })
   let assert Ok(pid) = process.receive(owner, 1000)
   process.sleep(200)
   kill_and_wait(pid)
   let _ = process.receive(result, 1000)
   let assert Ok(execution.Failed(..)) =
+    drive(reconnect(build(True), backend, "restored-1"))
+  receive(undone) |> should.equal(Ok(Some(order())))
+  memory.stop(store)
+}
+
+/// A gate that the first drive never leaves and the next one passes.
+fn gated(
+  seen: process.Subject(Option(Correlation)),
+  open: Bool,
+) -> durable.Persistence(String, String, String, String) {
+  saga.define("gated", fn(input) {
+    saga.perform(
+      input,
+      saga.effect("gate", fn(value, key) {
+        process.send(seen, saga.correlation_of(key))
+        case open {
+          True -> Ok(value)
+          False -> {
+            process.sleep_forever()
+            Ok(value)
+          }
+        }
+      })
+        |> recoverable(fn(_, _) { durable.NotSent }),
+    )
+  })
+  |> text_persistence
+}
+
+/// Drives `id` once with a blocking step, kills its runner and returns, so
+/// the execution is left unfinished with whatever the drive saved.
+fn interrupted_first_drive(
+  backend: storage.Storage,
+  id: String,
+  seen: process.Subject(Option(Correlation)),
+  handle: fn(durable.Run(String, String, String, String)) ->
+    durable.Run(String, String, String, String),
+) -> Nil {
+  let owner = process.new_subject()
+  let watched = stores.watched(backend, owner)
+  let result = process.new_subject()
+  process.spawn_unlinked(fn() {
+    process.send(result, drive(handle(start(gated(seen, False), watched, id))))
+  })
+  let assert Ok(pid) = process.receive(owner, 1000)
+  let assert Ok(_) = process.receive(seen, 1000)
+  kill_and_wait(pid)
+  let _ = process.receive(result, 1000)
+  Nil
+}
+
+/// Every drive of one execution reports the correlation that its first drive
+/// saved, in its steps and in its events.
+pub fn a_later_drive_without_a_correlation_sees_the_first_drives_test() {
+  let seen = process.new_subject()
+  let events = process.new_subject()
+  let assert Ok(store) = memory.start()
+  let backend = memory.storage(store)
+  interrupted_first_drive(backend, "saved-1", seen, durable.with_correlation(
+    _,
+    order(),
+  ))
+  let plan =
+    sinal.subscriptions([
+      sinal.subscription(telemetry.run_stopped(), fn(_m, d) {
+        process.send(events, d.correlation)
+      }),
+    ])
+  let assert Ok(sinal.SubscriptionCompletion(Ok(execution.Completed("x")), [])) =
+    sinal.with_subscriptions(plan, fn() {
+      drive(reconnect(gated(seen, True), backend, "saved-1"))
+    })
+  receive(seen) |> should.equal(Ok(Some(order())))
+  receive(events) |> should.equal(Ok(Some(order())))
+  memory.stop(store)
+}
+
+/// A correlation supplied after the first drive does not replace the saved
+/// one.
+pub fn a_later_drive_ignores_a_different_correlation_test() {
+  let seen = process.new_subject()
+  let assert Ok(store) = memory.start()
+  let backend = memory.storage(store)
+  interrupted_first_drive(backend, "saved-2", seen, durable.with_correlation(
+    _,
+    order(),
+  ))
+  let other = correlation.from_key("somebody-else")
+  let assert Ok(execution.Completed("x")) =
     drive(
-      reconnect(build(True), backend, "restored-1")
+      reconnect(gated(seen, True), backend, "saved-2")
+      |> durable.with_correlation(other),
+    )
+  receive(seen) |> should.equal(Ok(Some(order())))
+  memory.stop(store)
+}
+
+/// Without a correlation, the first drive saves `from_key(id)`, and a later
+/// drive's handle cannot change it.
+pub fn the_first_drive_saves_the_default_test() {
+  let seen = process.new_subject()
+  let assert Ok(store) = memory.start()
+  let backend = memory.storage(store)
+  interrupted_first_drive(backend, "saved-3", seen, fn(run) { run })
+  let assert Ok(execution.Completed("x")) =
+    drive(
+      reconnect(gated(seen, True), backend, "saved-3")
       |> durable.with_correlation(order()),
     )
-  receive(undone) |> should.equal(Ok(Some(order())))
+  receive(seen) |> should.equal(Ok(Some(correlation.from_key("saved-3"))))
+  let assert Ok(stored) = storage.do_load(backend, "saved-3")
+  shape(storage.data(stored)) |> should.equal(#(2, Some("saved-3")))
+  memory.stop(store)
+}
+
+@external(erlang, "saga_legacy_fixture", "downgrade")
+fn downgrade(bytes: BitArray) -> BitArray
+
+@external(erlang, "saga_legacy_fixture", "shape")
+fn shape(bytes: BitArray) -> #(Int, Option(String))
+
+/// An execution saved in format 1, before the correlation was recorded,
+/// reads as `from_key(id)`: a supplied correlation is ignored, and the next
+/// commit saves the value in format 2.
+pub fn a_format_1_record_reads_as_the_execution_id_test() {
+  let seen = process.new_subject()
+  let assert Ok(scratch) = memory.start()
+  let assert Ok(fresh) =
+    durable.start_or_reconnect(
+      gated(seen, True),
+      memory.storage(scratch),
+      id: "legacy-1",
+      input: "x",
+    )
+  let assert Ok(written) = storage.do_load(memory.storage(scratch), "legacy-1")
+  durable.id(fresh) |> should.equal("legacy-1")
+  shape(storage.data(written)) |> should.equal(#(2, None))
+  let legacy = downgrade(storage.data(written))
+  shape(legacy) |> should.equal(#(1, None))
+  memory.stop(scratch)
+
+  let assert Ok(store) = memory.start()
+  let backend = memory.storage(store)
+  let assert Ok(_) = storage.do_create(backend, "legacy-1", legacy)
+  let handle =
+    reconnect(gated(seen, True), backend, "legacy-1")
+    |> durable.with_correlation(order())
+  let assert Ok(execution.Completed("x")) = drive(handle)
+  receive(seen) |> should.equal(Ok(Some(correlation.from_key("legacy-1"))))
+  let assert Ok(stored) = storage.do_load(backend, "legacy-1")
+  shape(storage.data(stored)) |> should.equal(#(2, Some("legacy-1")))
+  // A finished legacy record still reads.
+  let assert Ok(durable.Finished(execution.Completed("x"))) =
+    durable.read(reconnect(gated(seen, True), backend, "legacy-1"))
   memory.stop(store)
 }

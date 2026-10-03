@@ -523,10 +523,10 @@ pub fn retried_maybe_sent_error_completes_with_unknown_effects_test() {
   // Both attempts share the idempotency key; the attempt keys differ.
   let assert Ok(first) = process.receive(keys, 1000)
   let assert Ok(second) = process.receive(keys, 1000)
-  first.idempotency |> should.equal(second.idempotency)
-  first.attempt |> should.equal(1)
-  second.attempt |> should.equal(2)
-  { first.attempt_key != second.attempt_key } |> should.be_true
+  saga.idempotency_key(first) |> should.equal(saga.idempotency_key(second))
+  saga.attempt_number(first) |> should.equal(1)
+  saga.attempt_number(second) |> should.equal(2)
+  { saga.attempt_key(first) != saga.attempt_key(second) } |> should.be_true
 }
 
 /// A held order after "maybe sent" names the attempt in its settlement.

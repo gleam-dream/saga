@@ -16,8 +16,10 @@
 //// - `correlation`: the `sinal/correlation` value set with
 ////   `execution.with_correlation` or `durable.with_correlation`. A durable
 ////   execution that set none carries `correlation.from_key` of its
-////   execution id; a local run that set none carries `None`. The steps of
-////   the run read the same value as `correlation` of their `saga.EffectKey`.
+////   execution id; a local run that set none carries `None`. A durable
+////   execution saves the value of its first drive, so every drive of it
+////   reports the same one. The steps of the run read the same value with
+////   `saga.correlation_of` of their `saga.EffectKey`.
 ////
 //// Read metadata fields by label: a later release may add fields.
 ////
