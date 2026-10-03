@@ -3,6 +3,7 @@
 
 import gleam/option.{Some}
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import pog
 import saga/storage
@@ -11,27 +12,30 @@ import saga_postgres/support
 
 fn renewal_every(config: saga_postgres.Config) -> Int {
   let assert Some(#(every, _)) = storage.renewal(saga_postgres.storage(config))
-  every
+  duration.to_milliseconds(every)
 }
 
 pub fn storage_renews_every_third_of_the_lease_test() {
   use connection <- support.using_pool(1)
   let config = saga_postgres.config(connection)
   renewal_every(config) |> should.equal(10_000)
-  renewal_every(config |> saga_postgres.with_lease(3000))
+  renewal_every(config |> saga_postgres.with_lease(duration.seconds(3)))
   |> should.equal(1000)
 }
 
 pub fn a_lease_below_100_ms_is_raised_to_100_test() {
   use connection <- support.using_pool(1)
-  renewal_every(saga_postgres.config(connection) |> saga_postgres.with_lease(5))
+  renewal_every(
+    saga_postgres.config(connection)
+    |> saga_postgres.with_lease(duration.milliseconds(5)),
+  )
   |> should.equal(33)
 }
 
 pub fn storage_keeps_saga_default_call_timeout_test() {
   use connection <- support.using_pool(1)
   storage.call_timeout(saga_postgres.storage(saga_postgres.config(connection)))
-  |> should.equal(5000)
+  |> should.equal(duration.seconds(5))
 }
 
 const secret = "saga-postgres-inspect-secret-7c41"
@@ -44,7 +48,8 @@ pub fn inspecting_a_config_never_prints_the_password_test() {
   use connection <- support.using_pool_with(1, fn(config) {
     pog.password(config, Some(secret))
   })
-  let config = support.migrated(connection, support.schema(), 30_000)
+  let config =
+    support.migrated(connection, support.schema(), duration.seconds(30))
   string.contains(string.inspect(config), secret) |> should.be_false
   string.contains(string.inspect(saga_postgres.storage(config)), secret)
   |> should.be_false

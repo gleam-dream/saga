@@ -4,12 +4,13 @@
 
 - Initial package: a PostgreSQL storage for saga's durable runs over one
   table, `saga_executions`, on the application's own `pog.Connection`.
-- `config`, `with_lease` (default 30 000 ms, at least 100 ms) and
+- `config`, `with_lease` (a `Duration`, default 30 seconds, at least 100
+  milliseconds) and
   `with_schema` (default `public`).
 - `storage` implements the `saga/storage` contract with leased claims,
   renewed every lease / 3, and passes `saga/storage/conformance`. Lease
   expiry is judged by the database's clock. Each query is bounded at
-  4 500 ms.
+  4.5 seconds.
 - `migrate` applies forward-only numbered migrations in one transaction
   under a per-schema advisory lock, recorded in `saga_schema_migrations`.
   The same SQL ships in `priv/migrations/`.

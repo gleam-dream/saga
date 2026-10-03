@@ -3,6 +3,7 @@
 
 import gleam/dynamic/decode
 import gleam/json
+import gleam/time/duration
 import saga
 import saga/codec
 import saga/durable
@@ -48,7 +49,8 @@ pub fn checkout() {
     |> saga.unknown_when(fn(error) { error == MaybeCharged })
     |> saga.compensate(max_attempts: 3, with: fn(failed) {
       case failed.failure {
-        saga.Returned(MaybeCharged) -> saga.RetryAfter(500)
+        saga.Returned(MaybeCharged) ->
+          saga.RetryAfter(duration.milliseconds(500))
         saga.Returned(error) -> saga.Abort(error)
         saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
       }
@@ -77,11 +79,12 @@ pub fn readme_configuration_test() {
   let config =
     execution.config()
     |> execution.with_max_concurrency(4)
-    |> execution.with_deadline(30_000)
+    |> execution.with_deadline(execution.After(duration.seconds(30)))
     |> execution.with_correlation(correlation.unique())
   let assert Ok(exec) = execution.start(workflow, "o-2", config)
-  let _ = execution.progress(exec, timeout: 1000)
-  let assert Ok(execution.Completed(_)) = execution.await(exec, timeout: 10_000)
+  let _ = execution.progress(exec, timeout: duration.seconds(1))
+  let assert Ok(execution.Completed(_)) =
+    execution.await(exec, timeout: duration.seconds(10))
 }
 
 type Lookup {
@@ -140,7 +143,7 @@ pub fn readme_durable_run_test() {
       id: "checkout:o-1",
       input: "o-1",
     )
-  let handled = case durable.drive(run, timeout: 30_000) {
+  let handled = case durable.drive(run, timeout: duration.seconds(30)) {
     Ok(execution.Completed(_)) -> "completed"
     Ok(_) -> "other outcome"
     Error(error) ->

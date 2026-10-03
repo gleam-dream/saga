@@ -6,6 +6,7 @@
 
 import gleam/erlang/process
 import gleam/list
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -150,7 +151,7 @@ pub fn timeout_retried_to_success_is_an_unknown_effect_test() {
             _ -> Ok(x)
           }
         })
-        |> saga.timeout(50)
+        |> saga.timeout(duration.milliseconds(50))
         |> saga.compensate(max_attempts: 2, with: fn(_failed) { saga.Retry }),
       )
     })
@@ -243,7 +244,7 @@ pub fn sibling_crash_in_settle_window_is_an_unknown_effect_test() {
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     probe.open(gate)
-    let assert Ok(outcome) = execution.await(exec, 10_000)
+    let assert Ok(outcome) = execution.await(exec, duration.seconds(10))
     let assert execution.Failed(execution.StepFailed(first, Boom), settlement) =
       outcome
     first |> should.equal(at("a"))
@@ -312,7 +313,9 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
         }),
       )
     })
-  let config = execution.config() |> execution.with_cleanup_timeout(50)
+  let config =
+    execution.config()
+    |> execution.with_cleanup_timeout(duration.milliseconds(50))
   let assert Ok(outcome) = execution.run(hanging, 0, config)
   let assert execution.Failed(execution.StepTimedOut(..), _) = outcome
   effects(outcome)
@@ -350,7 +353,9 @@ pub fn undo_crash_and_timeout_are_unknown_effects_test() {
       |> saga.perform(saga.step("last", fn(_x: Int) { Error(Boom) }))
     })
 
-  let config = execution.config() |> execution.with_cleanup_timeout(50)
+  let config =
+    execution.config()
+    |> execution.with_cleanup_timeout(duration.milliseconds(50))
   let assert Ok(outcome) = execution.run(workflow, 0, config)
   let assert execution.Failed(execution.StepFailed(_, Boom), settlement) =
     outcome
@@ -385,11 +390,13 @@ pub fn cancel_interrupting_an_attempt_is_an_unknown_effect_test() {
       )
     })
 
-  let config = execution.config() |> execution.with_settle_timeout(0)
+  let config =
+    execution.config()
+    |> execution.with_settle_timeout(duration.milliseconds(0))
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     execution.cancel(exec)
-    let assert Ok(outcome) = execution.await(exec, 10_000)
+    let assert Ok(outcome) = execution.await(exec, duration.seconds(10))
     let assert execution.Cancelled(execution.CancelRequested, settlement) =
       outcome
     settlement.undone |> should.equal([at("first")])
@@ -415,11 +422,13 @@ pub fn cancel_interrupting_a_compensation_is_an_unknown_effect_test() {
       )
     })
 
-  let config = execution.config() |> execution.with_settle_timeout(0)
+  let config =
+    execution.config()
+    |> execution.with_settle_timeout(duration.milliseconds(0))
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     execution.cancel(exec)
-    let assert Ok(outcome) = execution.await(exec, 10_000)
+    let assert Ok(outcome) = execution.await(exec, duration.seconds(10))
     let assert execution.Cancelled(_, _) = outcome
     effects(outcome)
     |> should.equal([#("s", execution.StepCompensation(1), Interrupted)])

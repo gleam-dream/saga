@@ -20,6 +20,7 @@ import gleam/int
 import gleam/option
 import gleam/result
 import gleam/string
+import gleam/time/duration
 import pog
 import saga/storage.{type Claim, type Storage, type Stored}
 
@@ -83,7 +84,9 @@ fn statements(table: String) -> Statements {
 
 /// The storage over `table` (a quoted, schema-qualified name), whose
 /// claims last `lease` milliseconds after their last claim, commit or
-/// renewal, renewed every `lease / 3` milliseconds.
+/// renewal, renewed every third of it. The lease is in milliseconds because
+/// it is a SQL parameter; the public `saga_postgres.with_lease` takes a
+/// `Duration`.
 pub fn new(connection: pog.Connection, table: String, lease: Int) -> Storage {
   let sql = statements(table)
   storage.new(
@@ -95,9 +98,10 @@ pub fn new(connection: pog.Connection, table: String, lease: Int) -> Storage {
     cancel: fn(id) { cancel(connection, sql, id) },
     unfinished: fn(limit) { unfinished(connection, sql, limit) },
   )
-  |> storage.with_renewal(every: int.max(1, lease / 3), renew: fn(claim) {
-    renew(connection, sql, lease, claim)
-  })
+  |> storage.with_renewal(
+    every: duration.milliseconds(int.max(1, lease / 3)),
+    renew: fn(claim) { renew(connection, sql, lease, claim) },
+  )
 }
 
 fn stored_decoder(from: Int) -> decode.Decoder(Stored) {

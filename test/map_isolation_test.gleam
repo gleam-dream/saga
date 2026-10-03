@@ -3,6 +3,7 @@
 /// ported from the reviewer's repro suite (REPRO1, REPRO2, REPRO7, REPRO8).
 import gleam/erlang/process
 import gleam/list
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -81,7 +82,9 @@ pub fn slow_map_does_not_block_cancel_test() {
       |> saga.perform(saga.step("b", fn(x: Int) -> Result(Int, Nil) { Ok(x) }))
     })
 
-  let config = execution.config() |> execution.with_settle_timeout(100)
+  let config =
+    execution.config()
+    |> execution.with_settle_timeout(duration.milliseconds(100))
   probe.with_run(wf, 1, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     // The map is blocked inside "b"'s attempt task. Cancellation must still
@@ -89,7 +92,7 @@ pub fn slow_map_does_not_block_cancel_test() {
     // window (bounded) sweeps the blocked task rather than waiting forever.
     execution.cancel(exec)
     let assert Ok(execution.Cancelled(_reason, _settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     Nil
   })
 }

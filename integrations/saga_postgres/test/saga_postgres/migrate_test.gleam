@@ -7,6 +7,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import pog
 import saga/storage
@@ -69,7 +70,7 @@ pub fn concurrent_migrations_all_succeed_and_apply_once_test() {
 pub fn migrate_leaves_a_newer_schema_alone_test() {
   use connection <- support.using_pool(2)
   let schema = support.schema()
-  let config = support.migrated(connection, schema, 30_000)
+  let config = support.migrated(connection, schema, duration.seconds(30))
   let assert Ok(_) =
     pog.query(
       "INSERT INTO \""
@@ -96,8 +97,10 @@ pub fn migrate_reports_an_unreachable_database_test() {
 pub fn storages_in_separate_schemas_are_apart_test() {
   use connection <- support.using_pool(2)
   let #(a, b) = #(support.schema(), support.schema())
-  let one = saga_postgres.storage(support.migrated(connection, a, 30_000))
-  let other = saga_postgres.storage(support.migrated(connection, b, 30_000))
+  let one =
+    saga_postgres.storage(support.migrated(connection, a, duration.seconds(30)))
+  let other =
+    saga_postgres.storage(support.migrated(connection, b, duration.seconds(30)))
   let id = support.id()
   let assert Ok(_) = storage.do_create(one, id, <<"one":utf8>>)
   storage.do_load(other, id) |> should.equal(Error(storage.NotFound))

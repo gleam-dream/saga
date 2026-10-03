@@ -32,6 +32,7 @@
 
 import gleam/int
 import gleam/option.{type Option, None, Some}
+import gleam/time/duration.{type Duration}
 
 /// Why a storage operation failed. Later releases may add variants:
 /// describe them with `describe_error`.
@@ -172,8 +173,8 @@ pub opaque type Storage {
     release: fn(Claim) -> Result(Nil, Error),
     cancel: fn(String) -> Result(Nil, Error),
     unfinished: fn(Int) -> Result(List(String), Error),
-    renewal: Option(#(Int, fn(Claim) -> Result(Nil, Error))),
-    call_timeout: Int,
+    renewal: Option(#(Duration, fn(Claim) -> Result(Nil, Error))),
+    call_timeout: Duration,
   )
 }
 
@@ -194,7 +195,7 @@ pub opaque type Storage {
 ///   or `Suspended` and that no live claim holds, oldest first where the
 ///   store can tell.
 ///
-/// Each operation must finish within the call timeout (5 000 ms by
+/// Each operation must finish within the call timeout (5 seconds by
 /// default, `with_call_timeout`); saga gives up on a slower one with
 /// `TimedOut`.
 pub fn new(
@@ -215,12 +216,12 @@ pub fn new(
     cancel:,
     unfinished:,
     renewal: None,
-    call_timeout: 5000,
+    call_timeout: duration.seconds(5),
   )
 }
 
 /// Declares that claims expire unless renewed: while a runner owns an
-/// execution, saga calls `renew(claim)` every `every` milliseconds, from a
+/// execution, saga calls `renew(claim)` every `every`, from a
 /// process linked to the runner, so a live runner keeps its claim however
 /// long a step takes, and a lost one stops renewing. `renew` fails with
 /// `StaleOwner` once the claim was taken over, which stops the runner.
@@ -231,17 +232,19 @@ pub fn new(
 /// storage with `new` must declare the adapter's renewal again.
 pub fn with_renewal(
   storage: Storage,
-  every every: Int,
+  every every: Duration,
   renew renew: fn(Claim) -> Result(Nil, Error),
 ) -> Storage {
   Storage(..storage, renewal: Some(#(every, renew)))
 }
 
-/// Bounds each storage operation saga performs (default 5 000 ms). A slower
+/// Bounds each storage operation saga performs (default 5 seconds). A slower
 /// operation fails with `TimedOut`; a runner whose storage call times out
-/// stops and keeps its last committed checkpoint.
-pub fn with_call_timeout(storage: Storage, milliseconds: Int) -> Storage {
-  Storage(..storage, call_timeout: int.max(1, milliseconds))
+/// stops and keeps its last committed checkpoint. A bound below 1
+/// millisecond is raised to 1 millisecond.
+pub fn with_call_timeout(storage: Storage, timeout: Duration) -> Storage {
+  let milliseconds = int.max(1, duration.to_milliseconds(timeout))
+  Storage(..storage, call_timeout: duration.milliseconds(milliseconds))
 }
 
 // The operations, for `saga/durable` and `saga/storage/conformance`.
@@ -284,11 +287,11 @@ pub fn do_unfinished(storage: Storage, limit: Int) {
 @internal
 pub fn renewal(
   storage: Storage,
-) -> Option(#(Int, fn(Claim) -> Result(Nil, Error))) {
+) -> Option(#(Duration, fn(Claim) -> Result(Nil, Error))) {
   storage.renewal
 }
 
 @internal
-pub fn call_timeout(storage: Storage) -> Int {
+pub fn call_timeout(storage: Storage) -> Duration {
   storage.call_timeout
 }

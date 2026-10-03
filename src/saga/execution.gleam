@@ -9,12 +9,13 @@
 //// `saga/testing` polls `progress` for tests.
 ////
 //// ```gleam
+//// import gleam/time/duration
 //// import saga/execution
 ////
 //// let config =
 ////   execution.config()
 ////   |> execution.with_max_concurrency(4)
-////   |> execution.with_deadline(5000)
+////   |> execution.with_deadline(execution.After(duration.seconds(5)))
 //// case execution.run(workflow, "order-1", config) {
 ////   Ok(execution.Completed(receipt)) -> Ok(receipt)
 ////   Ok(outcome) -> Error(execution.unknown_effects(outcome))
@@ -68,11 +69,19 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleam/time/duration.{type Duration}
 import saga.{type Workflow}
 import saga/internal/coordinator
 import saga/internal/ffi
 import saga/telemetry
 import sinal/correlation.{type Correlation}
+
+/// A time bound that may be lifted. `Infinity` lifts it and must be chosen
+/// explicitly.
+pub type Timeout {
+  After(Duration)
+  Infinity
+}
 
 /// The bounds, pacing and labels of a run. Build one with `config` and the
 /// `with_*` setters; `run`, `start`, `start_reporting` and `durable.drive`
@@ -80,11 +89,11 @@ import sinal/correlation.{type Correlation}
 pub opaque type Config {
   Config(
     max_concurrency: Int,
-    deadline: Option(Int),
-    step_timeout: Option(Int),
-    settle_timeout: Int,
-    cleanup_timeout: Int,
-    max_retry_delay: Int,
+    deadline: Timeout,
+    step_timeout: Timeout,
+    settle_timeout: Duration,
+    cleanup_timeout: Duration,
+    max_retry_delay: Duration,
     correlation: Option(Correlation),
   )
 }
@@ -94,11 +103,11 @@ pub opaque type Config {
 /// | Setting | Default | Setter |
 /// | --- | --- | --- |
 /// | concurrent attempts and compensation decisions | schedulers online | `with_max_concurrency` |
-/// | run deadline | none | `with_deadline` |
-/// | per-attempt timeout | 60 000 ms | `with_step_timeout`, `without_step_timeout` |
-/// | settle window | 5 000 ms | `with_settle_timeout` |
-/// | each compensation decision and undo | 5 000 ms | `with_cleanup_timeout` |
-/// | `RetryAfter` delay cap | 300 000 ms | `with_max_retry_delay` |
+/// | run deadline | `Infinity` | `with_deadline` |
+/// | per-attempt timeout | 60 seconds | `with_step_timeout` |
+/// | settle window | 5 seconds | `with_settle_timeout` |
+/// | each compensation decision and undo | 5 seconds | `with_cleanup_timeout` |
+/// | `RetryAfter` delay cap | 5 minutes | `with_max_retry_delay` |
 /// | correlation | none | `with_correlation` |
 ///
 /// **Why the run has no default deadline.** A step's attempts are bounded
@@ -109,11 +118,11 @@ pub opaque type Config {
 pub fn config() -> Config {
   Config(
     max_concurrency: schedulers_online(),
-    deadline: None,
-    step_timeout: Some(60_000),
-    settle_timeout: 5000,
-    cleanup_timeout: 5000,
-    max_retry_delay: 300_000,
+    deadline: Infinity,
+    step_timeout: After(duration.seconds(60)),
+    settle_timeout: duration.seconds(5),
+    cleanup_timeout: duration.seconds(5),
+    max_retry_delay: duration.seconds(300),
     correlation: None,
   )
 }
@@ -124,44 +133,41 @@ pub fn with_max_concurrency(config: Config, limit: Int) -> Config {
   Config(..config, max_concurrency: limit)
 }
 
-/// Ends the run with `DeadlineExceeded` after `milliseconds`, settling and
-/// rolling back like any failure. Must be positive.
-pub fn with_deadline(config: Config, milliseconds: Int) -> Config {
-  Config(..config, deadline: Some(milliseconds))
+/// Ends the run with `DeadlineExceeded` after `deadline`, settling and
+/// rolling back like any failure. `Infinity` (the default) sets no deadline.
+/// A duration must be at least 1 millisecond.
+pub fn with_deadline(config: Config, deadline: Timeout) -> Config {
+  Config(..config, deadline:)
 }
 
 /// Bounds each attempt of a step that has no `saga.timeout` of its own.
-/// A step's own `saga.timeout` always wins, shorter or longer. Must be
-/// positive.
-pub fn with_step_timeout(config: Config, milliseconds: Int) -> Config {
-  Config(..config, step_timeout: Some(milliseconds))
-}
-
-/// Leaves attempts of steps without their own `saga.timeout` unbounded: the
-/// explicit opt-out of the 60 second default.
-pub fn without_step_timeout(config: Config) -> Config {
-  Config(..config, step_timeout: None)
+/// A step's own `saga.timeout` always wins, shorter or longer. `Infinity`
+/// leaves such attempts unbounded: the explicit opt-out of the 60 second
+/// default. A duration must be at least 1 millisecond.
+pub fn with_step_timeout(config: Config, timeout: Timeout) -> Config {
+  Config(..config, step_timeout: timeout)
 }
 
 /// How long in-flight attempts and compensation decisions may finish on
 /// their own once the run stops admitting work, before they are killed and
-/// reported `interrupted`. `0` kills them at once. Must not be negative.
-pub fn with_settle_timeout(config: Config, milliseconds: Int) -> Config {
-  Config(..config, settle_timeout: milliseconds)
+/// reported `interrupted`. A zero duration kills them at once. Must not be
+/// negative.
+pub fn with_settle_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, settle_timeout: timeout)
 }
 
-/// Bounds each compensation decision and each undo action. Must be
-/// positive.
-pub fn with_cleanup_timeout(config: Config, milliseconds: Int) -> Config {
-  Config(..config, cleanup_timeout: milliseconds)
+/// Bounds each compensation decision and each undo action. Must be at
+/// least 1 millisecond.
+pub fn with_cleanup_timeout(config: Config, timeout: Duration) -> Config {
+  Config(..config, cleanup_timeout: timeout)
 }
 
 /// Caps the delay of a `RetryAfter` decision. A longer requested delay is
 /// shortened to the cap, and the decision's
 /// `telemetry.CompensationMetadata` reports `retry_delay_capped: True`.
 /// Must not be negative.
-pub fn with_max_retry_delay(config: Config, milliseconds: Int) -> Config {
-  Config(..config, max_retry_delay: milliseconds)
+pub fn with_max_retry_delay(config: Config, delay: Duration) -> Config {
+  Config(..config, max_retry_delay: delay)
 }
 
 /// Carries `correlation` in every `saga/telemetry` event of the run, so the
@@ -177,11 +183,11 @@ fn schedulers_online() -> Int
 /// applies, not just the first.
 pub type ConfigError {
   MaxConcurrencyNotPositive(value: Int)
-  DeadlineNotPositive(value: Int)
-  StepTimeoutNotPositive(value: Int)
-  SettleTimeoutNegative(value: Int)
-  CleanupTimeoutNotPositive(value: Int)
-  MaxRetryDelayNegative(value: Int)
+  DeadlineNotPositive(value: Duration)
+  StepTimeoutNotPositive(value: Duration)
+  SettleTimeoutNegative(value: Duration)
+  CleanupTimeoutNotPositive(value: Duration)
+  MaxRetryDelayNegative(value: Duration)
 }
 
 /// Describes a configuration error for logs.
@@ -192,20 +198,38 @@ pub fn describe_config_error(error: ConfigError) -> String {
       <> int.to_string(value)
     DeadlineNotPositive(value) ->
       "the deadline must be positive (with_deadline), got "
-      <> int.to_string(value)
+      <> describe_duration(value)
     StepTimeoutNotPositive(value) ->
       "the step timeout must be positive (with_step_timeout), got "
-      <> int.to_string(value)
+      <> describe_duration(value)
     SettleTimeoutNegative(value) ->
       "the settle timeout must not be negative (with_settle_timeout), got "
-      <> int.to_string(value)
+      <> describe_duration(value)
     CleanupTimeoutNotPositive(value) ->
       "the cleanup timeout must be positive (with_cleanup_timeout), got "
-      <> int.to_string(value)
+      <> describe_duration(value)
     MaxRetryDelayNegative(value) ->
       "the retry delay cap must not be negative (with_max_retry_delay), got "
-      <> int.to_string(value)
+      <> describe_duration(value)
   }
+}
+
+// A duration keeps its nanoseconds non-negative, so only its whole seconds
+// carry the sign. (`duration.compare` mis-orders negative durations.)
+fn is_negative(value: Duration) -> Bool {
+  let #(seconds, _nanoseconds) = duration.to_seconds_and_nanoseconds(value)
+  seconds < 0
+}
+
+fn bound_milliseconds(bound: Timeout) -> Option(Int) {
+  case bound {
+    After(limit) -> Some(duration.to_milliseconds(limit))
+    Infinity -> None
+  }
+}
+
+fn describe_duration(value: Duration) -> String {
+  int.to_string(duration.to_milliseconds(value)) <> " ms"
 }
 
 /// Checks `config` and returns the coordinator's settings, labelled with a
@@ -222,37 +246,43 @@ pub fn settings(
         False -> [MaxConcurrencyNotPositive(config.max_concurrency)]
       },
       case config.deadline {
-        None -> []
-        Some(ms) if ms > 0 -> []
-        Some(ms) -> [DeadlineNotPositive(ms)]
+        Infinity -> []
+        After(deadline) ->
+          case duration.to_milliseconds(deadline) > 0 {
+            True -> []
+            False -> [DeadlineNotPositive(deadline)]
+          }
       },
       case config.step_timeout {
-        None -> []
-        Some(ms) if ms > 0 -> []
-        Some(ms) -> [StepTimeoutNotPositive(ms)]
+        Infinity -> []
+        After(timeout) ->
+          case duration.to_milliseconds(timeout) > 0 {
+            True -> []
+            False -> [StepTimeoutNotPositive(timeout)]
+          }
       },
-      case config.settle_timeout >= 0 {
-        True -> []
-        False -> [SettleTimeoutNegative(config.settle_timeout)]
+      case is_negative(config.settle_timeout) {
+        False -> []
+        True -> [SettleTimeoutNegative(config.settle_timeout)]
       },
-      case config.cleanup_timeout > 0 {
+      case duration.to_milliseconds(config.cleanup_timeout) > 0 {
         True -> []
         False -> [CleanupTimeoutNotPositive(config.cleanup_timeout)]
       },
-      case config.max_retry_delay >= 0 {
-        True -> []
-        False -> [MaxRetryDelayNegative(config.max_retry_delay)]
+      case is_negative(config.max_retry_delay) {
+        False -> []
+        True -> [MaxRetryDelayNegative(config.max_retry_delay)]
       },
     ])
   case errors {
     [] ->
       Ok(coordinator.Settings(
         max_concurrency: config.max_concurrency,
-        deadline: config.deadline,
-        step_timeout: config.step_timeout,
-        settle_timeout: config.settle_timeout,
-        cleanup_timeout: config.cleanup_timeout,
-        max_retry_delay: config.max_retry_delay,
+        deadline: bound_milliseconds(config.deadline),
+        step_timeout: bound_milliseconds(config.step_timeout),
+        settle_timeout: duration.to_milliseconds(config.settle_timeout),
+        cleanup_timeout: duration.to_milliseconds(config.cleanup_timeout),
+        max_retry_delay: duration.to_milliseconds(config.max_retry_delay),
         correlation: config.correlation,
         execution: execution,
       ))
@@ -830,7 +860,7 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
   }
 }
 
-/// Waits up to `milliseconds` for the run's outcome. Returns
+/// Waits up to `timeout` for the run's outcome. Returns
 /// `Error(AwaitTimedOut)` on timeout — the run continues, and `await` may
 /// be called again. Returns `Error(AlreadyAwaited)` if a previous `await`
 /// on this same `Execution` already consumed the outcome, *or* if a
@@ -854,12 +884,12 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
 /// runs never grows the owner's process dictionary.
 pub fn await(
   execution: Execution(o, e, u),
-  timeout milliseconds: Int,
+  timeout timeout: Duration,
 ) -> Result(Outcome(o, e, u), AwaitError) {
   use #(monitor, result) <- awaited_by_self(execution)
   let #(fresh_monitor, selector) =
     await_selector(execution.pid, monitor, result)
-  case process.selector_receive(selector, milliseconds) {
+  case process.selector_receive(selector, duration.to_milliseconds(timeout)) {
     Ok(signal) -> await_signal(monitor, fresh_monitor, signal)
     Error(_) -> {
       process.demonitor_process(fresh_monitor)
@@ -907,7 +937,7 @@ fn awaited_by_self(
 /// The settle window is the run's `Config.settle_timeout`, fixed at start;
 /// a cancellation cannot shorten it, because the owner's exit cancels a
 /// run with no call to carry a value. It is an upper bound, not a delay:
-/// settling ends as soon as nothing is in flight. `settle_timeout: 0`
+/// settling ends as soon as nothing is in flight. A zero settle timeout
 /// kills in-flight work at once, reporting it `interrupted`; a longer
 /// window lets it finish, so that it is known and undone.
 pub fn cancel(execution: Execution(o, e, u)) -> Nil {
@@ -928,7 +958,7 @@ type ProgressSignal {
 /// reply against the coordinator's exit instead.
 pub fn progress(
   execution: Execution(o, e, u),
-  timeout milliseconds: Int,
+  timeout timeout: Duration,
 ) -> Result(Progress, ProgressError) {
   let reply = process.new_subject()
   let monitor = process.monitor(execution.pid)
@@ -939,7 +969,9 @@ pub fn progress(
     |> process.select_specific_monitor(monitor, fn(_down) {
       ProgressCoordinatorDown
     })
-  let outcome = case process.selector_receive(selector, milliseconds) {
+  let outcome = case
+    process.selector_receive(selector, duration.to_milliseconds(timeout))
+  {
     Ok(GotProgress(progress)) -> Ok(to_public_progress(progress))
     Ok(ProgressCoordinatorDown) -> Error(ExecutionEnded)
     Error(_) -> Error(ProgressTimedOut)

@@ -3,6 +3,7 @@
 
 import gleam/erlang/process
 import gleam/int
+import gleam/time/duration.{type Duration}
 import pog
 import saga_postgres.{type Config}
 
@@ -58,7 +59,7 @@ pub fn schema() -> String {
 pub fn migrated(
   connection: pog.Connection,
   schema: String,
-  lease: Int,
+  lease: Duration,
 ) -> Config {
   let assert Ok(config) =
     saga_postgres.config(connection)

@@ -56,6 +56,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set.{type Set}
 import gleam/string
+import gleam/time/duration.{type Duration}
 import saga/codec.{type Codec}
 import saga/internal/cell
 import saga/internal/checkpoint
@@ -212,7 +213,7 @@ pub fn failure_from_node(failure: node.AttemptFailure(e)) -> AttemptFailure(e) {
 /// unresolved with no rollback authority. The union is closed.
 pub type Recovery(o, e, u) {
   Retry
-  RetryAfter(milliseconds: Int)
+  RetryAfter(delay: Duration)
   Continue(output: o, undo: Undo(u))
   Abort(error: e)
   AbortAfterCleanupFailure(error: e, cleanup_error: u)
@@ -237,7 +238,7 @@ pub type DefinitionError {
   EmptyWorkflowName
   EmptyStepName(scope: List(String))
   InvalidMaxAttempts(step: StepAddress, value: Int)
-  InvalidTimeout(step: StepAddress, value: Int)
+  InvalidTimeout(step: StepAddress, value: Duration)
   ForeignPort(step: StepAddress)
   /// A step was created during the builder (via `perform`/`embed`) but its
   /// output port never reaches the workflow's final output, so it would
@@ -262,7 +263,7 @@ pub fn describe_definition_error(error: DefinitionError) -> String {
       "step "
       <> address_to_string(step)
       <> " has timeout "
-      <> int.to_string(value)
+      <> int.to_string(duration.to_milliseconds(value))
       <> " ms; it must be positive"
     ForeignPort(step) ->
       "a port from another workflow definition is used in "
@@ -284,7 +285,7 @@ pub type StepDescriptor {
     undoable: Bool,
     compensates: Bool,
     max_attempts: Int,
-    timeout: Option(Int),
+    timeout: Option(Duration),
   )
 }
 
@@ -309,7 +310,7 @@ pub opaque type Step(i, o, e, u) {
   Step(
     name: String,
     max_attempts: Int,
-    timeout: Option(Int),
+    timeout: Option(Duration),
     undoable: Bool,
     compensates: Bool,
     attempt: fn(i, EffectKey) -> RunOutcome(o, u, e),
@@ -545,10 +546,11 @@ pub fn on_unknown(
   Step(..step, on_unknown: policy)
 }
 
-/// Bounds one attempt of this step to `milliseconds`, overriding the run's
-/// `execution.with_step_timeout` default in either direction.
-pub fn timeout(step: Step(i, o, e, u), milliseconds: Int) -> Step(i, o, e, u) {
-  Step(..step, timeout: Some(milliseconds))
+/// Bounds one attempt of this step to `limit`, overriding the run's
+/// `execution.with_step_timeout` default in either direction. `define`
+/// rejects a limit below 1 millisecond.
+pub fn timeout(step: Step(i, o, e, u), limit: Duration) -> Step(i, o, e, u) {
+  Step(..step, timeout: Some(limit))
 }
 
 /// Adapts a step's error and undo-error types into a unified workflow
@@ -663,7 +665,7 @@ fn map_recovery(
 ) -> Recovery(o, e2, u2) {
   case recovery {
     Retry -> Retry
-    RetryAfter(ms) -> RetryAfter(ms)
+    RetryAfter(delay) -> RetryAfter(delay)
     Continue(output, undo_choice) ->
       Continue(output, map_undo(undo_choice, map_undo_error))
     Abort(error) -> Abort(map_error(error))
@@ -1048,7 +1050,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   ) {
     case recovery {
       Retry -> node.ERetry
-      RetryAfter(ms) -> node.ERetryAfter(ms)
+      RetryAfter(delay) -> node.ERetryAfter(duration.to_milliseconds(delay))
       Continue(output, undo_choice) ->
         node.EContinue(commit: fn(run_store) {
           #(
@@ -1411,7 +1413,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
         )
       }),
       max_attempts: step.max_attempts,
-      timeout: step.timeout,
+      timeout: option.map(step.timeout, duration.to_milliseconds),
       undoable: step.undoable,
       compensates: step.compensates,
       rolls_back_unknown: step.on_unknown == RollBack,
@@ -1430,8 +1432,11 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   }
   let timeout_error = case step.timeout {
     None -> []
-    Some(ms) if ms > 0 -> []
-    Some(ms) -> [InvalidTimeout(step: address, value: ms)]
+    Some(limit) ->
+      case duration.to_milliseconds(limit) > 0 {
+        True -> []
+        False -> [InvalidTimeout(step: address, value: limit)]
+      }
   }
 
   Port(
@@ -1731,7 +1736,7 @@ fn descriptors_for(
       undoable: raw_node.undoable,
       compensates: raw_node.compensates,
       max_attempts: raw_node.max_attempts,
-      timeout: raw_node.timeout,
+      timeout: option.map(raw_node.timeout, duration.milliseconds),
     )
   })
 }

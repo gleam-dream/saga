@@ -1,6 +1,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import saga
 
@@ -24,7 +25,7 @@ pub fn define_panics_naming_every_defect_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) -> Result(Int, Nil) { Ok(x) })
-          |> saga.timeout(0),
+          |> saga.timeout(duration.milliseconds(0)),
         )
         |> saga.perform(saga.step("", fn(x: Int) { Ok(x) }))
       })
@@ -93,13 +94,16 @@ pub fn define_rejects_invalid_timeout_test() {
   let result =
     saga.try_define("wf", fn(input) {
       input
-      |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }) |> saga.timeout(0))
+      |> saga.perform(
+        saga.step("a", fn(x: Int) { Ok(x) })
+        |> saga.timeout(duration.milliseconds(0)),
+      )
     })
   case result {
     Error(errors) ->
       list.any(errors, fn(e) {
         case e {
-          saga.InvalidTimeout(_, 0) -> True
+          saga.InvalidTimeout(_, value) -> value == duration.milliseconds(0)
           _ -> False
         }
       })

@@ -1,3 +1,4 @@
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -134,7 +135,7 @@ pub fn compensation_decisions_test() {
           }
         })
         |> saga.compensate(max_attempts: 3, with: fn(_failed) {
-          saga.RetryAfter(1)
+          saga.RetryAfter(duration.milliseconds(1))
         }),
       )
     })

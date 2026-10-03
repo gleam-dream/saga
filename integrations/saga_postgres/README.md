@@ -18,6 +18,7 @@ Run `migrate` once the pool is up, then hand `storage(config)` to
 
 ```gleam
 import gleam/erlang/process
+import gleam/time/duration
 import pog
 import saga/durable
 import saga_postgres
@@ -35,7 +36,7 @@ let storage = saga_postgres.storage(config)
 // `persistence` comes from `durable.new`, as with any saga storage.
 let assert Ok(run) =
   durable.start_or_reconnect(persistence, storage, id: "checkout:order-123", input: order)
-let outcome = durable.drive(run, timeout: 30_000)
+let outcome = durable.drive(run, timeout: duration.seconds(30))
 ```
 
 `durable.read`, `durable.cancel`, `durable.reconnect` and
@@ -44,16 +45,16 @@ execution; build it once and share it.
 
 ## Defaults
 
-| Setting           | Default                     | Change with                               |
-| ----------------- | --------------------------- | ----------------------------------------- |
-| Lease             | 30 000 ms (at least 100 ms) | `with_lease`                              |
-| Renewal           | every lease / 3 (10 000 ms) | follows the lease                         |
-| Query timeout     | 4 500 ms per statement      | fixed, below saga's call timeout          |
-| Call timeout      | 5 000 ms                    | `storage.with_call_timeout` (saga)        |
-| Schema            | `public`                    | `with_schema` (1-63 of `a-z`, `0-9`, `_`) |
-| Owner-loss window | the lease                   | follows the lease                         |
+| Setting           | Default                      | Change with                               |
+| ----------------- | ---------------------------- | ----------------------------------------- |
+| Lease             | 30 seconds (at least 100 ms) | `with_lease(Duration)`                    |
+| Renewal           | every lease / 3 (10 seconds) | follows the lease                         |
+| Query timeout     | 4.5 seconds per statement    | fixed, below saga's call timeout          |
+| Call timeout      | 5 seconds                    | `storage.with_call_timeout` (saga)        |
+| Schema            | `public`                     | `with_schema` (1-63 of `a-z`, `0-9`, `_`) |
+| Owner-loss window | the lease                    | follows the lease                         |
 
-A query slower than 4 500 ms fails with `storage.TimedOut` before saga gives
+A query slower than 4.5 seconds fails with `storage.TimedOut` before saga gives
 up on the call. Raising saga's call timeout does not raise the query
 timeout.
 

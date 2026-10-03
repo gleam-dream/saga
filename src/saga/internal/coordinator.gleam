@@ -30,6 +30,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set.{type Set}
 import gleam/string
+import gleam/time/duration as gleam_duration
 import saga/internal/checkpoint
 import saga/internal/ffi
 import saga/internal/min_heap.{type MinHeap}
@@ -2358,7 +2359,10 @@ fn emit_compensation_stopped(
 ) -> Nil {
   let #(retry_delay, retry_delay_capped) = case retry {
     NoRetryDelay -> #(None, False)
-    ScheduledDelay(delay, capped) -> #(Some(delay), capped)
+    ScheduledDelay(delay, capped) -> #(
+      Some(gleam_duration.milliseconds(delay)),
+      capped,
+    )
   }
   sinal.emit(
     telemetry.compensation_stopped(),

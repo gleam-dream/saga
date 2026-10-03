@@ -2,6 +2,7 @@
 //// `codec.json` and `result.map_error`.
 
 import gleam/result
+import gleam/time/duration
 import json/blueprint/codec as blueprint
 import saga
 import saga/codec
@@ -66,6 +67,6 @@ pub fn blueprint_codec_saves_a_durable_input_test() {
       input: Order("o-1", 2),
     )
   let assert Ok(execution.Completed(Order("o-1", 2))) =
-    durable.drive(run, timeout: 5000)
+    durable.drive(run, timeout: duration.seconds(5))
   memory.stop(store)
 }

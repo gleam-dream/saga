@@ -3,15 +3,16 @@
 //// one table, `saga_executions`, and the migrations that create it.
 ////
 //// ```gleam
+//// import gleam/time/duration
 //// import saga/durable
 //// import saga_postgres
 ////
-//// let config = saga_postgres.config(db) |> saga_postgres.with_lease(30_000)
+//// let config = saga_postgres.config(db) |> saga_postgres.with_lease(duration.seconds(30))
 //// let assert Ok(Nil) = saga_postgres.migrate(config)
 //// let storage = saga_postgres.storage(config)
 //// let assert Ok(run) =
 ////   durable.start_or_reconnect(persistence, storage, id: "checkout-123", input: order)
-//// let outcome = durable.drive(run, timeout: 30_000)
+//// let outcome = durable.drive(run, timeout: duration.seconds(30))
 //// ```
 ////
 //// The application owns the connection pool (`pog.start` or
@@ -20,7 +21,7 @@
 //// checkpoint bytes, revision, ownership generation, cancellation flag,
 //// phase, and claim (a random token and a lease expiry). Every write is one
 //// conditional statement. A claim lasts until it is released or its lease
-//// expires; saga renews it every `lease / 3` ms while its runner lives, so
+//// expires; saga renews it every third of the lease while its runner lives, so
 //// a runner that dies loses its claim within one lease. Lease expiry is
 //// judged by the database's clock alone (`clock_timestamp()`), so the
 //// nodes' clocks need not agree.
@@ -30,6 +31,7 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
+import gleam/time/duration.{type Duration}
 import pog
 import saga/storage.{type Storage}
 import saga_postgres/internal/migrations
@@ -38,22 +40,23 @@ import saga_postgres/internal/store
 /// Where and how the storage keeps executions: the application's
 /// connection, the lease duration and the schema.
 pub opaque type Config {
-  Config(connection: pog.Connection, lease: Int, schema: String)
+  Config(connection: pog.Connection, lease: Duration, schema: String)
 }
 
-/// A configuration over `connection`, with a 30 000 ms lease, in the
+/// A configuration over `connection`, with a 30 second lease, in the
 /// schema `public`.
 pub fn config(connection: pog.Connection) -> Config {
-  Config(connection:, lease: 30_000, schema: "public")
+  Config(connection:, lease: duration.seconds(30), schema: "public")
 }
 
-/// Sets the lease in milliseconds (default 30 000): how long a claim lasts
-/// after its last claim, commit or renewal, and so how long another runner
-/// waits before it resumes an execution whose runner died. Saga renews a
-/// live runner's claim every `lease / 3` ms. Values below 100 are raised
-/// to 100.
-pub fn with_lease(config: Config, milliseconds: Int) -> Config {
-  Config(..config, lease: int.max(100, milliseconds))
+/// Sets the lease (default 30 seconds): how long a claim lasts after its
+/// last claim, commit or renewal, and so how long another runner waits
+/// before it resumes an execution whose runner died. Saga renews a live
+/// runner's claim every third of the lease. A lease below 100 milliseconds
+/// is raised to 100 milliseconds.
+pub fn with_lease(config: Config, lease: Duration) -> Config {
+  let milliseconds = int.max(100, duration.to_milliseconds(lease))
+  Config(..config, lease: duration.milliseconds(milliseconds))
 }
 
 /// Why a schema name was refused (`with_schema`).
@@ -177,15 +180,15 @@ pub fn migrate(config: Config) -> Result(Nil, MigrateError) {
 }
 
 /// The `saga/storage.Storage` of this configuration, over the table
-/// `saga_executions` in its schema. It declares renewal every `lease / 3`
-/// ms (`storage.with_renewal`). Each query is bounded at 4 500 ms, below
-/// saga's default call timeout of 5 000 ms, and fails with
+/// `saga_executions` in its schema. It declares renewal every third of the
+/// lease (`storage.with_renewal`). Each query is bounded at 4.5 seconds,
+/// below saga's default call timeout of 5 seconds, and fails with
 /// `storage.TimedOut` when slower. Run `migrate` first.
 pub fn storage(config: Config) -> Storage {
   store.new(
     config.connection,
     quoted(config.schema) <> ".saga_executions",
-    config.lease,
+    duration.to_milliseconds(config.lease),
   )
 }
 

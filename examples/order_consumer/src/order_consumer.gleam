@@ -6,7 +6,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{Some}
+import gleam/time/duration
 import order_consumer/domain.{type Order, Order}
 import order_consumer/workflows
 import saga/execution
@@ -111,10 +111,11 @@ fn scenario_c_advanced_config_and_cancellation() -> Nil {
           Nil
         })
 
-      let config = workflows.bounded_config(Some(2000))
+      let config =
+        workflows.bounded_config(execution.After(duration.seconds(2)))
       let assert Ok(execution) = execution.start(workflow, "ord-1", config)
 
-      case execution.progress(execution, 500) {
+      case execution.progress(execution, duration.milliseconds(500)) {
         Ok(progress) ->
           io.println(
             "progress before cancel: phase=" <> string_of_phase(progress.phase),
@@ -123,7 +124,7 @@ fn scenario_c_advanced_config_and_cancellation() -> Nil {
       }
 
       execution.cancel(execution)
-      case execution.await(execution, 2000) {
+      case execution.await(execution, duration.seconds(2)) {
         Ok(execution.Cancelled(reason, settlement)) ->
           io.println(
             "cancelled as expected: reason="

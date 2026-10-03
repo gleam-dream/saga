@@ -4,6 +4,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -50,7 +51,8 @@ pub fn await_does_not_leak_monitor_down_test() {
     })
   let before = probe.mailbox_length()
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
   probe.mailbox_length() |> should.equal(before)
 }
 
@@ -65,8 +67,9 @@ pub fn progress_after_end_reports_execution_ended_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 1000)
-  case execution.progress(exec, timeout: 10_000) {
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(1))
+  case execution.progress(exec, timeout: duration.seconds(10)) {
     Error(execution.ExecutionEnded) -> Nil
     other ->
       panic as { "expected ExecutionEnded, got " <> string.inspect(other) }
@@ -126,7 +129,7 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
             // below), so this decision is received by the coordinator only
             // after the run has a different, unrelated terminal trigger.
             probe.enter(decider_gate)
-            saga.RetryAfter(1)
+            saga.RetryAfter(duration.milliseconds(1))
           }),
         )
       let b =
@@ -163,12 +166,12 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
     testing.wait_until(
       exec,
       matching: fn(p) { p.phase == execution.Settling },
-      within: 10_000,
+      within: duration.seconds(10),
     )
   probe.open(decider_gate)
 
   let assert Ok(execution.Failed(cause, settlement)) =
-    execution.await(exec, 15_000)
+    execution.await(exec, duration.seconds(15))
   case cause {
     execution.StepFailed(step, Nil) -> step.name |> should.equal("failing")
     _ -> panic as "expected the primary cause to be `failing`'s StepFailed"
@@ -249,7 +252,7 @@ pub fn settle_sweep_kill_emits_attempt_interrupted_test() {
   // a single-scheduler `+S 1:1` run too.
   let config =
     execution.config()
-    |> execution.with_settle_timeout(100)
+    |> execution.with_settle_timeout(duration.milliseconds(100))
     |> execution.with_max_concurrency(2)
   let assert Ok(sinal.SubscriptionCompletion(Ok(_result), [])) =
     sinal.with_subscriptions(collect_step_stop_durations(collector), fn() {

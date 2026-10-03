@@ -43,11 +43,11 @@
 //// let assert Ok(store) = memory.start()
 //// let assert Ok(run) =
 ////   durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout-123", input: "order-123")
-//// let outcome = durable.drive(run, timeout: 30_000)
+//// let outcome = durable.drive(run, timeout: duration.seconds(30))
 //// ```
 ////
 //// **Who stops what.** `drive` runs the execution in a runner process and
-//// waits at most `timeout` milliseconds. On timeout, when the process that
+//// waits at most `timeout`. On timeout, when the process that
 //// called `drive` exits, and when the runner is killed or crashes, the run
 //// stops: in-flight attempts are killed, the claim is released, and the
 //// last checkpoint stays the recovery authority, so the next `drive`
@@ -65,6 +65,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/duration.{type Duration}
 import saga.{type Workflow}
 import saga/codec.{type Codec}
 import saga/execution
@@ -103,7 +104,7 @@ pub type Error {
   /// The run configuration is invalid.
   InvalidConfig(errors: List(execution.ConfigError))
   /// `drive` was given a timeout below 1 millisecond.
-  InvalidTimeout(milliseconds: Int)
+  InvalidTimeout(timeout: Duration)
   /// The runner process was killed or crashed before reporting, or the
   /// caller's exit stopped it. Its claim was released; `drive` again.
   RunnerLost
@@ -228,9 +229,10 @@ pub fn describe_error(error: Error) -> String {
     InvalidConfig(errors) ->
       "invalid configuration: "
       <> string.join(list.map(errors, execution.describe_config_error), "; ")
-    InvalidTimeout(milliseconds) ->
+    InvalidTimeout(timeout) ->
       "the drive timeout must be at least 1 ms, got "
-      <> int.to_string(milliseconds)
+      <> int.to_string(duration.to_milliseconds(timeout))
+      <> " ms"
     RunnerLost -> "the runner process died"
     DriveTimedOut ->
       "drive reached its timeout; the execution resumes at the next drive"
@@ -684,8 +686,7 @@ type RunnerExit {
   StillRunning
 }
 
-/// Runs the execution until it finishes, suspends or `timeout` milliseconds
-/// pass, and returns its outcome once it is saved. A finished execution
+/// Runs the execution until it finishes, suspends or `timeout` passes, and returns its outcome once it is saved. A finished execution
 /// returns its saved outcome at once.
 ///
 /// The run happens in a runner process. When `timeout` passes, `drive`
@@ -702,9 +703,10 @@ type RunnerExit {
 /// least the storage's owner-loss window (a lease-based adapter's lease).
 pub fn drive(
   run: Run(i, o, e, u),
-  timeout timeout: Int,
+  timeout timeout: Duration,
 ) -> Result(execution.Outcome(o, e, u), Error) {
-  use _ <- result.try(case timeout > 0 {
+  let timeout_ms = duration.to_milliseconds(timeout)
+  use _ <- result.try(case timeout_ms > 0 {
     True -> Ok(Nil)
     False -> Error(InvalidTimeout(timeout))
   })
@@ -718,7 +720,7 @@ pub fn drive(
     process.spawn_unlinked(fn() {
       let runner = process.self()
       let guard =
-        start_guard(runner, storage.call_timeout(run.storage), fn() {
+        start_guard(runner, call_timeout_ms(run.storage), fn() {
           process.send(
             reply,
             RunnerFinished(Error(StorageFailure(storage.TimedOut))),
@@ -747,7 +749,7 @@ pub fn drive(
         _ -> RunnerDown(ExitedAbnormally)
       }
     })
-  let deadline = ffi.monotonic_time() + timeout
+  let deadline = ffi.monotonic_time() + timeout_ms
   await_runner(run, runner, monitor, selector, deadline, None)
 }
 
@@ -1007,7 +1009,7 @@ fn call(
     |> process.select_specific_monitor(monitor, fn(_) {
       Error(storage.Unavailable("the storage operation exited"))
     })
-  case process.selector_receive(selector, storage.call_timeout(store)) {
+  case process.selector_receive(selector, call_timeout_ms(store)) {
     Ok(result) -> {
       process.demonitor_process(monitor)
       result
@@ -1073,6 +1075,11 @@ fn guard_idle(
   }
 }
 
+/// The storage's call timeout in milliseconds, for the process timers.
+fn call_timeout_ms(store: Storage) -> Int {
+  duration.to_milliseconds(storage.call_timeout(store))
+}
+
 fn guarded(
   guard: Guard,
   operation: fn() -> Result(a, storage.Error),
@@ -1083,17 +1090,20 @@ fn guarded(
   result
 }
 
-/// Renews a claim every `every` milliseconds while the runner lives; when
-/// the claim was taken over, reports it and stops the runner.
+/// Renews a claim every `every` while the runner lives; when the claim was
+/// taken over, reports it and stops the runner.
 fn start_heartbeat(
   store: Storage,
   runner: Pid,
-  every: Int,
+  every: Duration,
   claim: storage.Claim,
   renew: fn(storage.Claim) -> Result(Nil, storage.Error),
   on_lost: fn() -> Nil,
 ) -> Pid {
-  process.spawn(fn() { heartbeat(store, runner, every, claim, renew, on_lost) })
+  let every_ms = duration.to_milliseconds(every)
+  process.spawn(fn() {
+    heartbeat(store, runner, every_ms, claim, renew, on_lost)
+  })
 }
 
 fn heartbeat(

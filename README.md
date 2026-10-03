@@ -21,6 +21,7 @@ Define the workflow once, at startup, and run it for each order; the order
 is the run's input, not part of the definition.
 
 ```gleam
+import gleam/time/duration
 import saga
 import saga/execution
 
@@ -42,7 +43,8 @@ pub fn checkout() {
     |> saga.unknown_when(fn(error) { error == MaybeCharged })
     |> saga.compensate(max_attempts: 3, with: fn(failed) {
       case failed.failure {
-        saga.Returned(MaybeCharged) -> saga.RetryAfter(500)
+        saga.Returned(MaybeCharged) ->
+          saga.RetryAfter(duration.milliseconds(500))
         saga.Returned(error) -> saga.Abort(error)
         saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
       }
@@ -106,24 +108,29 @@ bound each. `run`, `start`, `start_reporting` and `durable.drive` check the
 configuration and return `InvalidConfig` with every violation.
 
 ```gleam
+import gleam/time/duration
 import saga/execution
 import sinal/correlation
 
 let config =
   execution.config()
   |> execution.with_max_concurrency(4)
-  |> execution.with_deadline(30_000)
+  |> execution.with_deadline(execution.After(duration.seconds(30)))
   |> execution.with_correlation(correlation.unique())
 
 let assert Ok(exec) = execution.start(workflow, order, config)
-let assert Ok(progress) = execution.progress(exec, timeout: 1000)
+let assert Ok(progress) = execution.progress(exec, timeout: duration.seconds(1))
 execution.cancel(exec)
-let assert Ok(outcome) = execution.await(exec, timeout: 10_000)
+let assert Ok(outcome) = execution.await(exec, timeout: duration.seconds(10))
 ```
 
-A step's own `saga.timeout(..)` always overrides the per-attempt default, in
-either direction; `execution.without_step_timeout` is the explicit opt-out
-for steps that set none.
+Every timeout, deadline, interval and lease in saga is a `gleam/time/duration`
+`Duration`; no public function takes milliseconds as an `Int`. A bound that
+may be lifted takes an `execution.Timeout`, `After(duration)` or `Infinity`,
+and unbounded is always the explicit `Infinity`. A step's own
+`saga.timeout(step, duration)` always overrides the per-attempt default, in
+either direction; `execution.with_step_timeout(execution.Infinity)` is the
+explicit opt-out for steps that set none.
 
 To learn the outcome somewhere other than the starting process, start with
 `execution.start_reporting(workflow, input, config, to: subject)`. The run
@@ -139,27 +146,27 @@ vocabulary with `saga.map_errors` (whole workflow) or `saga.map_step_errors`
 
 Every wait, retry and saved value is bounded by default.
 
-| Operation                                              | Default                                    | Change it with                                                                  |
-| ------------------------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------------- |
-| Concurrent attempts and compensation decisions per run | schedulers online                          | `execution.with_max_concurrency`                                                |
-| Run deadline                                           | none; the run is bounded by the rows below | `execution.with_deadline`                                                       |
-| Each attempt of a step without its own timeout         | 60 000 ms                                  | `execution.with_step_timeout`, `execution.without_step_timeout`, `saga.timeout` |
-| Settle window after a run stops admitting work         | 5 000 ms                                   | `execution.with_settle_timeout`                                                 |
-| Each compensation decision and each undo               | 5 000 ms                                   | `execution.with_cleanup_timeout`                                                |
-| Attempts per step                                      | 1                                          | `saga.compensate(max_attempts:)`                                                |
-| `RetryAfter` delay                                     | capped at 300 000 ms                       | `execution.with_max_retry_delay`                                                |
-| `execution.run`                                        | until the run ends (finite, see below)     | use `start` and `await`                                                         |
-| `await`, `progress`, `testing.wait_until`              | the caller's timeout (required)            | `timeout:`, `within:`                                                           |
-| Coordinator startup handshake                          | 5 000 ms                                   | none                                                                            |
-| `durable.drive`                                        | the caller's timeout (required)            | `drive(run, timeout:)`                                                          |
-| `durable.drive` caller exits                           | runner stops, checkpoint kept              | none                                                                            |
-| Each storage call                                      | 5 000 ms, then `storage.TimedOut`          | `storage.with_call_timeout`                                                     |
-| Memory adapter call                                    | 5 000 ms                                   | none                                                                            |
-| File adapter mutation lock                             | 5 000 ms, then `storage.Busy`              | none                                                                            |
-| Checkpoint size                                        | 16 MiB (16 777 216 bytes)                  | `durable.with_max_checkpoint_bytes`                                             |
-| PostgreSQL claim lease                                 | 30 000 ms, renewed every 10 000 ms         | `saga_postgres.with_lease`                                                      |
-| Conformance owner-loss window                          | declared by the adapter                    | `conformance.run(owner_loss_within:)`                                           |
-| Sinal handlers                                         | synchronous in the coordinator             | route `["saga"]` to a `sinal/forwarder`                                         |
+| Operation                                              | Default                                          | Change it with                                                        |
+| ------------------------------------------------------ | ------------------------------------------------ | --------------------------------------------------------------------- |
+| Concurrent attempts and compensation decisions per run | schedulers online                                | `execution.with_max_concurrency`                                      |
+| Run deadline                                           | `Infinity`; the run is bounded by the rows below | `execution.with_deadline`                                             |
+| Each attempt of a step without its own timeout         | 60 seconds                                       | `execution.with_step_timeout` (`After` or `Infinity`), `saga.timeout` |
+| Settle window after a run stops admitting work         | 5 seconds                                        | `execution.with_settle_timeout`                                       |
+| Each compensation decision and each undo               | 5 seconds                                        | `execution.with_cleanup_timeout`                                      |
+| Attempts per step                                      | 1                                                | `saga.compensate(max_attempts:)`                                      |
+| `RetryAfter` delay                                     | capped at 5 minutes                              | `execution.with_max_retry_delay`                                      |
+| `execution.run`                                        | until the run ends (finite, see below)           | use `start` and `await`                                               |
+| `await`, `progress`, `testing.wait_until`              | the caller's `Duration` (required)               | `timeout:`, `within:`                                                 |
+| Coordinator startup handshake                          | 5 seconds                                        | none                                                                  |
+| `durable.drive`                                        | the caller's `Duration` (required)               | `drive(run, timeout:)`                                                |
+| `durable.drive` caller exits                           | runner stops, checkpoint kept                    | none                                                                  |
+| Each storage call                                      | 5 seconds, then `storage.TimedOut`               | `storage.with_call_timeout`                                           |
+| Memory adapter call                                    | 5 seconds                                        | none                                                                  |
+| File adapter mutation lock                             | 5 seconds, then `storage.Busy`                   | none                                                                  |
+| Checkpoint size                                        | 16 MiB (16 777 216 bytes)                        | `durable.with_max_checkpoint_bytes`                                   |
+| PostgreSQL claim lease                                 | 30 seconds, renewed every 10 seconds             | `saga_postgres.with_lease`                                            |
+| Conformance owner-loss window                          | declared by the adapter                          | `conformance.run(owner_loss_within:)`                                 |
+| Sinal handlers                                         | synchronous in the coordinator                   | route `["saga"]` to a `sinal/forwarder`                               |
 
 Without a deadline a run is still finite: each step takes at most
 `max_attempts * (attempt timeout + cleanup_timeout + max_retry_delay)`, and
@@ -176,6 +183,7 @@ values and how to establish the effect of an attempt that was interrupted.
 ```gleam
 import gleam/dynamic/decode
 import gleam/json
+import gleam/time/duration
 import saga
 import saga/codec
 import saga/durable
@@ -201,7 +209,7 @@ let persistence =
 let assert Ok(store) = memory.start()
 let assert Ok(run) =
   durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout:o-1", input: "o-1")
-case durable.drive(run, timeout: 30_000) {
+case durable.drive(run, timeout: duration.seconds(30)) {
   Ok(outcome) -> handle(outcome)
   Error(error) ->
     case durable.error_kind(error) {
@@ -270,19 +278,20 @@ asserting on it — should poll `execution.progress` rather than sleep a
 guessed duration. `saga/testing` ships exactly one helper for this:
 
 ```gleam
+import gleam/time/duration
 import saga/testing
 
 let assert Ok(progress) =
   testing.wait_until(
     exec,
     matching: fn(p) { p.phase == execution.Settling },
-    within: 10_000,
+    within: duration.seconds(10),
   )
 ```
 
 `wait_until` polls `execution.progress` at a short internal interval (never
 a fixed `process.sleep`) until `matching` accepts a snapshot or `within`
-milliseconds elapse overall, using the monotonic clock for the deadline.
+elapses overall, using the monotonic clock for the deadline.
 `Error(testing.WaitTimedOut)` means the predicate never matched in time;
 `Error(testing.RunEnded)` means the run's coordinator process was already
 gone (`execution.progress`'s own `ExecutionEnded`).
@@ -410,7 +419,7 @@ scenario for it in use alongside `execution.progress`.
 - **`saga.all` takes a required first port**, so there is no empty case:
   split a `List(Port(..))` with a `case` and handle `[]` yourself.
 - **The settle window is set per run, not per cancel.** Settling ends as
-  soon as nothing is in flight; `with_settle_timeout(0)` rolls back at once
+  soon as nothing is in flight; `with_settle_timeout(duration.seconds(0))` rolls back at once
   and reports in-flight steps `interrupted`.
 - **Await once more after `cancel`.** `await` drains its monitor and the
   outcome only on the call that consumes them; an `Execution` dropped after

@@ -4,6 +4,7 @@
 /// helper here uses `process.sleep`; every synchronization point is a
 /// message exchange.
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/time/duration
 import saga
 import saga/execution.{type Execution}
 
@@ -306,7 +307,7 @@ pub fn with_run(
   let assert Ok(execution) = execution.start(workflow, input, config)
   ensure(fn() { use_execution(execution) }, fn() {
     execution.cancel(execution)
-    let _ = execution.await(execution, 2000)
+    let _ = execution.await(execution, duration.seconds(2))
     Nil
   })
 }

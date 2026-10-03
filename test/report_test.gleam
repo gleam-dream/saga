@@ -7,6 +7,7 @@
 //// synchronization point is a message exchange, never a sleep.
 
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution.{type Execution}
@@ -119,7 +120,7 @@ fn kill_owner_mid_run(
     testing.wait_until(
       run,
       matching: fn(progress) { progress.phase != execution.Running },
-      within: 5000,
+      within: duration.seconds(5),
     )
   Nil
 }
@@ -215,8 +216,8 @@ pub fn owner_death_reports_an_interrupted_compensation_test() {
   let report = process.new_subject()
   let config =
     execution.config()
-    |> execution.with_settle_timeout(0)
-    |> execution.with_cleanup_timeout(50)
+    |> execution.with_settle_timeout(duration.milliseconds(0))
+    |> execution.with_cleanup_timeout(duration.milliseconds(50))
   let #(owner, run) =
     start_owned_elsewhere(trip(gate, log), Hangs, config, report)
 
@@ -268,7 +269,8 @@ pub fn a_report_joins_the_owners_own_selector_test() {
       execution.config(),
       to: report,
     )
-  execution.await(run, 0) |> should.equal(Error(execution.NotOwner))
+  execution.await(run, duration.milliseconds(0))
+  |> should.equal(Error(execution.NotOwner))
 
   let selector =
     process.new_selector()

@@ -6,6 +6,51 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
+### Durations (wave 4)
+
+Every breaking change below has a before and after in
+[docs/migration-wave-4.md](docs/migration-wave-4.md).
+
+#### Breaking
+
+- **Every timeout, deadline, interval and lease is a `gleam/time/duration`
+  `Duration`.** No public signature or setter takes milliseconds as an
+  `Int` any more, matching grind and http_gun. Defaults and behavior are
+  unchanged. A bound below 1 millisecond keeps the refusal it had (a
+  `ConfigError`, a `DefinitionError`, `durable.InvalidTimeout` or
+  `conformance.InvalidTimeout`); a sub-millisecond `Duration` truncates to
+  0 ms before the check, so it is refused.
+  - `saga.timeout(step, limit)`, `saga.RetryAfter(delay)`,
+    `saga.InvalidTimeout(step, value)` and `StepDescriptor.timeout` carry a
+    `Duration`.
+  - `execution.with_settle_timeout`, `with_cleanup_timeout` and
+    `with_max_retry_delay` take a `Duration`; `execution.await` and
+    `execution.progress` take `timeout: Duration`; the `ConfigError`
+    variants carry the offending `Duration`.
+  - `durable.drive(run, timeout: Duration)` and
+    `durable.InvalidTimeout(timeout)`.
+  - `storage.with_call_timeout(storage, timeout)` and
+    `storage.with_renewal(every: Duration, ..)`; `conformance.run` takes
+    `timeout:` and `owner_loss_within:` as `Duration`s;
+    `testing.wait_until(within: Duration)`.
+  - `telemetry.CompensationMetadata.retry_delay` is `Option(Duration)`. The
+    event's map still carries whole milliseconds, and the numeric
+    measurements (`duration`, `system_time`) are unchanged.
+  - `saga_postgres.with_lease(config, lease)` takes a `Duration`.
+- **Unbounded is an explicit `Infinity`.** New `execution.Timeout`
+  (`After(Duration)` or `Infinity`), shaped like grind's and http_gun's.
+  `execution.with_deadline` and `execution.with_step_timeout` take it, and
+  `execution.without_step_timeout` is removed in favor of
+  `with_step_timeout(execution.Infinity)`. The deadline's default is
+  `Infinity`, as it was `None`.
+- New dependency: `gleam_time >= 1.11.0 and < 2.0.0`, in saga,
+  `saga_postgres` and `examples/order_consumer`.
+
+The memory adapter's 5 second call bound, the file adapter's 5 second
+mutation lock wait, the coordinator's 5 second start handshake and
+`saga_postgres`'s 4.5 second query bound have no setter and no public
+signature, so they stay fixed internal constants.
+
 ### Follow-up fixes (wave 3)
 
 Every breaking change below has a before and after in the "Follow-up fixes"

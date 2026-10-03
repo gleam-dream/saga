@@ -1,4 +1,5 @@
 import gleam/int
+import gleam/time/duration
 import gleeunit/should
 import saga/storage
 import saga/storage/conformance
@@ -25,7 +26,11 @@ fn memory_fixture() -> Result(conformance.Fixture, String) {
 }
 
 pub fn memory_adapter_conformance_test() {
-  conformance.run(memory_fixture, timeout: 5000, owner_loss_within: 200)
+  conformance.run(
+    memory_fixture,
+    timeout: duration.seconds(5),
+    owner_loss_within: duration.milliseconds(200),
+  )
   |> should.equal(Ok(Nil))
 }
 
@@ -40,8 +45,8 @@ pub fn file_adapter_conformance_test() {
         }),
       )
     },
-    timeout: 5000,
-    owner_loss_within: 200,
+    timeout: duration.seconds(5),
+    owner_loss_within: duration.milliseconds(200),
   )
   |> should.equal(Ok(Nil))
 }
@@ -66,8 +71,8 @@ pub fn conformance_detects_broken_ownership_test() {
         )
       Ok(conformance.fixture(broken, cleanup: fn() { memory.stop(store) }))
     },
-    timeout: 5000,
-    owner_loss_within: 200,
+    timeout: duration.seconds(5),
+    owner_loss_within: duration.milliseconds(200),
   )
   |> should.equal(Error(conformance.UnexpectedResult("forged release")))
 }
@@ -111,8 +116,8 @@ pub fn conformance_detects_forgeable_claims_test() {
         )
       Ok(conformance.fixture(forgeable, cleanup: fn() { memory.stop(store) }))
     },
-    timeout: 5000,
-    owner_loss_within: 200,
+    timeout: duration.seconds(5),
+    owner_loss_within: duration.milliseconds(200),
   )
   |> should.equal(
     Error(conformance.UnexpectedResult("a generation alone grants no ownership")),
@@ -136,8 +141,8 @@ pub fn conformance_detects_a_claim_that_never_ends_test() {
       let sticky = stores.with_claim(backend, process_claim(backend, _))
       Ok(conformance.fixture(sticky, cleanup: fn() { memory.stop(store) }))
     },
-    timeout: 5000,
-    owner_loss_within: 100,
+    timeout: duration.seconds(5),
+    owner_loss_within: duration.milliseconds(100),
   )
   |> should.equal(
     Error(conformance.UnexpectedResult(
@@ -147,9 +152,17 @@ pub fn conformance_detects_a_claim_that_never_ends_test() {
 }
 
 pub fn conformance_rejects_invalid_windows_test() {
-  conformance.run(memory_fixture, timeout: 0, owner_loss_within: 100)
+  conformance.run(
+    memory_fixture,
+    timeout: duration.milliseconds(0),
+    owner_loss_within: duration.milliseconds(100),
+  )
   |> should.equal(Error(conformance.InvalidTimeout))
-  conformance.run(memory_fixture, timeout: 100, owner_loss_within: 0)
+  conformance.run(
+    memory_fixture,
+    timeout: duration.milliseconds(100),
+    owner_loss_within: duration.milliseconds(0),
+  )
   |> should.equal(Error(conformance.InvalidTimeout))
 }
 
