@@ -10,53 +10,47 @@ Local use requires no codecs, storage, database, or job system.
 | Component                     | Responsibility                                                                                                    |
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | Saga workflow and runner      | Dependencies, bounded admission, choices, attempts, retries, cancellation, outcomes, compensation, and undo order |
-| Storage adapter               | Saved bytes, atomic creation and conditional updates, execution ownership, and cancellation intent                |
-| Optional delivery integration | Waking a runner, scheduling jobs, capacity, and delivery recovery                                                 |
+| Storage adapter               | Saved bytes, atomic creation and conditional updates, claims and their expiry, cancellation intent, listing       |
+| Delivery integration (caller) | Waking a runner, scheduling jobs, capacity, and delivery recovery                                                 |
 
-Persistence is an execution capability. `durable.prepare` checks an existing
+Persistence is an execution capability. `durable.new` checks an existing
 workflow and attaches root codecs and a compatibility stamp; it does not
-construct a second graph. This is the initial unpublished persistence API and
-checkpoint format.
+construct a second graph.
 
 ## Example
 
 ```gleam
+import gleam/dynamic/decode
+import gleam/json
 import saga
 import saga/codec
 import saga/durable
-import saga/execution
 import saga/storage/memory
 
+let order = codec.json("order-1", fn(id) { Ok(json.string(id)) }, decode.string)
 let text = codec.text()
 let action =
-  saga.effect("charge", fn(order, key) { charge(order, key) })
-  |> saga.undo_effect(fn(order, receipt, key) { refund(order, receipt, key) })
-  |> saga.recoverable("1", text, text, fn(order, key) {
-    lookup_charge(order, key)
-  })
-  |> saga.reconcile_undo(fn(order, receipt, key) {
-    lookup_refund(order, receipt, key)
-  })
-let assert Ok(workflow) = saga.define("checkout", fn(input) {
-  saga.perform(input, action)
-})
+  saga.effect("charge", fn(order, key) { charge(order, key.idempotency) })
+  |> saga.undo(fn(undo) { refund(undo.input, undo.output, undo.key.idempotency) })
+  |> durable.recoverable(version: "1", input: order, output: text, resolve: lookup_charge)
+  |> durable.resolve_undo(lookup_refund)
+let assert Ok(workflow) = saga.define("checkout", saga.perform(_, action))
 
 // The same workflow remains usable with execution.run(workflow, input, config).
 let assert Ok(persistence) =
-  durable.prepare(workflow, "1", text, text, text, text)
-let memory = memory.new()
-let storage = memory.storage(memory)
-let assert Ok(reference) =
-  durable.start_or_reconnect(storage, "checkout-123", persistence, "order-123")
-let outcome = durable.drive(storage, reference, persistence, execution.config())
-let saved = durable.read(storage, reference, persistence)
-memory.close(memory)
+  durable.new(workflow, version: "1", input: order, output: text, error: text, undo_error: text)
+let assert Ok(store) = memory.start()
+let assert Ok(run) =
+  durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout:123", input: "order-123")
+let outcome = durable.drive(run, timeout: 30_000)
+let saved = durable.read(run)
+memory.stop(store)
 ```
 
-`file.open(canonical_absolute_path)` supplies the reference persistent adapter
-through the same `Storage` contract. The caller creates its parent directory.
-A third-party package can implement `Storage`, including through ETS or a
-database, without changing workflow authoring or depending on runner internals.
+`file.open(directory)` and `saga_postgres.storage(config)` supply persistent
+adapters through the same `Storage` contract. A third-party package can
+implement `Storage` with `storage.new`, without changing workflow authoring
+or depending on runner internals.
 
 ## Authoring and eligibility
 
@@ -64,199 +58,252 @@ database, without changing workflow authoring or depending on runner internals.
   typed branch graphs once. Both branches have the same output/error types.
   The decision becomes a scheduled, saved Bool value. Only the selected branch
   executes, including nested choices. Shared dependencies still execute once.
-- `saga.recoverable(step, version, input_codec, output_codec, resolve)` adds
-  persistence capability to a step. Every step must have this capability before
-  `durable.prepare` accepts the graph. Choice decisions supply their own codec.
-- `saga.effect` and `saga.undo_effect` expose stable keys. Retries receive distinct
-  attempt keys; reconciliation and authorized replay retain the original key.
-  Undo has its own stable key. Ordinary `saga.step` and `saga.undo` also work
-  when the integration can reconcile their effects without a key argument.
-- `saga.undo` and `saga.undo_effect` retain undo reconstruction automatically.
-  Every persistent compensating step must declare `saga.restore_undo`, including
-  an explicit `NoUndo` factory when it never returns undo. `durable.prepare`
-  rejects a missing declaration before effects. Checkpointing rejects an actual
+- `durable.recoverable(step, version:, input:, output:, resolve:)` adds
+  persistence capability to a step. Every step must have it before
+  `durable.new` accepts the graph; `new` returns `NotPersistable` with every
+  problem it finds. Choice decisions supply their own codec.
+- `saga.effect` gives each attempt an `EffectKey`. Its `idempotency` is the
+  same for every attempt of the step in one execution and survives restarts;
+  its `attempt_key` is unique per attempt. Send `idempotency` downstream as
+  the provider's idempotency key. A resolver receives the same key the
+  interrupted attempt had. An undo has its own key.
+- `saga.undo` keeps undo reconstruction automatically. Every persistent
+  compensating step declares `durable.restore_undo`, including an explicit
+  `saga.NoUndo` factory when it never returns undo; `durable.new` rejects a
+  missing declaration before any effect. Checkpointing rejects an actual
   `Continue` undo when the factory returns `NoUndo`. The factory must be pure;
-  it may run during checkpoint validation and restoration. A saved `NoUndo`
-  never acquires an undo merely because the step has a default factory.
-- `saga.reconcile_undo` and `saga.reconcile_compensation` retain their callbacks
-  regardless of whether `recoverable` comes before or after them. Reattaching
-  codecs preserves both callbacks. Step error mapping translates resolver
-  results; apply `recoverable` after mapping to attach codecs in that vocabulary.
-- Apply step error mapping before adding persistence codecs. Reconciliation of
-  a returned failure needs a compensation decider in that error vocabulary;
-  configure compensation after mapping when such recovery is needed. Whole
-  workflow error mapping retains the node's bound value codecs.
-- Codecs catch exceptions and check that encoded data decodes. Determinism and
-  semantic round trips remain the codec author's responsibility. Pure maps and
-  definition factories must remain pure. Callback changes require version
-  changes, even when value types stay the same.
+  it may run during checkpoint validation and restoration.
+- `durable.resolve_undo` and `durable.resolve_compensation` keep their
+  callbacks whatever the order of the modifiers. `saga.map_step_errors` keeps
+  the codecs and maps every resolver's answers forward. A `Failed` answer from
+  a `recoverable` added after `map_step_errors` needs a `compensate` decider
+  in the mapped vocabulary; without one the execution suspends with
+  `InvalidCheckpoint(DeciderMissingAfterMapping(step))`.
+- Codecs catch exceptions and check that encoded data decodes back.
+  Determinism and semantic round trips remain the codec author's
+  responsibility. Callback changes require version changes, even when value
+  types stay the same.
 
-The compatibility stamp covers workflow identity/version, ordered nodes,
+The compatibility stamp covers workflow identity and version, ordered nodes,
 scoped addresses, dependency and choice wiring, step versions, codecs,
 attempt budgets, timeouts, and declared recovery capabilities. Restoration
-checks the stamp before invoking application decoders. Exact compatibility is
-required; callers retain the matching definition factory for live executions.
+checks the stamp before invoking application decoders; a different stamp is
+`IncompatibleDefinition`.
 
 ## State and dispatch
 
 The coordinator represents checkpoint state as values: step progress, saved
 inputs/outputs, retry times, deadline, failures, selected decisions, rollback
-intent, ordered undo journal, and settlement. Runtime closures, PIDs, monitors,
-and timers are reconstructed from the checked workflow and are never saved.
+intent, ordered undo journal, unknown effects and settlement. Runtime
+closures, PIDs, monitors, and timers are reconstructed from the checked
+workflow and are never saved.
 
 Workers wait for permission at persistence boundaries. Saga saves admission,
 then saves the checked input before releasing the actual effect. An accepted
 outcome and newly ready work share one checkpoint before further dispatch.
 Storage or codec failure stops workers and leaves the last committed state
 available for recovery. Local runs use the same transition functions without
-storage or encoding. Persistent checkpoints currently rewrite the complete
-snapshot; no incremental journal or high-volume performance claim is made.
+storage or encoding. Each commit rewrites the complete snapshot, bounded by
+`durable.with_max_checkpoint_bytes` (16 MiB by default); a larger checkpoint
+suspends the execution with `CheckpointTooLarge`.
 
 The recovery rules are:
 
 1. Saved successful outputs are decoded and reused without executing the step.
 2. A task interrupted before its input admission did not receive effect
    permission and may prepare again.
-3. An admitted effect with no saved result uses its resolver. `EffectCompleted`
-   and `EffectFailed` restore the observed result. `EffectAbsent` authorizes a
-   retry under the original key; `EffectUnknown` suspends progress. During
-   cancellation, known absence never starts another effect.
-4. Interrupted undo uses `UndoCompleted`, `UndoFailed`, `UndoStillApplied`, or
-   `UndoUnknown`. Only `UndoStillApplied` authorizes replay of the saved undo.
-5. An interrupted compensation decision uses `reconcile_compensation` with its
-   saved input, original attempt budget, and stable compensation key.
-   `CompensationResolved(decision)` applies that decision through the normal
-   runner transitions. `CompensationUnknown` keeps the execution suspended.
-   Saga never repeats the original compensation callback on restart.
+3. An admitted effect with no saved result uses its resolver.
+   `durable.Completed` and `durable.Failed` restore the observed result.
+   `NotSent` authorizes a retry under the original key; `MaybeSent` suspends
+   progress with `RecoveryRequired`. During cancellation, known absence never
+   starts another effect.
+4. An interrupted undo uses `durable.resolve_undo`: `Completed(Nil)`,
+   `Failed(error)`, `NotSent` (replay the saved undo) or `MaybeSent`
+   (suspend). Without a resolver, an interrupted undo suspends.
+5. An interrupted compensation decision uses `durable.resolve_compensation`
+   with its saved input and the failed attempt's key, under the original
+   attempt budget. `Some(decision)` applies that decision through the normal
+   runner transitions; `None` keeps the execution suspended. Saga never
+   repeats the original decider on restart.
+6. A returned error that `saga.unknown_when` marks is recorded in the saved
+   unknown effects when it ends, and the decision about it is saved like any
+   other. After a restart, a decision that was in flight goes to the
+   compensation resolver (rule 5), and an attempt whose result was not yet
+   saved goes to its effect resolver (rule 3); a `Failed` answer that the
+   classifier marks is recorded as unknown again. A journaled error is never
+   replayed as if it were known.
 
 Resolvers must establish absence or use downstream idempotency. Storage alone
 cannot promise exactly-once external effects. Reverse completion-order undo,
 retry budgets and backoff, branch selection, and rollback intent survive
 restart. A resumed concurrency limit cannot be smaller than the saved number
-of in-flight attempts and compensation decisions. Compensation requires an
-admitted input; a crash while preparing input suspends persistent compensation
-before its callback can run. Saved deadlines/backoff use wall-clock timestamps;
-clocks must be suitable for the deployment's timing requirements.
+of in-flight attempts and compensation decisions
+(`ConcurrencyBelowInFlight`). Compensation requires an admitted input; a crash
+while preparing input suspends persistent compensation before its callback
+can run. Saved deadlines and backoff use wall-clock timestamps; clocks must
+suit the deployment's timing requirements.
 
-## Compensation recovery
+## Driving
 
-Use `compensate_with_key` when the compensation callback performs an external
-action. Save the decision under its key in the external system. The resolver
-must be safe to call repeatedly and reconstruct the complete decision, including
-any `Continue` output and undo capability.
+`durable.drive(run, timeout:)` runs the execution in a runner process and
+waits at most `timeout` milliseconds.
 
-```gleam
-let action =
-  saga.step("reserve", reserve)
-  |> saga.compensate_with_key(3, fn(input, failure, attempt, key) {
-    decide_and_record(input, failure, attempt, key)
-  })
-  |> saga.reconcile_compensation(fn(input, attempt, key) {
-    lookup_decision(input, attempt, key)
-  })
-  |> saga.restore_undo(fn(input, output, key) {
-    saga.UndoWith(fn() { release_reservation(input, output, key) })
-  })
-  |> saga.recoverable("1", input_codec, output_codec, lookup_reservation)
-```
+- The runner claims the execution, restores the checkpoint and runs. The
+  outcome is returned once it is saved; a finished execution returns its
+  saved outcome at once.
+- On timeout, `drive` stops the runner and returns `DriveTimedOut`. When the
+  process that called `drive` exits, the runner stops by itself. Either way
+  in-flight attempts are killed, the claim is released, and the last
+  checkpoint stays: the next `drive` resumes and asks each interrupted
+  attempt's resolver what happened. This is never cancellation.
+- Every storage call from the runner is bounded by the storage's call
+  timeout (5 s by default, `storage.with_call_timeout`); a slower call stops
+  the runner with `StorageFailure(TimedOut)`.
+- A storage declared `with_renewal` has its claim renewed from a heartbeat
+  linked to the runner. A renewal that finds the claim taken over stops the
+  runner with `StorageFailure(StaleOwner)`.
+- Concurrent `drive`s of one execution contend through the storage: all but
+  one return `StorageFailure(Busy)`.
 
-A resolver returns any ordinary recovery decision (`Retry`, `RetryAfter`,
-`Continue`, `Abort`, `AbortAfterCleanupFailure`, `Hold`) inside
-`CompensationResolved`. Retry still consumes the original budget. Cancellation
-supersedes retry; a resolved Continue joins settlement and rollback. Hold
-retains its lack of rollback authority. If no decision can be established,
-return `CompensationUnknown` and leave the execution suspended.
+`durable.error_kind` classifies every error into `Busy`, `Transient`,
+`NeedsReconciliation`, `Incompatible` or `Defect`, so a job handler can map
+an error to snooze, retry, operator attention or failure without matching
+the growing `Error` union.
+
+Saga does not wake runners. `durable.unfinished(storage, limit:)` lists the
+executions that are pending or suspended and that no live runner owns, and
+`durable.reconnect(persistence, storage, id:)` attaches to one by id. Who
+calls them (a grind job, an application sweeper, an operator) is the
+application's choice until the ecosystem settles durability ownership.
 
 ## Storage contract
 
-A `Storage` value addresses one execution and supplies these atomic operations:
+One `Storage` value serves a whole store: every operation names the
+execution it acts on, so one database pool backs every execution of an
+application. `storage.new` takes seven atomic operations:
 
-- `create(bytes)` succeeds once and returns revision zero.
-- `load()` returns revision, ownership generation, cancellation flag, and bytes.
-- `claim()` excludes competing live runners and advances the ownership generation.
-- `commit(generation, expected_revision, observed_cancelled, bytes)` succeeds
-  only for the current owner and matching revision/cancellation observation,
-  increments the revision, and preserves ownership.
-- `release(generation)` releases only the current owner's claim.
-- `cancel()` idempotently records cancellation without overwriting progress.
+- `create(id, bytes)` succeeds once and returns revision zero, phase
+  `Pending`.
+- `load(id)` returns revision, ownership generation, cancellation flag, and
+  bytes.
+- `claim(id)` excludes competing live owners, advances the generation, and
+  returns an opaque `Claim` (id, generation, adapter token).
+- `commit(claim, Commit(expected_revision:, observed_cancelled:, phase:,
+data:))` succeeds only for the current claim and the matching revision
+  and cancellation observation, increments the revision, and keeps
+  ownership. Failures take precedence `StaleOwner`, then
+  `CancellationChanged`, then `Conflict`.
+- `release(claim)` releases only the current claim.
+- `cancel(id)` idempotently records cancellation without overwriting
+  progress.
+- `unfinished(limit)` lists unowned executions whose phase is `Pending` or
+  `Suspended`.
 
-An adapter must reject stale owners and release ownership after worker loss.
-A distributed adapter must fence stale writers across its supported deployment
-scope; implementing this as unguarded load/store does not satisfy the contract.
-External effects still need reconciliation when a worker loses ownership.
+**Ownership is the claim value.** Any process holding the current claim may
+commit or release; a claim rebuilt with the right generation but another
+token is refused. An adapter therefore needs no registry of claiming
+processes. How an adapter notices that an owner is gone is its own choice,
+within the window it declares to the conformance suite: the memory adapter
+watches the claiming process, the file adapter checks that the claiming
+process still lives in this VM, and `saga_postgres` uses a lease.
 
-The memory adapter uses a dedicated process and survives execution-worker
-loss, but not VM shutdown. Call `memory.close` when finished. The file adapter
-uses VM-local ownership, revision/generation checks, synced temporary files,
-and atomic replacement. It supports fresh-VM recovery after shutdown, but
-requires one VM at a time to access a canonical path. Concurrent VMs, path
-aliases, and power-loss directory durability are outside its contract.
+**Lease renewal.** A lease-based adapter declares `storage.with_renewal`.
+Commit-only refresh is not enough: the gap between two commits is the
+longest action in flight, which a step may extend up to its attempt timeout
+(or without bound with `without_step_timeout`) and a `RetryAfter` backoff
+up to five minutes. A lease shorter than that gap would expire under a live
+runner and let a second runner start the same step concurrently. With
+renewal, a lease expires only when its runner is gone, so the lease can stay
+short and the owner-loss window small, and fencing by generation and token
+still guards every write.
+
+A distributed adapter must fence stale writers across its supported
+deployment scope; implementing this as unguarded load/store does not satisfy
+the contract. External effects still need reconciliation when a runner loses
+ownership.
+
+The memory adapter is a gleam_otp actor (`memory.start`, or
+`memory.supervised(name)` found by `memory.named(name)`); it survives runner
+and caller loss but not VM shutdown, and loses its executions on restart. The
+file adapter keeps one file per execution in a directory, with synced
+temporary files and atomic replacement. It supports fresh-VM recovery after
+shutdown, but requires one VM at a time to use the directory. Concurrent
+VMs, path aliases, and power-loss directory durability are outside its
+contract. `saga_postgres` shares executions across VMs on the application's
+pool.
 
 ## Adapter conformance
 
-An adapter package can run the public suite without depending on Saga's tests
+An adapter package runs the public suite without depending on saga's tests
 or a particular test framework:
 
 ```gleam
 import saga/storage/conformance
 
-let result = conformance.run(fn() {
-  let resource = create_fresh_test_execution()
-  Ok(conformance.Fixture(
-    adapter.storage(resource),
-    fn() { delete_test_execution(resource) },
-  ))
-}, 5000)
+let result =
+  conformance.run(
+    fn() {
+      let resource = create_test_store()
+      Ok(conformance.fixture(adapter.storage(resource), cleanup: fn() {
+        drop_test_store(resource)
+      }))
+    },
+    timeout: 5000,
+    owner_loss_within: lease + 500,
+  )
 ```
 
-Each scenario receives a fresh execution. The factory and cleanup run in the
-caller; adapter operations run in separate workers. The timeout bounds each
-scenario. Cleanup runs after the scenario worker stops, including on failure.
-Factories and cleanup must return promptly and must not raise.
+Each scenario receives a fresh fixture and fresh execution ids. The factory
+and cleanup run in the caller; adapter operations run in separate workers.
+`timeout` bounds each scenario's storage work, and scenarios that wait for a
+lost owner get `owner_loss_within` on top.
 
 The suite checks atomic creation, unchanged data after refused writes,
-exclusive ownership, revision and generation checks, cancellation races,
-release, and ownership recovery after process death. The memory and file
-adapters run this same suite. A passing result establishes these protocol
-checks within one VM; adapter authors must separately test their deployment's
-distributed fencing and media durability claims.
+exclusive claims, claims as values, revision and generation checks,
+cancellation races, release, that a live owner keeps its claim past the
+owner-loss window, that a lost owner's claim ends within it, and the
+`unfinished` listing. The memory, file and PostgreSQL adapters run this same
+suite. A passing result establishes these protocol checks from one VM;
+adapter authors must separately test distributed fencing and media
+durability claims.
 
 ## Results and cancellation
 
-`start_or_reconnect` is idempotent for the same reference, definition, and
-encoded input. A mismatch is refused. `read` returns `Pending`, `Suspended`,
-or `Finished(execution.Outcome)` without relying on a live worker or completion
-notification. `drive` returns that same outcome after it has been saved.
+`start_or_reconnect` is idempotent for the same id, definition, and encoded
+input. A different input is `InputMismatch`. `read` returns `Pending`,
+`Suspended`, or `Finished(execution.Outcome)` without a live runner. `drive`
+returns that same outcome after it has been saved.
 
-Operational failures retain typed categories: `StorageError(storage.Error)`,
-`CodecFailure(reason)`, `InvalidCheckpoint(reason)`, and
-`RecoveryRequired(reconciliation.Required(step, action, key))`. A saved suspension
-retains the category for later reads. If saving the suspension fails with a
-different error, `SuspensionNotSaved(cause, recording)` returns both causes; an
-identical repeated error is returned once. The last committed checkpoint remains
-the recovery authority. Checkpoint format 1 stores these typed reasons. Its
-version starts at 1 for the first release; development snapshots are disposable.
+Failures are typed: `StorageFailure(storage.Error)`,
+`CodecFailure(boundary, codec.CodecError)`, `InvalidCheckpoint(problem)`,
+`CheckpointTooLarge(bytes, limit)` and
+`RecoveryRequired(Required(step, action, key))`. A saved suspension keeps its
+reason for later reads. If saving the suspension fails with a different
+error, `SuspensionNotSaved(cause, recording)` returns both; an identical
+repeated error is returned once. The last committed checkpoint remains the
+recovery authority.
 
-`cancel` records explicit intent; caller or worker death is not cancellation.
-A running worker observes cancellation at its next checkpoint, so cancellation
-latency can include the current action's timeout. A cancellation recorded before
-the next admission or terminal commit wins. Interrupted admitted actions are
-reconciled before rollback. Cancellation does not imply an external effect
-has been reversed.
+`cancel` records explicit intent; caller or runner death is not cancellation.
+A running runner observes cancellation at its next checkpoint, so
+cancellation latency can include the current action's timeout. A
+cancellation recorded before the next admission or terminal commit wins.
+Interrupted admitted actions are reconciled before rollback. Cancellation
+does not imply that an external effect has been reversed.
 
-## Optional Grind and Fabric integration
+## Grind and Fabric integration
 
-An integration retains a stable Saga execution reference before scheduling a
-job. Redelivery uses that reference, reads any saved outcome, then calls
-`drive` if work remains. `Busy` means another runner owns the execution.
-Delivery acknowledgment is not the authority for Saga completion.
+An integration keeps a stable execution id before scheduling a job.
+Redelivery reconnects by that id, reads any saved outcome, then calls
+`drive` with the job's own time budget as `timeout`. `error_kind` maps the
+result: `Busy` and `Transient` snooze the job, `NeedsReconciliation` makes it
+uncertain, and the rest fail it. Delivery acknowledgment is not the
+authority for saga completion; the saved outcome is.
 
-Grind can supply delivery, worker capacity, and wakeups. Saga owns progress and
-compensation. An integration needing atomic coordination between state changes
-and external job scheduling must supply that transaction/outbox contract.
-Fabric can retain the same reference for an independently owned child workflow;
-parent process loss must not be translated into Saga cancellation. Neither
-integration is implemented here.
+Grind supplies delivery, worker capacity, and wakeups; saga owns progress
+and compensation. An integration needing atomic coordination between state
+changes and external job scheduling must supply that transaction or outbox
+contract. Fabric can keep the same id for an independently owned child
+workflow; parent process loss is never translated into saga cancellation.
 
 ## Evidence
 
@@ -276,4 +323,8 @@ they save receipts. The fresh VM resolves both original keys and attempt
 budgets without repeating either callback. Public tests also cover mapped
 resolver results, every recovery decision, a second restart before Continue
 undo, configuration order, early undo eligibility, typed failures, failed
-suspension recording, and adapter conformance.
+suspension recording, and adapter conformance. Durable tests also cover a
+bounded `drive` (timeout and caller exit stop the runner and release its
+claim), lease renewal detecting a takeover, slow storage calls, the
+checkpoint size limit, the `unfinished` listing, one storage serving many
+executions, and "maybe sent" errors recorded as unknown across a restart.

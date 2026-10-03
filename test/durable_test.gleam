@@ -1393,3 +1393,102 @@ pub fn error_kinds_classify_every_variant_test() {
   durable.describe_error(durable.StorageFailure(storage.Busy))
   |> should.equal("storage: another runner owns the execution")
 }
+
+// ---------------------------------------------------------------------------
+// unknown_when across a restart (open question 1)
+// ---------------------------------------------------------------------------
+
+/// A "maybe sent" error is recorded as unknown when it ends, and the record
+/// survives a restart: the in-flight decision goes to the compensation
+/// resolver, and the retried success still completes with unknown effects.
+pub fn classified_error_survives_a_restart_in_its_decision_test() {
+  let entered = process.new_subject()
+  let owner = process.new_subject()
+  let make = fn(recovering) {
+    let step =
+      saga.effect("charge", fn(value, key: saga.EffectKey) {
+        case key.attempt {
+          1 -> Error("maybe charged")
+          _ -> Ok(value <> " charged")
+        }
+      })
+      |> saga.unknown_when(fn(error) { error == "maybe charged" })
+      |> saga.compensate(max_attempts: 2, with: fn(_failed) {
+        process.send(entered, Nil)
+        process.receive_forever(process.new_subject())
+      })
+      |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+      |> durable.resolve_compensation(fn(_, _) {
+        case recovering {
+          True -> Some(saga.Retry)
+          False -> None
+        }
+      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) { durable.MaybeSent },
+      )
+    let assert Ok(workflow) =
+      saga.define("maybe", fn(input) { saga.perform(input, step) })
+    prepare(workflow)
+  }
+  let store = start_memory()
+  let backend = stores.watched(memory.storage(store), owner)
+  let result = drive_later(start(make(False), backend, "maybe"))
+  let assert Ok(pid) = process.receive(owner, 1000)
+  let assert Ok(Nil) = process.receive(entered, 1000)
+  kill_and_wait(pid)
+  let _ = process.receive(result, 1000)
+  let assert Ok(execution.CompletedWithUnknownEffects("x charged", [unknown])) =
+    drive(reconnect(make(True), backend, "maybe"))
+  unknown.step |> should.equal(at("charge"))
+  unknown.action |> should.equal(execution.StepAttempt(1))
+  unknown.ending |> should.equal(execution.ActionReturnedUnknown)
+  memory.stop(store)
+}
+
+/// An attempt interrupted before its result was saved goes to its effect
+/// resolver; a `Failed` answer the classifier marks is recorded as unknown.
+pub fn classified_resolver_failure_is_recorded_as_unknown_test() {
+  let entered = process.new_subject()
+  let owner = process.new_subject()
+  let make = fn(recovering) {
+    let step =
+      saga.step("charge", fn(value) {
+        process.send(entered, Nil)
+        process.sleep_forever()
+        Ok(value)
+      })
+      |> saga.unknown_when(fn(error) { error == "maybe charged" })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) {
+          case recovering {
+            True -> durable.Failed("maybe charged")
+            False -> durable.MaybeSent
+          }
+        },
+      )
+    let assert Ok(workflow) =
+      saga.define("maybe-resolved", fn(input) { saga.perform(input, step) })
+    prepare(workflow)
+  }
+  let store = start_memory()
+  let backend = stores.watched(memory.storage(store), owner)
+  let result = drive_later(start(make(False), backend, "maybe-resolved"))
+  let assert Ok(pid) = process.receive(owner, 1000)
+  let assert Ok(Nil) = process.receive(entered, 1000)
+  kill_and_wait(pid)
+  let _ = process.receive(result, 1000)
+  let assert Ok(outcome) =
+    drive(reconnect(make(True), backend, "maybe-resolved"))
+  let assert execution.Failed(execution.StepFailed(_, "maybe charged"), _) =
+    outcome
+  let assert [unknown] = execution.unknown_effects(outcome)
+  unknown.ending |> should.equal(execution.ActionReturnedUnknown)
+  memory.stop(store)
+}

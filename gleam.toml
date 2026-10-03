@@ -12,6 +12,10 @@ gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
 gleam_json = ">= 3.0.0 and < 4.0.0"
+# Sinal is required: the coordinator emits saga/telemetry events on every
+# run. It stays a path dependency until it is published; then this line
+# becomes `sinal = ">= 0.1.0 and < 1.0.0"`. CI checks out the revision in
+# sibling-revisions.txt.
 sinal = { path = "../sinal" }
 
 [dev-dependencies]

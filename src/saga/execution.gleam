@@ -1009,7 +1009,7 @@ pub fn pid(execution: Execution(o, e, u)) -> Pid {
   execution.pid
 }
 
-/// The run's id, matching what Sinal observation metadata will use.
+/// The run's id, the `run` field of its `saga/telemetry` events.
 pub fn run_id(execution: Execution(o, e, u)) -> Int {
   execution.run_id
 }

@@ -787,49 +787,16 @@ fn root_scope() -> ScopeToken(e, u) {
 // Port
 // ---------------------------------------------------------------------------
 
-/// A typed reference to a value produced somewhere in the workflow graph
-/// being built: either the workflow's own input, or the output of a
-/// `perform`/`map`/`both`/`all`/`embed`. Two consumers of the same `Port`
-/// value depend on the same node, so that node executes once per run.
+/// A typed reference to a value produced in the workflow graph being
+/// built: the workflow's own input, or the output of a `perform`, `map`,
+/// `both`, `all`, `choose` or `embed`. Two consumers of the same `Port` value
+/// depend on the same node, so that node executes once per run.
 ///
-/// `fetch` has three levels, each meant to run in a different place:
-///
-///  1. The outer call happens while the graph is being built, exactly once
-///     per `Workflow` (in `perform`, `both`, `all`, `map`, and `define`'s
-///     final output read): purely structural, composing closures, never
-///     touching a run's values.
-///  2. The middle call happens in the coordinator, once per attempt
-///     (`perform`'s `prepare_attempt`/`prepare_crash_recovery`) or once for
-///     the final output (`for_run`'s `fetch_output`), and is given that
-///     run's `Store`: it performs every underlying dependency read
-///     (`store.get`, only ever called by the coordinator — the process that
-///     owns this run's `Store`) and returns a *pure* thunk with the raw
-///     dependency value(s) already captured.
-///  3. The inner call happens wherever that pure thunk is actually run: for
-///     `perform`, inside the spawned attempt/recovery task, under `rescue`.
-///     This is the only level `map`'s `with` function is ever invoked from,
-///     so a panicking or slow `map` becomes an ordinary attempt
-///     crash/duration instead of reaching the coordinator.
-///
-/// Because the graph is now built once at `define` (see `Workflow`'s doc
-/// comment) and every subsequent run of the same definition replays the
-/// same node closures, `fetch`'s outer (level 1) call happens only once,
-/// ever, per `Workflow` value -- not once per run as it did when the
-/// builder was re-evaluated fresh for every run. What *is* per-run is the
-/// `Store` threaded into level 2, which is why a value read can never leak
-/// between two runs of the same definition despite sharing one build.
-///
-/// `deps` holds only this port's own *immediate* dependency ids (a single
-/// id for a `perform` result, the union of two ports' immediate ids for
-/// `both`/`map`'s pass-through) -- never the full transitive node graph.
-/// The full node table is never carried by any `Port` at all: every node
-/// `perform` creates is appended, once, to its scope's own `registry` (see
-/// `ScopeToken`'s doc comment), and `define` assembles the final table by
-/// walking `deps` transitively (via each node's own `deps` list) from the
-/// workflow's output port, once, at the very end -- rather than every
-/// `both`/`map` call merging an ever-larger node map copied from its
-/// inputs. See `bench/RESULTS.md`'s "define time" section for the
-/// superlinear cost this replaces.
+/// A port reads its value in three stages: the graph is composed once, at
+/// `define`; the coordinator reads the dependency values from the run's
+/// store for each attempt; and the task that runs the attempt computes any
+/// `map` transformation, under `rescue`, so a panicking or slow `map`
+/// becomes an attempt crash instead of reaching the coordinator.
 pub opaque type Port(a, e, u) {
   Port(
     scope: ScopeToken(e, u),
@@ -1464,30 +1431,11 @@ fn failure_to_node(failure: AttemptFailure(e)) -> node.AttemptFailure(e) {
 /// A pure, named workflow description with input, output, business error,
 /// and undo-error types.
 ///
-/// **A builder function is invoked in exactly two situations, each exactly
-/// once, and never any other way:**
-///
-///  1. `define(name, build)` calls `build` exactly once, in the calling
-///     process, before any run exists, to validate the workflow and to
-///     compute this static, immutable graph (`nodes`/`order`/
-///     `root_input_id`/`fetch_output`).
-///  2. `embed(input, workflow)`, called from *inside* some other,
-///     unrelated `define`'s own builder, calls `workflow`'s `build` field
-///     exactly once — this is that *other* `define`'s one evaluation
-///     validating and incorporating `workflow`'s subgraph at a fresh input
-///     port it owns, not a second evaluation of `workflow` itself.
-///
-/// No other function ever calls a builder. In particular: no run
-/// (`execution.run`/`start`, however many, however concurrent) calls
-/// `build` — `for_run` replays the *already-built* `nodes`/`order`/
-/// `fetch_output` against a fresh `saga/internal/store.Store` instead (see
-/// that function's doc comment for why this is safe despite the graph
-/// being shared). And `map_errors` never calls `build` either: it reuses
-/// `workflow`'s own already-built graph, wrapping only the node closures
-/// (`node.map_errors`) — its own `build` field exists solely so a *later*
-/// `embed` of the mapped workflow has one to call, per case 2 above; it is
-/// never invoked to compute the mapped workflow's own `nodes`/`order`/
-/// `fetch_output`.
+/// A builder function runs exactly once per `define`, in the calling
+/// process, to validate the workflow and build its graph; `embed` runs a
+/// workflow's builder once more as part of another workflow's `define`. No
+/// run evaluates a builder: every run replays the built graph against its
+/// own value store, so concurrent runs of one `Workflow` never share values.
 pub opaque type Workflow(i, o, e, u) {
   Workflow(
     name: String,
@@ -1506,17 +1454,11 @@ pub opaque type Workflow(i, o, e, u) {
   )
 }
 
-/// Builds and validates a named workflow. Validation runs the builder once,
-/// in the calling process, before any runtime resource exists: it checks
-/// step names, attempt budgets, timeouts, and that every port used belongs
-/// to this evaluation. All errors are collected, not just the first. This
-/// one evaluation also *is* the workflow's graph construction for running
-/// it — no run evaluates `build` again (see `Workflow`'s doc comment), so
-/// running this `Workflow` never depends on `build` returning the same
-/// graph twice. (`build` is called once more *at another workflow's own
-/// `define` evaluation* if this one is later composed in with `embed`; that
-/// is the other `define`'s graph construction, not a run of this one.
-/// `map_errors` never calls `build` at all — see its own doc comment.)
+/// Builds and validates a named workflow. The builder runs once, in the
+/// calling process, before any runtime resource exists: `define` checks step
+/// names, attempt budgets, timeouts, that every port used belongs to this
+/// evaluation, and that every step reaches the output. It returns every
+/// error, not just the first; `describe_definition_error` renders one.
 pub fn define(
   name: String,
   build: fn(Port(i, e, u)) -> Port(o, e, u),
@@ -1815,29 +1757,13 @@ pub fn describe(workflow: Workflow(i, o, e, u)) -> List(StepDescriptor) {
   workflow.descriptors
 }
 
-/// Sequentially composes `workflow` into the port graph being built for
-/// another workflow, sharing the same run and journal (not an independent
-/// child). `input`'s scope *id* flows through unchanged, so an inner
-/// builder may legitimately capture outer ports (and the parent's own
-/// `define` still validates against a single scope id) — but every node the
-/// inner builder creates is addressed under a nested scope path, extended
-/// with `workflow`'s name, so repeated `embed` calls of the same workflow
-/// (or a name that collides with an outer step) do not collide in
-/// `saga.describe`/`saga.address_to_string` or in Sinal step names. See the
-/// `StepAddress` doc comment.
-///
-/// `workflow.build` is not guaranteed to be a pure function of the
-/// `scoped_input` it is given here (see `Workflow`'s doc comment on when a
-/// builder is invoked) — it could close over mutable state and return a
-/// `Port` stashed from a *different*, unrelated `define`'s own evaluation.
-/// Before restoring the parent's own scope below, `foreign_error_for` checks
-/// `output`'s scope id against this call's own scope, exactly as `both`/
-/// `all`/`perform` already do for a foreign port used directly: skipping
-/// that check and unconditionally overwriting `output.scope` would silently
-/// launder a foreign port's scope into looking like this `embed`'s own,
-/// masking the mismatch from the composing `define`'s root-scope check —
-/// the foreign port's *nodes* would still belong to the other definition's
-/// graph, so a run would panic in `store.get` instead of `define` failing.
+/// Composes `workflow` into the graph being built for another workflow,
+/// sharing the same run and journal (not an independent child). The embedded
+/// steps are addressed under a nested scope named after `workflow`, so
+/// repeated embeds and name collisions stay distinct in `describe`,
+/// `address_to_string` and telemetry. An inner builder may use ports of the
+/// outer workflow; a port from an unrelated definition is reported as
+/// `ForeignPort`.
 pub fn embed(
   input: Port(i, e, u),
   workflow: Workflow(i, o, e, u),
@@ -1863,35 +1789,10 @@ pub fn embed(
   )
 }
 
-/// Adapts a whole workflow's error and undo-error types.
-///
-/// **Running the mapped workflow standalone** (`execution.run`/`start`, or
-/// `describe`) never invokes `workflow`'s own builder again: `nodes`,
-/// `order`, `root_input_id`, and `fetch_output` are reused directly from
-/// `workflow`'s already-built, already-validated graph, with only the
-/// node closures themselves translated in place (`node.map_errors`, which
-/// wraps each node's `e1`/`u1`-typed *outputs* on the way out — see that
-/// function's doc comment for why this never needs to re-run, or even
-/// look at, the original builder). This is what fixes a real hazard a
-/// second builder evaluation could hit: a builder that is not a pure
-/// function of its input (closing over mutable state, or returning a
-/// `Port` stashed from an earlier call) could, if re-run, produce a graph
-/// shape `define` never validated — `describe` would then disagree with
-/// what an actual run executes, and a stashed `Port` from a *different*
-/// evaluation could reference a node id the mapped workflow's own graph
-/// never populated, panicking the run instead of completing it.
-///
-/// **Composing the mapped workflow with `embed`** is different: `embed`
-/// splices a workflow's port graph into some *other*, unrelated `define`
-/// call's own one-time builder evaluation, at a fresh input port that
-/// evaluation itself owns — there is no way to reuse a fixed graph for
-/// that (the new embedding site's own dependency wiring did not exist
-/// when `workflow`/`map_errors` first ran). So `build` here still wraps
-/// `workflow.build` (the *original*, already-validated builder) with the
-/// same node-translation, exactly as `embed` needs; this is not a second
-/// evaluation of `map_errors`'s own graph, it is the *one* evaluation
-/// `embed`'s own composing `define` performs, validated there like any
-/// other node that `define` call introduces.
+/// Adapts a whole workflow's error and undo-error types. The mapped
+/// workflow reuses the original's built graph and wraps each step's results;
+/// its builder never runs again for a standalone run, and runs once inside
+/// another workflow's `define` when the mapped workflow is embedded.
 pub fn map_errors(
   workflow: Workflow(i, o, e1, u1),
   error map_error: fn(e1) -> e2,
