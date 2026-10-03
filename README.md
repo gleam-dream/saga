@@ -98,8 +98,32 @@ saga.effect("charge_payment", charge_with_key)
 Step callbacks receive one record each: `saga.undo` gets
 `UndoRequest(input, output, key)`, `saga.compensate` gets
 `FailedAttempt(input, failure, attempt, attempts_left, key)`, and
-`saga.effect` gets an `EffectKey(idempotency, attempt, attempt_key)`. Read
-them by label.
+`saga.effect` gets an `EffectKey(idempotency, attempt, attempt_key,
+correlation)`. Read them by label.
+
+**A step reads its run's correlation** from the `EffectKey` that `effect`,
+`undo` and `compensate` already receive, so a step's own clients join the
+run's events without threading the value by hand:
+
+```gleam
+saga.effect("refund", fn(refund, key) {
+  let shop = case key.correlation {
+    Some(correlation) -> shop.with_correlation(shop, correlation)
+    None -> shop
+  }
+  shop.refund(shop, refund, idempotency: key.idempotency)
+})
+```
+
+`key.correlation` is the correlation set with `execution.with_correlation` or
+`durable.with_correlation`, the same value that the run's `saga/telemetry`
+events carry. A durable execution that sets none carries
+`correlation.from_key(id)` of its execution id, so a step of a durable run
+always reads `Some`; a local run without one reads `None`. `saga.step` hands
+its function the input only: use `effect` for a step that needs the context.
+The durable resolvers (`recoverable`, `resolve_undo`, `resolve_compensation`)
+receive the same key, with the correlation of the handle that drives after
+the restart.
 
 ## Configuration
 
@@ -166,6 +190,7 @@ Every wait, retry and saved value is bounded by default.
 | Checkpoint size                                        | 16 MiB (16 777 216 bytes)                        | `durable.with_max_checkpoint_bytes`                                   |
 | PostgreSQL claim lease                                 | 30 seconds, renewed every 10 seconds             | `saga_postgres.with_lease`                                            |
 | Conformance owner-loss window                          | declared by the adapter                          | `conformance.run(owner_loss_within:)`                                 |
+| Correlation of a run, its events and its steps         | local: none; durable: `from_key(execution id)`   | `execution.with_correlation`, `durable.with_correlation`              |
 | Sinal handlers                                         | synchronous in the coordinator                   | route `["saga"]` to a `sinal/forwarder`                               |
 
 Without a deadline a run is still finite: each step takes at most
@@ -255,7 +280,9 @@ case durable.drive(run, timeout: duration.seconds(30)) {
 and stop, compensation decisions and undo outcomes. Every event's metadata
 carries `workflow`, `run` (this VM's id for one run), `execution` (the
 durable id, or `None`) and `correlation` (from `execution.with_correlation`
-or `durable.with_correlation`).
+or `durable.with_correlation`; a durable execution without one carries
+`correlation.from_key(id)`, and a local run `None`). The step and undo
+callbacks read the same value from their `EffectKey`.
 
 ```gleam
 import saga/telemetry

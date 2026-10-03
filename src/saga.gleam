@@ -66,6 +66,7 @@ import saga/internal/node.{
   EvidenceCompleted, EvidenceFailed, EvidenceMaybeSent, EvidenceNotSent, Node,
 }
 import saga/internal/store.{type Store}
+import sinal/correlation.{type Correlation}
 
 /// A step's recorded location: nested scope (from `embed` and `choose`), a
 /// name, and the 1-based occurrence rank among steps sharing the same scope
@@ -74,7 +75,8 @@ pub type StepAddress {
   StepAddress(scope: List(String), name: String, occurrence: Int)
 }
 
-/// The keys of one action of a step, for external systems.
+/// The context of one action of a step, for external systems: its keys and
+/// the correlation of its run.
 ///
 /// - `idempotency` is the same for every attempt of the step within one run
 ///   of a local workflow, or one durable execution across restarts. Send it
@@ -83,13 +85,30 @@ pub type StepAddress {
 /// - `attempt` is the 1-based attempt number.
 /// - `attempt_key` is unique to this attempt; use it to record or look up
 ///   one attempt.
+/// - `correlation` is the correlation of the run that performs the action:
+///   the one set with `execution.with_correlation` or
+///   `durable.with_correlation`, which is also the `correlation` of the run's
+///   `saga/telemetry` events. A durable execution without one carries
+///   `correlation.from_key(id)` of its execution id, so it is never `None`
+///   there. A local run without one has `None`. Pass it on to the clients the
+///   step calls, for example `http_gun.with_correlation`, so their events
+///   join the run's.
 ///
 /// A local run derives `idempotency` from its run id, which is new for every
 /// `execution.run`; a durable execution derives it from the id given to
 /// `durable.start_or_reconnect`, so it survives restarts. The text of a key
 /// is opaque: compare and store it, never parse it.
+///
+/// Saga builds this record; read its fields by label. `saga.step` receives
+/// only the step's input: use `saga.effect` for a step that needs the
+/// context. `undo` and `compensate` receive it as `key`.
 pub type EffectKey {
-  EffectKey(idempotency: String, attempt: Int, attempt_key: String)
+  EffectKey(
+    idempotency: String,
+    attempt: Int,
+    attempt_key: String,
+    correlation: Option(Correlation),
+  )
 }
 
 /// What an undo action receives: the step's input, the output that
@@ -359,7 +378,8 @@ type StepPersistence(i, o) {
 
 /// Creates a step from its name and its run function. With no further
 /// modifiers, a failure is terminal after one attempt and nothing is undone
-/// on rollback.
+/// on rollback. The run function receives only the step's input; use
+/// `effect` to read the attempt's keys and the run's correlation.
 pub fn step(name: String, run: fn(i) -> Result(o, e)) -> Step(i, o, e, u) {
   effect(name, fn(input, _key) { run(input) })
 }
@@ -367,7 +387,8 @@ pub fn step(name: String, run: fn(i) -> Result(o, e)) -> Step(i, o, e, u) {
 /// Creates a step whose run function also receives the attempt's
 /// `EffectKey`. Send `key.idempotency` to the external system as its
 /// idempotency key: it stays the same across retries, so a retry after an
-/// unknown outcome cannot repeat the effect.
+/// unknown outcome cannot repeat the effect. `key.correlation` is the run's
+/// correlation, for the step's own clients.
 pub fn effect(
   name: String,
   run: fn(i, EffectKey) -> Result(o, e),
@@ -417,7 +438,11 @@ pub fn undo(
           Succeeded(
             output,
             UndoWith(fn() {
-              run(UndoRequest(input, output, undo_key(key.idempotency)))
+              run(UndoRequest(
+                input,
+                output,
+                undo_key(key.idempotency, key.correlation),
+              ))
             }),
           )
         unchanged -> unchanged
@@ -762,35 +787,46 @@ pub fn set_resolve_compensation(
   Step(..step, resolve_compensation: resolve)
 }
 
-/// The `EffectKey` of attempt `number` of a step with stable key `base`.
-fn effect_key(base: String, number: Int) -> EffectKey {
+/// The `EffectKey` of attempt `number` of a step with stable key `base`, in
+/// a run with `correlation`.
+fn effect_key(
+  base: String,
+  number: Int,
+  correlation: Option(Correlation),
+) -> EffectKey {
   EffectKey(
     idempotency: base,
     attempt: number,
     attempt_key: base <> ":attempt:" <> int.to_string(number),
+    correlation: correlation,
   )
 }
 
-/// The `EffectKey` of the undo of a step with stable key `base`.
-fn undo_key(base: String) -> EffectKey {
-  effect_key(base <> ":undo", 1)
+/// The `EffectKey` of the undo of a step with stable key `base`, in a run
+/// with `correlation`.
+fn undo_key(base: String, correlation: Option(Correlation)) -> EffectKey {
+  effect_key(base <> ":undo", 1, correlation)
 }
 
 fn saved_key(key: EffectKey) -> checkpoint.Key {
   checkpoint.Key(key.idempotency, key.attempt, key.attempt_key)
 }
 
-/// Converts a saved key back to the public vocabulary.
+/// Converts a saved key back to the public vocabulary, in a run with
+/// `correlation`.
 @internal
-pub fn key_from_saved(key: checkpoint.Key) -> EffectKey {
-  EffectKey(key.idempotency, key.attempt, key.attempt_key)
+pub fn key_from_saved(
+  key: checkpoint.Key,
+  correlation: Option(Correlation),
+) -> EffectKey {
+  EffectKey(key.idempotency, key.attempt, key.attempt_key, correlation)
 }
 
 fn context_from_node(attempt: node.Attempt) -> Context {
   Context(
     number: attempt.number,
     remaining: attempt.remaining,
-    key: effect_key(attempt.base, attempt.number),
+    key: effect_key(attempt.base, attempt.number, attempt.correlation),
   )
 }
 
@@ -1117,7 +1153,11 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           case
             step.attempt(
               value,
-              effect_key(node_attempt.base, node_attempt.number),
+              effect_key(
+                node_attempt.base,
+                node_attempt.number,
+                node_attempt.correlation,
+              ),
             )
           {
             Succeeded(output, undo_choice) ->
@@ -1208,7 +1248,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               Error(Nil) -> Error(checkpoint.InvalidState(checkpoint.Malformed))
             })
             let #(input, output, undoable) = pair
-            let request = UndoRequest(input, output, undo_key(base))
+            let request = UndoRequest(input, output, undo_key(base, None))
             use _ <- result.try(
               case undoable && !has_undo(step.undo_for(request)) {
                 True ->
@@ -1235,7 +1275,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               },
             ])
           },
-          thaw: fn(saved, _run_store, base) {
+          thaw: fn(saved, _run_store, base, correlation) {
             case saved {
               [input, output, undo_kind] -> {
                 use input <- result.try(
@@ -1250,7 +1290,11 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                   "none" -> Ok(None)
                   "undo" ->
                     case
-                      step.undo_for(UndoRequest(input, output, undo_key(base)))
+                      step.undo_for(UndoRequest(
+                        input,
+                        output,
+                        undo_key(base, correlation),
+                      ))
                     {
                       NoUndo ->
                         Error(
@@ -1280,7 +1324,8 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           },
           resume_compensation: fn(attempt, _run_store) {
             fn() {
-              let key = effect_key(attempt.base, attempt.number)
+              let key =
+                effect_key(attempt.base, attempt.number, attempt.correlation)
               case attempt.saved_input {
                 None ->
                   node.EBlocked(
@@ -1307,7 +1352,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               }
             }
           },
-          resume_undo: fn(run_store, base) {
+          resume_undo: fn(run_store, base, correlation) {
             fn() {
               use pair <- result.try(case store.get_record(run_store, id) {
                 Ok(pair) -> Ok(pair)
@@ -1315,7 +1360,8 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                   Error(checkpoint.InvalidState(checkpoint.Malformed))
               })
               let #(input, output, _) = pair
-              let request = UndoRequest(input, output, undo_key(base))
+              let request =
+                UndoRequest(input, output, undo_key(base, correlation))
               case step.resolve_undo(request) {
                 EvidenceCompleted(Nil) -> Ok(Ok(Nil))
                 EvidenceFailed(error) -> Ok(Error(error))
@@ -1343,7 +1389,8 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           resume: fn(attempt, run_store) {
             let produce = capture_input(run_store)
             fn() {
-              let key = effect_key(attempt.base, attempt.number)
+              let key =
+                effect_key(attempt.base, attempt.number, attempt.correlation)
               let input = case attempt.saved_input {
                 None -> Ok(produce())
                 Some(encoded) ->
@@ -1385,7 +1432,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                             step.undo_for(UndoRequest(
                               input,
                               output,
-                              undo_key(attempt.base),
+                              undo_key(attempt.base, attempt.correlation),
                             )),
                           )
                         ResumedFailed(error, recover_returned, unknown) ->
