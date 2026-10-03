@@ -60,11 +60,15 @@ timeout.
 ## When a runner dies
 
 A runner claims an execution before it runs it, and saga renews the claim
-every lease / 3 while the runner lives, however long a step takes. A runner
-that dies, or whose node dies, stops renewing. Its claim ends when the lease
-expires, judged by the database's clock (`clock_timestamp()`), so the
+every lease / 3 while the runner lives, however long a step takes. When the
+runner is killed or crashes while `drive`'s caller lives, `drive` releases
+the claim at once and returns `RunnerLost`, so the next `drive` resumes
+without waiting for the lease. A runner whose node dies stops renewing, and
+nothing releases its claim. That claim ends when the lease expires, judged by the database's clock (`clock_timestamp()`), so the
 nodes' clocks need not agree. Until then another `drive` of the execution
-returns `StorageFailure(Busy)`, and `durable.unfinished` does not list it.
+returns `StorageFailure(Busy)`, and `durable.unfinished` does not list it:
+retry `Busy` no sooner than the lease, so that a job's snooze limit cannot
+run out first.
 After expiry, `durable.unfinished` lists it, and the next `drive` claims it
 with a new generation and token and resumes from the last checkpoint. It
 asks the resolver of each interrupted step what happened instead of running

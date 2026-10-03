@@ -62,8 +62,11 @@ pub fn run_checkout(workflow, order) {
 ```
 
 `define` validates the workflow once (names, attempt budgets, timeouts, and
-that every `Port` belongs to this build) and returns every
-`DefinitionError`; `saga.describe_definition_error` renders one.
+that every `Port` belongs to this build) and returns the `Workflow`. A
+defect is a bug in the source, so `define` panics with a message that names
+the workflow and every offending step. When names, budgets or timeouts come
+from runtime data, `saga.try_define` returns every `DefinitionError`
+instead; `saga.describe_definition_error` renders one.
 `execution.run` blocks until the run ends and returns `Completed`,
 `CompletedWithUnknownEffects`, `Failed(cause, settlement)`,
 `Cancelled(reason, settlement)` or `Unresolved(step, evidence, settlement)`.
@@ -71,6 +74,24 @@ that every `Port` belongs to this build) and returns every
 `execution.unknown_effects(outcome)` names every action whose effect is
 unknown: a crashed or timed-out attempt, and a returned error that
 `unknown_when` marks, such as a payment that may have been charged.
+`execution.describe_cause(cause, error: describe)` renders a cause for logs,
+with the step's error rendered by `describe`.
+
+An error that `unknown_when` marks, with no `compensate` decision to settle
+it, holds the run for reconciliation: the run ends `Unresolved(step, error,
+settlement)`, nothing is undone, and `settlement.held` lists the completed
+steps left in place. An uncertain payment therefore never releases the stock
+reserved before it. This also applies when the decider asked for a retry
+that the attempt budget no longer allows, as in `checkout` above after three
+`MaybeCharged` answers. A decider's explicit `Abort` still rolls back, and
+`saga.on_unknown(saga.RollBack)` makes the step fail and roll back instead
+of holding:
+
+```gleam
+saga.effect("charge_payment", charge_with_key)
+|> saga.unknown_when(fn(error) { error == MaybeCharged })
+|> saga.on_unknown(saga.RollBack)
+```
 
 Step callbacks receive one record each: `saga.undo` gets
 `UndoRequest(input, output, key)`, `saga.compensate` gets
@@ -173,9 +194,9 @@ let charge =
     }
   })
   |> durable.resolve_undo(lookup_refund)
-let assert Ok(workflow) = saga.define("checkout", saga.perform(_, charge))
-let assert Ok(persistence) =
-  durable.new(workflow, version: "1", input: order, output: text, error: text, undo_error: text)
+let workflow = saga.define("checkout", saga.perform(_, charge))
+let persistence =
+  durable.new(workflow, input: order, output: text, error: text, undo_error: text)
 
 let assert Ok(store) = memory.start()
 let assert Ok(run) =
@@ -194,11 +215,22 @@ case durable.drive(run, timeout: 30_000) {
 - One `Storage` serves every execution of a store; the execution id given
   to `start_or_reconnect` addresses one. `start_or_reconnect` is idempotent
   for the same id and input; `durable.reconnect` attaches by id alone.
-- `drive` waits at most `timeout`. On timeout, and when the calling process
-  exits, the runner stops: in-flight attempts are killed, the claim is
-  released, and the next `drive` resumes from the last checkpoint, asking
-  each interrupted attempt's resolver what happened. Only `durable.cancel`
-  cancels.
+- `durable.new` checks that every step is recoverable and panics, naming
+  each offending step and codec, when one is not: that is a bug in the
+  source. The workflow version is `"1"`; change it with
+  `durable.with_version` whenever the workflow's behavior changes, so a saved
+  execution of the old behavior is refused with `IncompatibleDefinition`.
+- `drive` waits at most `timeout`. On timeout, when the calling process
+  exits, and when the runner is killed or crashes (`RunnerLost`), the runner
+  stops: in-flight attempts are killed, the claim is released at once, and
+  the next `drive` resumes from the last checkpoint, asking each interrupted
+  attempt's resolver what happened. Only the loss of the runner's VM leaves
+  the claim to the storage's own expiry (saga_postgres's lease, 30 s by
+  default). Only `durable.cancel` cancels.
+- `Busy` means another runner holds the claim. Retry it no sooner than the
+  storage's owner-loss window, such as saga_postgres's lease: a grind job
+  that drives a saga snoozes `Busy` for at least the lease, so that its
+  snooze limit cannot end the job while a lost runner's lease runs out.
 - Waking a runner after a restart is the application's job, for example a
   grind job per execution. `durable.unfinished(storage, limit:)` lists the
   executions that wait for one.
@@ -343,6 +375,11 @@ scenario for it in use alongside `execution.progress`.
   have completed are rolled back. `Settlement.not_undoable` and
   `Settlement.interrupted` show the difference between "reversed" and
   "unknown".
+- **An unknown effect holds the run unless the step opts into rollback.**
+  A returned error that `saga.unknown_when` marks ends the run `Unresolved`
+  when no `compensate` decision settles it; `saga.on_unknown(saga.RollBack)`
+  fails the run and undoes the completed steps instead. Crashes and timeouts
+  keep failing the run and rolling back.
 - **Every outcome says which effects are unknown.** Each action of a run (a
   step attempt, a compensation decision, an undo) ends with a known result
   or with an unknown effect: it crashed, it was killed at its time bound or

@@ -18,7 +18,9 @@
 //// `undo` registers the action that reverses a completed step when a later
 //// step fails; `compensate` decides, after a failed attempt, whether to
 //// retry, continue with a substitute output, abort, or hold; `unknown_when`
-//// names the returned errors after which the step's effect is unknown.
+//// names the returned errors after which the step's effect is unknown, and
+//// such an error holds the run for reconciliation unless `on_unknown`
+//// opts into rollback.
 //// `embed` and `map_errors` compose one workflow into another.
 //// `saga/durable` adds what a step needs to recover after a restart.
 ////
@@ -312,6 +314,7 @@ pub opaque type Step(i, o, e, u) {
     compensates: Bool,
     attempt: fn(i, EffectKey) -> RunOutcome(o, u, e),
     unknown: fn(e) -> Bool,
+    on_unknown: OnUnknown,
     persistence: Option(StepPersistence(i, o)),
     resolve: Option(fn(i, EffectKey) -> Resumed(o, u, e)),
     undo_for: fn(UndoRequest(i, o)) -> Undo(u),
@@ -377,6 +380,7 @@ pub fn effect(
     persistence: None,
     resolve: None,
     unknown: fn(_) { False },
+    on_unknown: Reconcile,
     undo_for: fn(_) { NoUndo },
     recovery_undo_declared: False,
     resolve_undo: fn(_) { EvidenceMaybeSent },
@@ -477,12 +481,21 @@ pub fn compensate(
 
 /// Marks the returned errors after which the step's effect is unknown: a
 /// timeout or connection loss after the request may have been sent, for
-/// example. A matching error still reaches the `compensate` decider as
-/// `Returned(error)`, or ends the step like any error when there is none,
-/// and the attempt is also named in the outcome's
+/// example. The attempt is named in the outcome's
 /// `execution.unknown_effects` with `execution.ActionReturnedUnknown`, so a
 /// retried success becomes `CompletedWithUnknownEffects`. Calling it twice
 /// marks the errors either classifier matches.
+///
+/// A matching error still reaches the `compensate` decider as
+/// `Returned(error)`, and the decider's decision applies: `Abort` rolls the
+/// run back, `Hold` ends it `Unresolved`. When the step has no decider, or
+/// its decider asked for a retry the attempt budget no longer allows, the
+/// step ends as `on_unknown` says: by default (`Reconcile`) the run ends
+/// `execution.Unresolved` with the error as evidence and undoes nothing, so
+/// an uncertain payment never releases the stock reserved before it.
+/// `on_unknown(RollBack)` fails the run and undoes the completed steps
+/// instead. Durable runs apply the same rule to an error that a recovery
+/// resolver reports after a restart.
 pub fn unknown_when(
   step: Step(i, o, e, u),
   classify: fn(e) -> Bool,
@@ -509,6 +522,27 @@ pub fn unknown_when(
       }
     }),
   )
+}
+
+/// What a run does when a step ends with an error that `unknown_when`
+/// classified and no `compensate` decision settles it. The union is closed.
+pub type OnUnknown {
+  /// End the run `execution.Unresolved` with the error as evidence and undo
+  /// nothing, so the effect can be reconciled first. The default.
+  Reconcile
+  /// Fail the run with `execution.StepFailed` (or `RetryLimitReached`) and
+  /// undo the completed steps, as for a known error.
+  RollBack
+}
+
+/// Sets what the run does when this step ends with an error that
+/// `unknown_when` classified (default `Reconcile`); see `unknown_when`.
+/// Crashes and timeouts are not affected.
+pub fn on_unknown(
+  step: Step(i, o, e, u),
+  policy: OnUnknown,
+) -> Step(i, o, e, u) {
+  Step(..step, on_unknown: policy)
 }
 
 /// Bounds one attempt of this step to `milliseconds`, overriding the run's
@@ -564,6 +598,7 @@ pub fn map_step_errors(
     compensates: step.compensates,
     persistence: step.persistence,
     unknown: fn(_) { False },
+    on_unknown: step.on_unknown,
     resolve: option.map(step.resolve, fn(resolve) {
       fn(input, key) {
         case resolve(input, key) {
@@ -1379,6 +1414,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       timeout: step.timeout,
       undoable: step.undoable,
       compensates: step.compensates,
+      rolls_back_unknown: step.on_unknown == RollBack,
       prepare_attempt: prepare_attempt,
       prepare_crash_recovery: prepare_crash_recovery,
     )
@@ -1454,12 +1490,37 @@ pub opaque type Workflow(i, o, e, u) {
   )
 }
 
-/// Builds and validates a named workflow. The builder runs once, in the
-/// calling process, before any runtime resource exists: `define` checks step
-/// names, attempt budgets, timeouts, that every port used belongs to this
-/// evaluation, and that every step reaches the output. It returns every
-/// error, not just the first; `describe_definition_error` renders one.
+/// Builds and validates a named workflow written in source code. The
+/// builder runs once, in the calling process, before any runtime resource
+/// exists: `define` checks step names, attempt budgets, timeouts, that every
+/// port used belongs to this evaluation, and that every step reaches the
+/// output.
+///
+/// A defect is a bug in the source, so `define` panics with a message that
+/// names the workflow and every offending step; any test that builds the
+/// workflow catches it. Use `try_define` when names, budgets or timeouts
+/// come from runtime data.
 pub fn define(
+  name: String,
+  build: fn(Port(i, e, u)) -> Port(o, e, u),
+) -> Workflow(i, o, e, u) {
+  case try_define(name, build) {
+    Ok(workflow) -> workflow
+    Error(errors) ->
+      panic as {
+        "saga.define: workflow \""
+        <> name
+        <> "\" is invalid: "
+        <> string.join(list.map(errors, describe_definition_error), "; ")
+      }
+  }
+}
+
+/// Builds and validates a named workflow like `define`, but returns every
+/// defect as a `DefinitionError` instead of panicking, for a workflow whose
+/// step names, attempt budgets or timeouts come from runtime data.
+/// `describe_definition_error` renders one.
+pub fn try_define(
   name: String,
   build: fn(Port(i, e, u)) -> Port(o, e, u),
 ) -> Result(Workflow(i, o, e, u), List(DefinitionError)) {

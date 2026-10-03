@@ -9,7 +9,6 @@ import gleam/list
 import gleam/option.{Some}
 import order_consumer/domain.{type Order, Order}
 import order_consumer/workflows
-import saga
 import saga/execution
 import saga/telemetry
 import sinal
@@ -32,7 +31,7 @@ fn sample_orders() -> List(Order) {
 
 fn scenario_a_shared_data_and_parallel_work() -> Nil {
   io.println("--- (a) shared data + parallel independent work ---")
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -60,7 +59,7 @@ fn scenario_b_failure_and_compensation() -> Nil {
   io.println(
     "--- (b) failure triggers compensation with a retained undo failure ---",
   )
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -100,7 +99,7 @@ fn scenario_c_advanced_config_and_cancellation() -> Nil {
 
   let assert Ok(_completion) =
     sinal.with_subscriptions(observed_stops, fn() {
-      let assert Ok(workflow) =
+      let workflow =
         workflows.blocking_workflow(fn() {
           // A `Subject` may only be received on by the process that
           // created it, and this closure runs inside a fresh task process
@@ -142,7 +141,7 @@ fn scenario_c_advanced_config_and_cancellation() -> Nil {
 
 fn scenario_d_caller_owned_error_types() -> Nil {
   io.println("--- (d) caller-owned error types via map_errors ---")
-  let assert Ok(workflow) =
+  let workflow =
     workflows.reported_checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -165,22 +164,7 @@ fn scenario_d_caller_owned_error_types() -> Nil {
 // ---------------------------------------------------------------------------
 
 fn describe_cause(cause: execution.Cause(domain.CheckoutError)) -> String {
-  case cause {
-    execution.StepFailed(step, error) ->
-      saga.address_to_string(step)
-      <> " failed: "
-      <> describe_checkout_error(error)
-    execution.StepCrashed(step, _crash) ->
-      saga.address_to_string(step) <> " crashed"
-    execution.StepTimedOut(step) -> saga.address_to_string(step) <> " timed out"
-    execution.RetryLimitReached(step, _last) ->
-      saga.address_to_string(step) <> " exhausted its retry budget"
-    execution.RetrySuperseded(step, _last) ->
-      saga.address_to_string(step)
-      <> " could not retry: the run was already settling"
-    execution.OutputCrashed(_crash) -> "an output transform crashed"
-    execution.DeadlineExceeded -> "the run's deadline was exceeded"
-  }
+  execution.describe_cause(cause, error: describe_checkout_error)
 }
 
 fn describe_checkout_error(error: domain.CheckoutError) -> String {

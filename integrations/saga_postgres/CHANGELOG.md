@@ -13,5 +13,8 @@
 - `migrate` applies forward-only numbered migrations in one transaction
   under a per-schema advisory lock, recorded in `saga_schema_migrations`.
   The same SQL ships in `priv/migrations/`.
+- A runner killed while `drive`'s caller lives no longer holds its claim
+  for the whole lease: saga releases it at once. The lease remains the
+  fallback when the runner's node is lost, and the tests cover both paths.
 - `pog` and `pgo` are pinned to the minor ranges grind uses, so one
   application pool serves the application, grind and saga.

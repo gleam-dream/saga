@@ -53,7 +53,7 @@ pub fn main() -> Nil {
       resolve: fn(_, _) { durable.MaybeSent },
     )
   }
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("vm-compensation", fn(input) {
       saga.both(
         saga.perform(input, branch("a")),
@@ -61,10 +61,9 @@ pub fn main() -> Nil {
       )
       |> saga.map(fn(pair) { pair.0 <> pair.1 })
     })
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: text,
       output: text,
       error: text,

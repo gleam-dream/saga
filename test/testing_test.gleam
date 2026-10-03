@@ -9,7 +9,7 @@ import support/probe
 /// well before `within` elapses.
 pub fn wait_until_succeeds_when_predicate_is_met_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -44,7 +44,7 @@ pub fn wait_until_succeeds_when_predicate_is_met_test() {
 /// covered by `wait_until_reports_run_ended_test` below.
 pub fn wait_until_times_out_test() {
   let gate = probe.new_gate()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input
       |> saga.perform(
@@ -66,7 +66,7 @@ pub fn wait_until_times_out_test() {
 /// Once the run has ended, `wait_until` reports `RunEnded` instead of
 /// waiting out the rest of `within`.
 pub fn wait_until_reports_run_ended_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })

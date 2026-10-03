@@ -5,7 +5,7 @@ import saga/execution
 
 pub fn only_selected_branch_runs_test() {
   let effects = process.new_subject()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("choice", fn(input) {
       saga.choose(
         input,
@@ -42,7 +42,7 @@ pub fn only_selected_branch_runs_test() {
 }
 
 pub fn nested_unchosen_branch_never_reads_missing_values_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("nested", fn(input) {
       saga.choose(
         input,

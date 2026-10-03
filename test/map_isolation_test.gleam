@@ -24,7 +24,7 @@ pub type DemoUndoError {
 
 pub fn map_panic_between_steps_is_recovered_test() {
   let undone = process.new_subject()
-  let assert Ok(wf) =
+  let wf =
     saga.define("mp", fn(input) {
       let a =
         input
@@ -57,7 +57,7 @@ pub fn map_panic_between_steps_is_recovered_test() {
   process.receive(undone, 500) |> should.equal(Ok(Nil))
 
   // The coordinator itself survived: an independent run still works.
-  let assert Ok(wf2) =
+  let wf2 =
     saga.define("mp2", fn(input) {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x + 1) }))
     })
@@ -70,7 +70,7 @@ pub fn map_panic_between_steps_is_recovered_test() {
 /// that task (the settle sweep) interrupts the map along with it.
 pub fn slow_map_does_not_block_cancel_test() {
   let gate = probe.new_gate()
-  let assert Ok(wf) =
+  let wf =
     saga.define("slow_map", fn(input) {
       input
       |> saga.perform(saga.step("a", fn(x: Int) { Ok(x) }))
@@ -101,7 +101,7 @@ pub fn slow_map_does_not_block_cancel_test() {
 // ---------------------------------------------------------------------------
 
 pub fn embed_map_errors_runs_to_completion_test() {
-  let assert Ok(inner) =
+  let inner =
     saga.define("inner", fn(input) {
       input
       |> saga.perform(
@@ -110,7 +110,7 @@ pub fn embed_map_errors_runs_to_completion_test() {
     })
   let mapped =
     saga.map_errors(inner, error: fn(e) { e }, undo_error: fn(u) { u })
-  let assert Ok(outer) =
+  let outer =
     saga.define("outer", fn(input) {
       input
       |> saga.perform(
@@ -146,7 +146,7 @@ pub fn map_step_errors_runtime_test() {
       undo_error: fn(_u: DemoUndoError) { "mapped-undo-error" },
     )
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("mapped_wf", fn(input) {
       let a = input |> saga.perform(mapped)
       a |> saga.perform(saga.step("fails", fn(_x: Int) { Error("boom2") }))
@@ -166,7 +166,7 @@ pub fn map_step_errors_runtime_test() {
 /// `map_errors` at runtime: a failing inner step's translated error reaches
 /// the outer `Failed` cause.
 pub fn map_errors_runtime_test() {
-  let assert Ok(inner) =
+  let inner =
     saga.define("inner", fn(input) {
       input
       |> saga.perform(
@@ -179,8 +179,7 @@ pub fn map_errors_runtime_test() {
       error: fn(_e: DemoError) { "translated" },
       undo_error: fn(_u: DemoUndoError) { "translated-undo" },
     )
-  let assert Ok(outer) =
-    saga.define("outer", fn(input) { input |> saga.embed(mapped) })
+  let outer = saga.define("outer", fn(input) { input |> saga.embed(mapped) })
 
   let assert Ok(execution.Failed(cause, _settlement)) =
     execution.run(outer, 1, execution.config())
@@ -198,7 +197,7 @@ pub fn map_errors_runtime_test() {
 
 pub fn orphan_step_rejected_test() {
   let result =
-    saga.define("u", fn(input) {
+    saga.try_define("u", fn(input) {
       let _side =
         input
         |> saga.perform(
@@ -227,7 +226,7 @@ pub fn non_orphaned_shared_dependency_is_not_rejected_test() {
   // `order`'s port is consumed twice (by `fraud` and `inventory`), both of
   // which do reach the final output: this must not be flagged as an
   // orphan.
-  let assert Ok(_workflow) =
+  let _workflow =
     saga.define("diamond", fn(input) {
       let order =
         input |> saga.perform(saga.step("order", fn(x: Int) { Ok(x) }))
@@ -246,7 +245,7 @@ pub fn non_orphaned_shared_dependency_is_not_rejected_test() {
 // ---------------------------------------------------------------------------
 
 pub fn all_single_port_runs_normally_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("wf", fn(input) {
       let a = input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))
       saga.all(a, [])

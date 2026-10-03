@@ -21,7 +21,7 @@ gleam run
 
 For each shape and each N in `[10, 50, 100, 250, 500, 1000, 2000]`:
 
-- **`define` time**: one monotonic-clock measurement around `saga.define`.
+- **`define` time**: one monotonic-clock measurement around `saga.try_define`, the checked form `saga.define` calls.
 - **Per-run wall time**: one warm-up `execution.run` (reported separately),
   then 20 measured runs (5 for N >= 1000, to keep total wall time
   reasonable), each timed with the monotonic clock. `median` and `p95` are

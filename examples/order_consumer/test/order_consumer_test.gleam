@@ -28,7 +28,7 @@ fn sample_orders() -> List(Order) {
 // ---------------------------------------------------------------------------
 
 pub fn shared_order_and_parallel_steps_succeed_test() {
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -48,7 +48,7 @@ pub fn load_order_runs_once_and_is_shared_test() {
   // Both `reserve_inventory` and `authorize_payment` depend on the same
   // `load_order` port; saga.describe must show one `load_order` node with
   // two dependents, not two.
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -66,7 +66,7 @@ pub fn load_order_runs_once_and_is_shared_test() {
 }
 
 pub fn unknown_order_fails_at_load_order_test() {
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -89,7 +89,7 @@ pub fn unknown_order_fails_at_load_order_test() {
 // ---------------------------------------------------------------------------
 
 pub fn payment_failure_rolls_back_inventory_test() {
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -113,7 +113,7 @@ pub fn payment_failure_rolls_back_inventory_test() {
 }
 
 pub fn inventory_unavailable_fails_before_payment_runs_test() {
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: ["gadget"],
@@ -138,7 +138,7 @@ pub fn undo_failure_is_preserved_in_settlement_test() {
   // The inventory release action is configured to itself fail, so the
   // failure must be retained in `settlement.undo_failures` rather than
   // silently dropped or aborting the rollback of other steps.
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -164,7 +164,7 @@ pub fn undo_failure_is_preserved_in_settlement_test() {
 // ---------------------------------------------------------------------------
 
 pub fn advanced_config_runs_with_bounded_concurrency_and_deadline_test() {
-  let assert Ok(workflow) =
+  let workflow =
     workflows.checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],
@@ -181,8 +181,7 @@ pub fn advanced_config_runs_with_bounded_concurrency_and_deadline_test() {
 pub fn cancel_while_step_in_flight_rolls_back_and_reports_cancelled_test() {
   let release_gate = gate.new_gate()
 
-  let assert Ok(workflow) =
-    workflows.blocking_workflow(fn() { gate.enter(release_gate) })
+  let workflow = workflows.blocking_workflow(fn() { gate.enter(release_gate) })
 
   let config = workflows.bounded_config(None)
   let assert Ok(execution) = execution.start(workflow, "ord-1", config)
@@ -217,8 +216,7 @@ pub fn cancel_while_step_in_flight_rolls_back_and_reports_cancelled_test() {
 pub fn cancel_is_idempotent_test() {
   let release_gate = gate.new_gate()
 
-  let assert Ok(workflow) =
-    workflows.blocking_workflow(fn() { gate.enter(release_gate) })
+  let workflow = workflows.blocking_workflow(fn() { gate.enter(release_gate) })
 
   let assert Ok(execution) =
     execution.start(workflow, "ord-1", workflows.bounded_config(None))
@@ -240,8 +238,7 @@ pub fn cancel_is_idempotent_test() {
 /// subject still learns how it ended.
 pub fn a_reported_run_outlives_its_owner_test() {
   let release_gate = gate.new_gate()
-  let assert Ok(workflow) =
-    workflows.blocking_workflow(fn() { gate.enter(release_gate) })
+  let workflow = workflows.blocking_workflow(fn() { gate.enter(release_gate) })
   let report = process.new_subject()
   let owner =
     process.spawn_unlinked(fn() {
@@ -270,7 +267,7 @@ pub fn a_reported_run_outlives_its_owner_test() {
 // ---------------------------------------------------------------------------
 
 pub fn map_errors_reports_application_owned_error_type_test() {
-  let assert Ok(workflow) =
+  let workflow =
     workflows.reported_checkout_workflow(
       orders: sample_orders(),
       unavailable_items: [],

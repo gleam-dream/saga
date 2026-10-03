@@ -128,10 +128,7 @@ pub fn checkout_workflow(
   unavailable_items unavailable_items: List(String),
   declined_orders declined_orders: List(String),
   undo_fails_for undo_fails_for: List(String),
-) -> Result(
-  Workflow(String, Checkout, CheckoutError, UndoError),
-  List(saga.DefinitionError),
-) {
+) -> Workflow(String, Checkout, CheckoutError, UndoError) {
   saga.define("checkout", fn(input: Port(String, CheckoutError, UndoError)) {
     let order = input |> saga.perform(load_order_step(orders))
     let inventory =
@@ -157,10 +154,7 @@ pub fn checkout_workflow(
 /// exercised.
 pub fn blocking_workflow(
   wait_for_release: fn() -> Nil,
-) -> Result(
-  Workflow(String, String, CheckoutError, UndoError),
-  List(saga.DefinitionError),
-) {
+) -> Workflow(String, String, CheckoutError, UndoError) {
   saga.define(
     "blocking_checkout",
     fn(input: Port(String, CheckoutError, UndoError)) {
@@ -235,31 +229,15 @@ pub fn reported_checkout_workflow(
   unavailable_items unavailable_items: List(String),
   declined_orders declined_orders: List(String),
   undo_fails_for undo_fails_for: List(String),
-) -> Result(
-  Workflow(String, Checkout, ReportedError, ReportedUndoError),
-  List(saga.DefinitionError),
-) {
-  use workflow <- result_try(checkout_workflow(
+) -> Workflow(String, Checkout, ReportedError, ReportedUndoError) {
+  checkout_workflow(
     orders:,
     unavailable_items:,
     declined_orders:,
     undo_fails_for:,
-  ))
-  Ok(
-    saga.map_errors(
-      workflow,
-      error: fn(e) { ReportedError(describe_checkout_error(e)) },
-      undo_error: fn(u) { ReportedUndoError(describe_undo_error(u)) },
-    ),
   )
-}
-
-fn result_try(
-  result: Result(a, err),
-  f: fn(a) -> Result(b, err),
-) -> Result(b, err) {
-  case result {
-    Ok(value) -> f(value)
-    Error(error) -> Error(error)
-  }
+  |> saga.map_errors(
+    error: fn(e) { ReportedError(describe_checkout_error(e)) },
+    undo_error: fn(u) { ReportedUndoError(describe_undo_error(u)) },
+  )
 }

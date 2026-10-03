@@ -67,13 +67,13 @@ pub fn run_checkout(workflow, order) {
 }
 
 pub fn readme_common_path_test() {
-  let assert Ok(workflow) = checkout()
+  let workflow = checkout()
   let assert Ok("receipt-" <> _) = run_checkout(workflow, "o-1")
   let assert Error([]) = run_checkout(workflow, "declined")
 }
 
 pub fn readme_configuration_test() {
-  let assert Ok(workflow) = checkout()
+  let workflow = checkout()
   let config =
     execution.config()
     |> execution.with_max_concurrency(4)
@@ -123,11 +123,10 @@ pub fn readme_durable_run_test() {
       },
     )
     |> durable.resolve_undo(lookup_refund)
-  let assert Ok(workflow) = saga.define("checkout", saga.perform(_, charge))
-  let assert Ok(persistence) =
+  let workflow = saga.define("checkout", saga.perform(_, charge))
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: order,
       output: text,
       error: text,
@@ -156,7 +155,7 @@ pub fn readme_durable_run_test() {
 }
 
 pub fn readme_telemetry_test() {
-  let assert Ok(workflow) = checkout()
+  let workflow = checkout()
   let attachment =
     sinal.observe(telemetry.run_stopped(), fn(_measurements, metadata) {
       let _ = #(metadata.correlation, metadata.execution, metadata.outcome)
@@ -165,4 +164,43 @@ pub fn readme_telemetry_test() {
   let assert Ok(_) = run_checkout(workflow, "o-3")
   let _ = sinal.detach(attachment)
   Nil
+}
+
+fn describe_checkout_error(error: CheckoutError) -> String {
+  case error {
+    OutOfStock -> "out of stock"
+    Declined -> "declined"
+    MaybeCharged -> "the charge may have been taken"
+  }
+}
+
+pub fn readme_unknown_effect_test() {
+  let reserve =
+    saga.step("reserve_inventory", reserve)
+    |> saga.undo(fn(undo) { release(undo.output) })
+  let charge =
+    saga.effect("charge_payment", fn(_reservation, _key) { Error(MaybeCharged) })
+    |> saga.unknown_when(fn(error) { error == MaybeCharged })
+  let checkout = fn(charge) {
+    saga.define("checkout", fn(order) {
+      order |> saga.perform(reserve) |> saga.perform(charge)
+    })
+  }
+  let reserved = saga.StepAddress([], "reserve_inventory", 1)
+  // By default the run holds the reservation for reconciliation.
+  let assert Ok(execution.Unresolved(_, MaybeCharged, settlement)) =
+    execution.run(checkout(charge), "o-4", execution.config())
+  let assert [held] = settlement.held
+  let assert True = held == reserved
+  // `on_unknown(RollBack)` opts into releasing it.
+  let assert Ok(execution.Failed(cause, settlement)) =
+    execution.run(
+      checkout(charge |> saga.on_unknown(saga.RollBack)),
+      "o-4",
+      execution.config(),
+    )
+  let assert [undone] = settlement.undone
+  let assert True = undone == reserved
+  let assert "step charge_payment returned an error: the charge may have been taken" =
+    execution.describe_cause(cause, error: describe_checkout_error)
 }

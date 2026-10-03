@@ -16,7 +16,7 @@ pub type DemoUndoError {
 /// Undo must happen in reverse completion order: c never completed (no
 /// undo), then b, then a.
 pub fn failure_undoes_completed_steps_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       let a =
         input
@@ -47,7 +47,7 @@ pub fn failure_undoes_completed_steps_test() {
 }
 
 pub fn multiple_undo_failures_retained_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       let a =
         input
@@ -77,7 +77,7 @@ pub fn compensation_vs_undo_test() {
   let undo_counter = probe.new_counter()
   let compensate_counter = probe.new_counter()
 
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       let a =
         input
@@ -106,7 +106,7 @@ pub fn compensation_vs_undo_test() {
 }
 
 pub fn not_undoable_steps_are_reported_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       let a = input |> saga.perform(saga.step("a", fn(x: Int) { Ok(x + 1) }))
       a |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
@@ -122,7 +122,7 @@ pub fn not_undoable_steps_are_reported_test() {
 }
 
 pub fn hold_leaves_completed_effects_unresolved_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       let a =
         input
@@ -151,7 +151,7 @@ pub fn hold_leaves_completed_effects_unresolved_test() {
 // no undo-retry loop at all (deliberate difference, see PROVENANCE.md
 // R10 and design §3.3): a failing undo is retained once, never retried.
 pub fn undo_receives_input_and_output_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       let a =
         input
@@ -183,7 +183,7 @@ pub fn undo_receives_input_and_output_test() {
 }
 
 pub fn continue_replacement_undo_used_test() {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("chain", fn(input) {
       input
       |> saga.perform(

@@ -50,7 +50,7 @@ fn trip(
       process.send(log, "refund")
       Ok(Nil)
     })
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("trip", fn(input) {
       input |> saga.perform(reserve) |> saga.perform(charge)
     })

@@ -36,7 +36,7 @@ fn order_codec() -> codec.Codec(Order) {
 
 pub fn blueprint_codec_saves_a_durable_input_test() {
   let text = codec.text()
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("blueprint", fn(input) {
       saga.perform(
         input,
@@ -49,10 +49,9 @@ pub fn blueprint_codec_saves_a_durable_input_test() {
           ),
       )
     })
-  let assert Ok(persistence) =
+  let persistence =
     durable.new(
       workflow,
-      version: "1",
       input: order_codec(),
       output: order_codec(),
       error: text,

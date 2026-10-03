@@ -8,7 +8,7 @@ pub type Err {
 }
 
 fn inner_workflow() -> saga.Workflow(Int, Int, Err, Nil) {
-  let assert Ok(workflow) =
+  let workflow =
     saga.define("inner", fn(input) {
       input
       |> saga.perform(saga.step("s", fn(x: Int) -> Result(Int, Err) { Ok(x) }))
