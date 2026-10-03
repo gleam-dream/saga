@@ -108,7 +108,7 @@ pub opaque type Config {
 /// | settle window | 5 seconds | `with_settle_timeout` |
 /// | each compensation decision and undo | 5 seconds | `with_cleanup_timeout` |
 /// | `RetryAfter` delay cap | 5 minutes | `with_max_retry_delay` |
-/// | correlation | none | `with_correlation` |
+/// | correlation | `unique()` (local), `from_key(id)` (durable) | `with_correlation` |
 ///
 /// **Why the run has no default deadline.** A step's attempts are bounded
 /// by the per-attempt timeout, its attempt budget (`saga.compensate`'s
@@ -175,8 +175,8 @@ pub fn with_max_retry_delay(config: Config, delay: Duration) -> Config {
 /// as `correlation` of the `saga.EffectKey` that `saga.effect`, `saga.undo`
 /// and `saga.compensate` receive, and pass it to the clients they call.
 ///
-/// A local run without a correlation carries none. A durable execution
-/// without one carries `correlation.from_key` of its execution id; its first
+/// Every run has a correlation. A local run without one gets a fresh
+/// `correlation.unique()` at start. A durable execution without one carries `correlation.from_key` of its execution id; its first
 /// drive saves the correlation it uses, and later drives read it back (see
 /// `durable.with_correlation`).
 pub fn with_correlation(config: Config, correlation: Correlation) -> Config {
@@ -239,19 +239,19 @@ fn describe_duration(value: Duration) -> String {
   int.to_string(duration.to_milliseconds(value)) <> " ms"
 }
 
-/// The correlation a run carries: the one set on `config`, or, for a durable
-/// execution, `correlation.from_key` of its id, so a durable run is never
-/// uncorrelated and a handle that forgot `with_correlation` still joins its
-/// events by execution id.
+/// The correlation a run carries: the one set on `config`; for a durable
+/// execution without one, `correlation.from_key` of its id, so a handle that
+/// forgot `with_correlation` still joins its events by execution id; for a
+/// local run without one, a fresh `correlation.unique()`. Every run has one.
 @internal
 pub fn correlation_of(
   config: Config,
   execution: Option(String),
-) -> Option(Correlation) {
+) -> Correlation {
   case config.correlation, execution {
-    Some(set), _ -> Some(set)
-    None, Some(id) -> Some(correlation.from_key(id))
-    None, None -> None
+    Some(set), _ -> set
+    None, Some(id) -> correlation.from_key(id)
+    None, None -> correlation.unique()
   }
 }
 

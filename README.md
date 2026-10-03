@@ -109,10 +109,7 @@ run's events without threading the value by hand:
 
 ```gleam
 saga.effect("refund", fn(refund, key) {
-  let shop = case saga.correlation_of(key) {
-    Some(correlation) -> shop.with_correlation(shop, correlation)
-    None -> shop
-  }
+  let shop = shop.with_correlation(shop, saga.correlation_of(key))
   shop.refund(shop, refund, idempotency: saga.idempotency_key(key))
 })
 ```
@@ -120,9 +117,10 @@ saga.effect("refund", fn(refund, key) {
 `saga.correlation_of(key)` is the correlation set with
 `execution.with_correlation` or `durable.with_correlation`, the same value
 that the run's `saga/telemetry` events carry. A durable execution that sets
-none carries `correlation.from_key(id)` of its execution id, so a step of a
-durable run always reads `Some`; a local run without one reads `None`. `saga.step` hands
-its function the input only: use `effect` for a step that needs the context.
+none carries `correlation.from_key(id)` of its execution id, and a local run
+that sets none gets a fresh `correlation.unique()` at start. Every run has a
+correlation, so `saga.correlation_of(key)` returns a `Correlation`, not an
+`Option`. `saga.step` hands its function the input only: use `effect` for a step that needs the context.
 The durable resolvers (`recoverable`, `resolve_undo`, `resolve_compensation`)
 receive the same key.
 
@@ -198,7 +196,7 @@ Every wait, retry and saved value is bounded by default.
 | Checkpoint size                                        | 16 MiB (16 777 216 bytes)                        | `durable.with_max_checkpoint_bytes`                                   |
 | PostgreSQL claim lease                                 | 30 seconds, renewed every 10 seconds             | `saga_postgres.with_lease`                                            |
 | Conformance owner-loss window                          | declared by the adapter                          | `conformance.run(owner_loss_within:)`                                 |
-| Correlation of a run, its events and its steps         | local: none; durable: `from_key(execution id)`   | `execution.with_correlation`, `durable.with_correlation`              |
+| Correlation of a run, its events and its steps         | local: `unique()`; durable: `from_key(id)`       | `execution.with_correlation`, `durable.with_correlation`              |
 | Sinal handlers                                         | synchronous in the coordinator                   | route `["saga"]` to a `sinal/forwarder`                               |
 
 Without a deadline a run is still finite: each step takes at most
@@ -289,8 +287,9 @@ and stop, compensation decisions and undo outcomes. Every event's metadata
 carries `workflow`, `run` (this VM's id for one run), `execution` (the
 durable id, or `None`) and `correlation` (from `execution.with_correlation`
 or `durable.with_correlation`; a durable execution without one carries
-`correlation.from_key(id)`, and a local run `None`; a durable execution
-reports the value its first drive saved). The step and undo callbacks read
+`correlation.from_key(id)`, and a local run a fresh `correlation.unique()`;
+a durable execution reports the value its first drive saved). It is a
+`Correlation`, never absent. The step and undo callbacks read
 the same value from their `EffectKey`.
 
 ```gleam

@@ -90,10 +90,10 @@ pub type StepAddress {
 ///   the one set with `execution.with_correlation` or
 ///   `durable.with_correlation`, which is also the `correlation` of the run's
 ///   `saga/telemetry` events. A durable execution without one carries
-///   `correlation.from_key(id)` of its execution id, so it is never `None`
-///   there. A local run without one has `None`. Pass it on to the clients the
-///   step calls, for example `http_gun.with_correlation`, so their events
-///   join the run's.
+///   `correlation.from_key(id)` of its execution id; a local run without one
+///   gets a fresh `correlation.unique()` at start. Every run has one, so a
+///   step passes it on to the clients it calls, for example
+///   `http_gun.with_correlation`, so their events join the run's.
 ///
 /// A local run derives the idempotency key from its run id, which is new for
 /// every `execution.run`; a durable execution derives it from the id given
@@ -107,7 +107,7 @@ pub opaque type EffectKey {
     idempotency: String,
     attempt: Int,
     attempt_key: String,
-    correlation: Option(Correlation),
+    correlation: Correlation,
   )
 }
 
@@ -129,7 +129,7 @@ pub fn attempt_key(key: EffectKey) -> String {
 }
 
 /// The correlation of the run that performs the action; see `EffectKey`.
-pub fn correlation_of(key: EffectKey) -> Option(Correlation) {
+pub fn correlation_of(key: EffectKey) -> Correlation {
   key.correlation
 }
 
@@ -825,7 +825,7 @@ pub fn set_resolve_compensation(
 fn effect_key(
   base: String,
   number: Int,
-  correlation: Option(Correlation),
+  correlation: Correlation,
 ) -> EffectKey {
   EffectKey(
     idempotency: base,
@@ -837,7 +837,7 @@ fn effect_key(
 
 /// The `EffectKey` of the undo of a step with stable key `base`, in a run
 /// with `correlation`.
-fn undo_key(base: String, correlation: Option(Correlation)) -> EffectKey {
+fn undo_key(base: String, correlation: Correlation) -> EffectKey {
   effect_key(base <> ":undo", 1, correlation)
 }
 
@@ -850,7 +850,7 @@ fn saved_key(key: EffectKey) -> checkpoint.Key {
 @internal
 pub fn key_from_saved(
   key: checkpoint.Key,
-  correlation: Option(Correlation),
+  correlation: Correlation,
 ) -> EffectKey {
   EffectKey(key.idempotency, key.attempt, key.attempt_key, correlation)
 }
@@ -1275,13 +1275,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           input_version: codec.version(p.input),
           output_version: codec.version(p.output),
           recovery_undo_declared: step.recovery_undo_declared,
-          freeze: fn(run_store, base) {
+          freeze: fn(run_store, base, correlation) {
             use pair <- result.try(case store.get_record(run_store, id) {
               Ok(pair) -> Ok(pair)
               Error(Nil) -> Error(checkpoint.InvalidState(checkpoint.Malformed))
             })
             let #(input, output, undoable) = pair
-            let request = UndoRequest(input, output, undo_key(base, None))
+            let request =
+              UndoRequest(input, output, undo_key(base, correlation))
             use _ <- result.try(
               case undoable && !has_undo(step.undo_for(request)) {
                 True ->

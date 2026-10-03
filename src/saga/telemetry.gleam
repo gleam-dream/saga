@@ -16,7 +16,8 @@
 //// - `correlation`: the `sinal/correlation` value set with
 ////   `execution.with_correlation` or `durable.with_correlation`. A durable
 ////   execution that set none carries `correlation.from_key` of its
-////   execution id; a local run that set none carries `None`. A durable
+////   execution id; a local run that set none gets a fresh
+////   `correlation.unique()` at start, so the field is always a `Correlation`. A durable
 ////   execution saves the value of its first drive, so every drive of it
 ////   reports the same one. The steps of the run read the same value with
 ////   `saga.correlation_of` of their `saga.EffectKey`.
@@ -58,7 +59,7 @@ pub type RunMetadata {
     workflow: String,
     run: Int,
     execution: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
   )
 }
 
@@ -88,7 +89,7 @@ pub type RunStopMetadata {
     workflow: String,
     run: Int,
     execution: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     outcome: OutcomeKind,
   )
 }
@@ -105,7 +106,7 @@ pub type StepMetadata {
     workflow: String,
     run: Int,
     execution: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     step: String,
     attempt: Int,
   )
@@ -136,7 +137,7 @@ pub type StepStopMetadata {
     workflow: String,
     run: Int,
     execution: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     step: String,
     attempt: Int,
     result: AttemptKind,
@@ -165,7 +166,7 @@ pub type CompensationMetadata {
     workflow: String,
     run: Int,
     execution: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     step: String,
     attempt: Int,
     decision: DecisionKind,
@@ -189,7 +190,7 @@ pub type UndoMetadata {
     workflow: String,
     run: Int,
     execution: Option(String),
-    correlation: Option(Correlation),
+    correlation: Correlation,
     step: String,
     result: UndoKind,
   )
@@ -259,7 +260,7 @@ pub fn run_started() -> Event(RunStartMeasurements, RunMetadata) {
     use execution <- fields.include(execution_field(), get: fn(m) {
       m.execution
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     fields.success(RunMetadata(workflow:, run:, execution:, correlation:))
@@ -295,7 +296,7 @@ pub fn run_stopped() -> Event(RunStopMeasurements, RunStopMetadata) {
     use execution <- fields.include(execution_field(), get: fn(m) {
       m.execution
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use outcome <- fields.include(
@@ -339,7 +340,7 @@ pub fn step_started() -> Event(StepStartMeasurements, StepMetadata) {
     use execution <- fields.include(execution_field(), get: fn(m) {
       m.execution
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
@@ -368,7 +369,7 @@ pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
     use execution <- fields.include(execution_field(), get: fn(m) {
       m.execution
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
@@ -416,7 +417,7 @@ pub fn compensation_stopped() -> Event(
     use execution <- fields.include(execution_field(), get: fn(m) {
       m.execution
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
@@ -475,7 +476,7 @@ pub fn undo_stopped() -> Event(StepStopMeasurements, UndoMetadata) {
     use execution <- fields.include(execution_field(), get: fn(m) {
       m.execution
     })
-    use correlation <- fields.include(correlation.field(), get: fn(m) {
+    use correlation <- fields.include(correlation.required_field(), get: fn(m) {
       m.correlation
     })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })

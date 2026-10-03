@@ -7,6 +7,7 @@ import saga
 import saga/execution
 import saga/telemetry
 import sinal
+import sinal/correlation
 import support/probe
 
 // ---------------------------------------------------------------------------
@@ -31,7 +32,12 @@ pub fn config_defaults_match_the_defaults_table_test() {
   settings.settle_timeout |> should.equal(5000)
   settings.cleanup_timeout |> should.equal(5000)
   settings.max_retry_delay |> should.equal(300_000)
-  settings.correlation |> should.equal(None)
+  // Every run has a correlation: a local run gets a fresh one, a durable
+  // execution `from_key(id)`.
+  let assert Ok(another) = execution.settings(execution.config(), None)
+  { settings.correlation != another.correlation } |> should.be_true
+  let assert Ok(durable) = execution.settings(execution.config(), Some("id-1"))
+  durable.correlation |> should.equal(correlation.from_key("id-1"))
   let assert Ok(unbounded) =
     execution.settings(
       execution.config() |> execution.with_step_timeout(execution.Infinity),

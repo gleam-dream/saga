@@ -35,7 +35,7 @@ pub type Attempt {
     persistent: Bool,
     saved_input: Option(String),
     admit: fn(String) -> Nil,
-    correlation: Option(Correlation),
+    correlation: Correlation,
   )
 }
 
@@ -311,8 +311,8 @@ pub fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
 
 /// Node-specific codecs remain bound to the node's concrete value types.
 /// The `String` that `freeze`, `thaw` and `resume_undo` receive is the step's
-/// stable key base (see `Attempt.base`); `thaw` and `resume_undo` also receive
-/// the run's correlation, which the undo's `EffectKey` carries.
+/// stable key base (see `Attempt.base`); they also receive the run's
+/// correlation, which the undo's `EffectKey` carries.
 pub type Persistence(e, u) {
   Persistence(
     version: String,
@@ -320,14 +320,15 @@ pub type Persistence(e, u) {
     input_version: String,
     output_version: String,
     recovery_undo_declared: Bool,
-    freeze: fn(Store, String) -> Result(List(String), checkpoint.Failure),
-    thaw: fn(List(String), Store, String, Option(Correlation)) ->
+    freeze: fn(Store, String, Correlation) ->
+      Result(List(String), checkpoint.Failure),
+    thaw: fn(List(String), Store, String, Correlation) ->
       Result(
         fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
         checkpoint.Failure,
       ),
     resume_compensation: fn(Attempt, Store) -> fn() -> ErasedRecovery(e, u),
-    resume_undo: fn(Store, String, Option(Correlation)) ->
+    resume_undo: fn(Store, String, Correlation) ->
       fn() -> Result(Result(Nil, u), checkpoint.Failure),
     resume: fn(Attempt, Store) -> fn() -> AttemptResult(e, u),
   )
