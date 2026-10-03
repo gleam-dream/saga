@@ -1,5 +1,4 @@
 import gleam/erlang/process
-import gleam/option.{None}
 import gleeunit/should
 import saga
 import saga/codec
@@ -115,11 +114,9 @@ pub fn persistent_concurrent_shared_dependency_test() {
         storage,
         reference,
         persistence,
-        execution.Config(
-          ..execution.config(),
-          max_concurrency: 2,
-          step_timeout: None,
-        ),
+        execution.config()
+          |> execution.with_max_concurrency(2)
+          |> execution.without_step_timeout(),
       ),
     )
   })
@@ -161,7 +158,7 @@ fn drive_later(
         storage,
         reference,
         persistence,
-        execution.Config(..execution.config(), step_timeout: None),
+        execution.config() |> execution.without_step_timeout(),
       ),
     )
   })

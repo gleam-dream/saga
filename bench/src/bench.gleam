@@ -13,7 +13,6 @@ import counter.{type Counter}
 import gleam/int
 import gleam/io
 import gleam/list
-import gleam/option.{None}
 import gleam/string
 import saga.{type DefinitionError, type Workflow}
 import saga/execution
@@ -111,12 +110,7 @@ fn bench_shape(
           True -> measured_runs_huge
           False -> measured_runs
         }
-        let config =
-          execution.Config(
-            ..execution.config(),
-            max_concurrency: 64,
-            deadline: None,
-          )
+        let config = execution.config() |> execution.with_max_concurrency(64)
         // One warm-up run, timed and reported separately, then `run_count`
         // measured runs. Every run is checked for correctness, not just
         // timed: a run that fails to complete with the expected output

@@ -11,7 +11,7 @@ import order_consumer/domain.{type Order, Order}
 import order_consumer/workflows
 import saga
 import saga/execution
-import saga/observation
+import saga/telemetry
 import sinal
 
 pub fn main() -> Nil {
@@ -88,7 +88,7 @@ fn scenario_c_advanced_config_and_cancellation() -> Nil {
   io.println("--- (c) advanced config, an observer, and cancellation ---")
   let observed_stops =
     sinal.subscriptions([
-      sinal.subscription(observation.run_stopped(), fn(_measurements, metadata) {
+      sinal.subscription(telemetry.run_stopped(), fn(_measurements, metadata) {
         io.println(
           "  [observed] run "
           <> int.to_string(metadata.run)
@@ -210,11 +210,6 @@ fn string_of_cancel_reason(reason: execution.CancelReason) -> String {
   }
 }
 
-fn string_of_outcome_kind(kind: observation.OutcomeKind) -> String {
-  case kind {
-    observation.OutcomeCompleted -> "completed"
-    observation.OutcomeFailed -> "failed"
-    observation.OutcomeCancelled -> "cancelled"
-    observation.OutcomeUnresolved -> "unresolved"
-  }
+fn string_of_outcome_kind(kind: telemetry.OutcomeKind) -> String {
+  telemetry.outcome_kind_name(kind)
 }

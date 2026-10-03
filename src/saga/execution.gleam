@@ -9,11 +9,12 @@
 //// `saga/testing` polls `progress` for tests.
 ////
 //// ```gleam
-//// import gleam/option.{Some}
 //// import saga/execution
 ////
 //// let config =
-////   execution.Config(..execution.config(), max_concurrency: 4, deadline: Some(5000))
+////   execution.config()
+////   |> execution.with_max_concurrency(4)
+////   |> execution.with_deadline(5000)
 //// case execution.run(workflow, "order-1", config) {
 ////   Ok(execution.Completed(receipt)) -> Ok(receipt)
 ////   Ok(outcome) -> Error(execution.unknown_effects(outcome))
@@ -22,10 +23,11 @@
 //// ```
 ////
 //// **Defaults.** `config()` gives one concurrent task per scheduler, no run
-//// deadline, a 60 second per-attempt `step_timeout`, a 5 second
-//// `settle_timeout` and a 5 second `cleanup_timeout`. `start` waits up to 5
-//// seconds for the run's coordinator to start. `run` waits until the run
-//// ends.
+//// deadline, a 60 second per-attempt timeout, a 5 second settle window, a 5
+//// second bound on each compensation decision and undo, and a 300 second
+//// cap on `RetryAfter` delays; see `config` for the setter of each. `start`
+//// waits up to 5 seconds for the run's coordinator to start. `run` waits
+//// until the run ends.
 ////
 //// **Who learns the outcome.** `run` returns it; `start` delivers it to the
 //// starting process, which alone may `await` it; `start_reporting` delivers
@@ -42,9 +44,10 @@
 //// bounded by `cleanup_timeout`. With a `deadline`, worst-case run time is
 //// therefore `deadline + settle_timeout + (undone entries + compensations) *
 //// cleanup_timeout`. Without one, a run lasts as long as its steps: each
-//// attempt is bounded by its timeout, if it has one, and each step by its
-//// attempt budget and the `RetryAfter` delays its `compensate` decider
-//// chooses.
+//// attempt is bounded by its timeout, and each step by its attempt budget
+//// and its `RetryAfter` delays, each at most `max_retry_delay`. A step's
+//// worst case is therefore `max_attempts * (attempt timeout +
+//// cleanup_timeout + max_retry_delay)`.
 ////
 //// **Cancellation never reverses an unknown effect.** A step whose attempt
 //// or compensation is killed — by its own `timeout`, or by the settle
@@ -61,38 +64,48 @@
 //// every outcome kind; it is `[]` exactly when every action returned.
 
 import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import saga.{type Workflow}
 import saga/internal/coordinator
 import saga/internal/ffi
+import saga/telemetry
+import sinal/correlation.{type Correlation}
 
-/// Bounds and pacing for one run.
-pub type Config {
+/// The bounds, pacing and labels of a run. Build one with `config` and the
+/// `with_*` setters; `run`, `start`, `start_reporting` and `durable.drive`
+/// check it and return `InvalidConfig` with every violation.
+pub opaque type Config {
   Config(
     max_concurrency: Int,
     deadline: Option(Int),
     step_timeout: Option(Int),
     settle_timeout: Int,
     cleanup_timeout: Int,
+    max_retry_delay: Int,
+    correlation: Option(Correlation),
   )
 }
 
-/// Sensible defaults: one attempt/compensation task per scheduler, no run
-/// deadline, a 60 second default per-attempt `step_timeout`, a 5 second
-/// settle window, and a 5 second cleanup bound.
+/// The default configuration:
 ///
-/// **Why the run `deadline` stays `None` while `step_timeout` does not.**
-/// `step_timeout` alone already bounds every individual attempt, and
-/// `saga.compensate`'s `max_attempts` already bounds how many attempts (plus
-/// backoff waits) a step can accumulate — together those two already give
-/// every step a finite worst-case duration without a run-wide deadline
-/// forcing one. A `deadline` is a different, coarser knob (a ceiling on the
-/// *whole run*, cutting across still-healthy steps too) that only some
-/// callers need; unlike a hung step, that is not a hazard the library can
-/// safely default on behalf of every caller, so it stays an opt-in via
-/// `deadline: Some(_)`.
+/// | Setting | Default | Setter |
+/// | --- | --- | --- |
+/// | concurrent attempts and compensation decisions | schedulers online | `with_max_concurrency` |
+/// | run deadline | none | `with_deadline` |
+/// | per-attempt timeout | 60 000 ms | `with_step_timeout`, `without_step_timeout` |
+/// | settle window | 5 000 ms | `with_settle_timeout` |
+/// | each compensation decision and undo | 5 000 ms | `with_cleanup_timeout` |
+/// | `RetryAfter` delay cap | 300 000 ms | `with_max_retry_delay` |
+/// | correlation | none | `with_correlation` |
+///
+/// **Why the run has no default deadline.** A step's attempts are bounded
+/// by the per-attempt timeout, its attempt budget (`saga.compensate`'s
+/// `max_attempts`) and the capped `RetryAfter` delay, so every run already
+/// has a finite worst case without a run-wide deadline (see the module
+/// doc). A deadline also cuts healthy long workflows, so it is opt-in.
 pub fn config() -> Config {
   Config(
     max_concurrency: schedulers_online(),
@@ -100,13 +113,67 @@ pub fn config() -> Config {
     step_timeout: Some(60_000),
     settle_timeout: 5000,
     cleanup_timeout: 5000,
+    max_retry_delay: 300_000,
+    correlation: None,
   )
+}
+
+/// Bounds how many step attempts and compensation decisions of one run
+/// execute at once. Must be at least 1.
+pub fn with_max_concurrency(config: Config, limit: Int) -> Config {
+  Config(..config, max_concurrency: limit)
+}
+
+/// Ends the run with `DeadlineExceeded` after `milliseconds`, settling and
+/// rolling back like any failure. Must be positive.
+pub fn with_deadline(config: Config, milliseconds: Int) -> Config {
+  Config(..config, deadline: Some(milliseconds))
+}
+
+/// Bounds each attempt of a step that has no `saga.timeout` of its own.
+/// A step's own `saga.timeout` always wins, shorter or longer. Must be
+/// positive.
+pub fn with_step_timeout(config: Config, milliseconds: Int) -> Config {
+  Config(..config, step_timeout: Some(milliseconds))
+}
+
+/// Leaves attempts of steps without their own `saga.timeout` unbounded: the
+/// explicit opt-out of the 60 second default.
+pub fn without_step_timeout(config: Config) -> Config {
+  Config(..config, step_timeout: None)
+}
+
+/// How long in-flight attempts and compensation decisions may finish on
+/// their own once the run stops admitting work, before they are killed and
+/// reported `interrupted`. `0` kills them at once. Must not be negative.
+pub fn with_settle_timeout(config: Config, milliseconds: Int) -> Config {
+  Config(..config, settle_timeout: milliseconds)
+}
+
+/// Bounds each compensation decision and each undo action. Must be
+/// positive.
+pub fn with_cleanup_timeout(config: Config, milliseconds: Int) -> Config {
+  Config(..config, cleanup_timeout: milliseconds)
+}
+
+/// Caps the delay of a `RetryAfter` decision. A longer requested delay is
+/// shortened to the cap, and the decision's
+/// `telemetry.CompensationMetadata` reports `retry_delay_capped: True`.
+/// Must not be negative.
+pub fn with_max_retry_delay(config: Config, milliseconds: Int) -> Config {
+  Config(..config, max_retry_delay: milliseconds)
+}
+
+/// Carries `correlation` in every `saga/telemetry` event of the run, so the
+/// run can be followed with the caller's other work.
+pub fn with_correlation(config: Config, correlation: Correlation) -> Config {
+  Config(..config, correlation: Some(correlation))
 }
 
 @external(erlang, "saga_ffi", "schedulers_online")
 fn schedulers_online() -> Int
 
-/// A single violated `Config` invariant. `validate` collects every one that
+/// A single violated `Config` bound. `InvalidConfig` lists every one that
 /// applies, not just the first.
 pub type ConfigError {
   MaxConcurrencyNotPositive(value: Int)
@@ -114,11 +181,40 @@ pub type ConfigError {
   StepTimeoutNotPositive(value: Int)
   SettleTimeoutNegative(value: Int)
   CleanupTimeoutNotPositive(value: Int)
+  MaxRetryDelayNegative(value: Int)
 }
 
-/// Validates a complete `Config` value before any process is started.
-/// Collects every violation, not just the first.
-pub fn validate(config: Config) -> Result(Config, List(ConfigError)) {
+/// Describes a configuration error for logs.
+pub fn describe_config_error(error: ConfigError) -> String {
+  case error {
+    MaxConcurrencyNotPositive(value) ->
+      "max_concurrency must be at least 1 (with_max_concurrency), got "
+      <> int.to_string(value)
+    DeadlineNotPositive(value) ->
+      "the deadline must be positive (with_deadline), got "
+      <> int.to_string(value)
+    StepTimeoutNotPositive(value) ->
+      "the step timeout must be positive (with_step_timeout), got "
+      <> int.to_string(value)
+    SettleTimeoutNegative(value) ->
+      "the settle timeout must not be negative (with_settle_timeout), got "
+      <> int.to_string(value)
+    CleanupTimeoutNotPositive(value) ->
+      "the cleanup timeout must be positive (with_cleanup_timeout), got "
+      <> int.to_string(value)
+    MaxRetryDelayNegative(value) ->
+      "the retry delay cap must not be negative (with_max_retry_delay), got "
+      <> int.to_string(value)
+  }
+}
+
+/// Checks `config` and returns the coordinator's settings, labelled with a
+/// durable execution id when there is one. Every violation is collected.
+@internal
+pub fn settings(
+  config: Config,
+  execution: Option(String),
+) -> Result(coordinator.Settings, List(ConfigError)) {
   let errors =
     list.flatten([
       case config.max_concurrency > 0 {
@@ -143,9 +239,23 @@ pub fn validate(config: Config) -> Result(Config, List(ConfigError)) {
         True -> []
         False -> [CleanupTimeoutNotPositive(config.cleanup_timeout)]
       },
+      case config.max_retry_delay >= 0 {
+        True -> []
+        False -> [MaxRetryDelayNegative(config.max_retry_delay)]
+      },
     ])
   case errors {
-    [] -> Ok(config)
+    [] ->
+      Ok(coordinator.Settings(
+        max_concurrency: config.max_concurrency,
+        deadline: config.deadline,
+        step_timeout: config.step_timeout,
+        settle_timeout: config.settle_timeout,
+        cleanup_timeout: config.cleanup_timeout,
+        max_retry_delay: config.max_retry_delay,
+        correlation: config.correlation,
+        execution: execution,
+      ))
     _ -> Error(errors)
   }
 }
@@ -153,14 +263,8 @@ pub fn validate(config: Config) -> Result(Config, List(ConfigError)) {
 /// Why `run`/`start` never began a run at all.
 pub type RunError {
   InvalidConfig(errors: List(ConfigError))
-  ExecutionLost(crash: Crash)
+  ExecutionLost(crash: saga.Crash)
 }
-
-pub type Crash =
-  saga.Crash
-
-pub type StepAddress =
-  saga.StepAddress
 
 /// The run-ending cause behind a `Failed` or a sibling failure recorded in
 /// a `Settlement`. Keeps an application failure (`StepFailed`), an
@@ -185,31 +289,31 @@ pub type Cause(e) {
   /// author who aborts after a crash should choose an error that says so,
   /// and a consumer should consult `unknown_effects` rather than infer a
   /// known result from `StepFailed`.
-  StepFailed(step: StepAddress, error: e)
-  StepCrashed(step: StepAddress, crash: Crash)
-  StepTimedOut(step: StepAddress)
-  RetryLimitReached(step: StepAddress, last: saga.AttemptFailure(e))
+  StepFailed(step: saga.StepAddress, error: e)
+  StepCrashed(step: saga.StepAddress, crash: saga.Crash)
+  StepTimedOut(step: saga.StepAddress)
+  RetryLimitReached(step: saga.StepAddress, last: saga.AttemptFailure(e))
   /// A `Retry`/`RetryAfter` decision was refused because settling had
   /// already begun for a different, unrelated trigger, not because this
   /// step's own attempt budget was exhausted — distinct from
   /// `RetryLimitReached` for that reason.
-  RetrySuperseded(step: StepAddress, last: saga.AttemptFailure(e))
-  OutputCrashed(crash: Crash)
+  RetrySuperseded(step: saga.StepAddress, last: saga.AttemptFailure(e))
+  OutputCrashed(crash: saga.Crash)
   DeadlineExceeded
 }
 
 /// One completed step's undo did not succeed, during rollback.
 pub type UndoFailure(u) {
-  UndoFailed(step: StepAddress, error: u)
-  UndoCrashed(step: StepAddress, crash: Crash)
-  UndoTimedOut(step: StepAddress)
+  UndoFailed(step: saga.StepAddress, error: u)
+  UndoCrashed(step: saga.StepAddress, crash: saga.Crash)
+  UndoTimedOut(step: saga.StepAddress)
 }
 
 /// A compensation decision itself failed to produce a clean outcome.
 pub type CompensationFailure(u) {
-  CleanupFailed(step: StepAddress, error: u)
-  CompensationCrashed(step: StepAddress, crash: Crash)
-  CompensationTimedOut(step: StepAddress)
+  CleanupFailed(step: saga.StepAddress, error: u)
+  CompensationCrashed(step: saga.StepAddress, crash: saga.Crash)
+  CompensationTimedOut(step: saga.StepAddress)
 }
 
 /// Why a run was cancelled: an explicit `cancel` call, or the owning
@@ -236,11 +340,11 @@ pub type CancelReason {
 /// every action of the run returned a result.
 pub type Settlement(e, u) {
   Settlement(
-    undone: List(StepAddress),
+    undone: List(saga.StepAddress),
     undo_failures: List(UndoFailure(u)),
-    not_undoable: List(StepAddress),
-    held: List(StepAddress),
-    interrupted: List(StepAddress),
+    not_undoable: List(saga.StepAddress),
+    held: List(saga.StepAddress),
+    interrupted: List(saga.StepAddress),
     compensation_failures: List(CompensationFailure(u)),
     sibling_failures: List(Cause(e)),
     unknown_effects: List(UnknownEffect),
@@ -253,7 +357,7 @@ pub type Settlement(e, u) {
 /// a crashed attempt retried to success, continued, aborted or held is
 /// still named.
 pub type UnknownEffect {
-  UnknownEffect(step: StepAddress, action: Action, ending: UnknownEnding)
+  UnknownEffect(step: saga.StepAddress, action: Action, ending: UnknownEnding)
 }
 
 /// Which of a step's actions ended with an unknown effect.
@@ -270,7 +374,7 @@ pub type Action {
 /// How an action ended without a result.
 pub type UnknownEnding {
   /// It raised, or its process exited (for example, killed from outside).
-  ActionCrashed(crash: Crash)
+  ActionCrashed(crash: saga.Crash)
   /// It was killed at its time bound: the step's `timeout` (or
   /// `Config.step_timeout`) for an attempt, `Config.cleanup_timeout` for a
   /// compensation decision or an undo.
@@ -300,7 +404,7 @@ pub type Outcome(o, e, u) {
   CompletedWithUnknownEffects(output: o, unknown_effects: List(UnknownEffect))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
-  Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
+  Unresolved(step: saga.StepAddress, evidence: e, settlement: Settlement(e, u))
 }
 
 /// The run's current admission phase: accepting new work, letting active
@@ -330,7 +434,7 @@ pub type StepState {
 }
 
 pub type StepProgress {
-  StepProgress(address: StepAddress, state: StepState)
+  StepProgress(address: saga.StepAddress, state: StepState)
 }
 
 /// A read-only snapshot of a run: its phase and every step's state. Never
@@ -370,7 +474,7 @@ pub type AwaitError {
   /// `start_reporting` and delivers its outcome to a report subject.
   NotOwner
   AlreadyAwaited
-  Lost(crash: Crash)
+  Lost(crash: saga.Crash)
 }
 
 /// A started run. Only the process that called `start` may `await` it; a
@@ -465,8 +569,8 @@ pub fn run(
 }
 
 /// Starts a run without blocking, returning an `Execution` handle. Only the
-/// calling process may `await` it. Returns `Error(InvalidConfig(_))` if
-/// `config` fails `validate`, or `Error(ExecutionLost(_))` if the
+/// calling process may `await` it. Returns `Error(InvalidConfig(_))` with
+/// every violated bound of `config`, or `Error(ExecutionLost(_))` if the
 /// coordinator process fails to complete its startup handshake within 5
 /// seconds (it should not normally take anywhere near that long; this
 /// guards against a wedged or unschedulable coordinator rather than
@@ -545,7 +649,7 @@ fn launch(
   config: Config,
   deliver: fn(coordinator.Outcome(o, e, u)) -> Nil,
 ) -> Result(#(Pid, Int, Subject(coordinator.Control(o, e, u))), RunError) {
-  use validated <- result_try(case validate(config) {
+  use validated <- result_try(case settings(config, None) {
     Ok(validated) -> Ok(validated)
     Error(errors) -> Error(InvalidConfig(errors))
   })
@@ -554,11 +658,7 @@ fn launch(
     coordinator.start(
       workflow_name: saga.name(workflow),
       owner: process.self(),
-      max_concurrency: validated.max_concurrency,
-      deadline: validated.deadline,
-      step_timeout: validated.step_timeout,
-      settle_timeout: validated.settle_timeout,
-      cleanup_timeout: validated.cleanup_timeout,
+      settings: validated,
       build_graph: fn() { saga.for_run(workflow, input) },
       deliver: deliver,
       control_subject_out: control_subject_out,
@@ -859,6 +959,44 @@ pub fn unknown_effects(outcome: Outcome(o, e, u)) -> List(UnknownEffect) {
     Failed(_, settlement)
     | Cancelled(_, settlement)
     | Unresolved(_, _, settlement) -> settlement.unknown_effects
+  }
+}
+
+/// The closed classification of an outcome, the same value that
+/// `[saga, run, stop]` reports. `CompletedWithUnknownEffects` has its own
+/// kind, so a match on the kind cannot mistake it for a plain completion.
+pub fn kind(outcome: Outcome(o, e, u)) -> telemetry.OutcomeKind {
+  case outcome {
+    Completed(_) -> telemetry.OutcomeCompleted
+    CompletedWithUnknownEffects(..) ->
+      telemetry.OutcomeCompletedWithUnknownEffects
+    Failed(..) -> telemetry.OutcomeFailed
+    Cancelled(..) -> telemetry.OutcomeCancelled
+    Unresolved(..) -> telemetry.OutcomeUnresolved
+  }
+}
+
+/// Describes a cause for logs, naming the step. It does not render the
+/// application error `e`; describe that with the application's own code.
+pub fn describe_cause(cause: Cause(e)) -> String {
+  case cause {
+    StepFailed(step, _) ->
+      "step " <> saga.address_to_string(step) <> " returned an error"
+    StepCrashed(step, crash) ->
+      "step " <> saga.address_to_string(step) <> " crashed: " <> crash.reason
+    StepTimedOut(step) ->
+      "step " <> saga.address_to_string(step) <> " timed out"
+    RetryLimitReached(step, _) ->
+      "step "
+      <> saga.address_to_string(step)
+      <> " used its whole attempt budget"
+    RetrySuperseded(step, _) ->
+      "step "
+      <> saga.address_to_string(step)
+      <> " could not retry because the run was already stopping"
+    OutputCrashed(crash) ->
+      "computing the workflow's output crashed: " <> crash.reason
+    DeadlineExceeded -> "the run passed its deadline"
   }
 }
 

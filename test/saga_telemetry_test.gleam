@@ -1,10 +1,12 @@
 import gleam/erlang/process.{type Subject}
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleeunit/should
 import saga
 import saga/execution
-import saga/observation
+import saga/telemetry
 import sinal
+import sinal/correlation.{type Correlation}
 import support/probe
 
 pub type DemoError {
@@ -61,28 +63,28 @@ fn events(collector: Collector) -> List(String) {
 
 fn all_subscriptions(collector: Collector) -> sinal.SubscriptionPlan {
   sinal.subscriptions([
-    sinal.subscription(observation.run_started(), fn(_m, _d) {
+    sinal.subscription(telemetry.run_started(), fn(_m, _d) {
       record(collector, "run_start")
     }),
-    sinal.subscription(observation.run_stopped(), fn(_m, d) {
+    sinal.subscription(telemetry.run_stopped(), fn(_m, d) {
       record(collector, "run_stop:" <> outcome_kind_string(d.outcome))
     }),
-    sinal.subscription(observation.step_started(), fn(_m, d) {
+    sinal.subscription(telemetry.step_started(), fn(_m, d) {
       record(collector, "step_start:" <> d.step)
     }),
-    sinal.subscription(observation.step_stopped(), fn(_m, d) {
+    sinal.subscription(telemetry.step_stopped(), fn(_m, d) {
       record(
         collector,
         "step_stop:" <> d.step <> ":" <> attempt_kind_string(d.result),
       )
     }),
-    sinal.subscription(observation.compensation_stopped(), fn(_m, d) {
+    sinal.subscription(telemetry.compensation_stopped(), fn(_m, d) {
       record(
         collector,
         "compensate_stop:" <> d.step <> ":" <> decision_kind_string(d.decision),
       )
     }),
-    sinal.subscription(observation.undo_stopped(), fn(_m, d) {
+    sinal.subscription(telemetry.undo_stopped(), fn(_m, d) {
       record(
         collector,
         "undo_stop:" <> d.step <> ":" <> undo_kind_string(d.result),
@@ -91,42 +93,44 @@ fn all_subscriptions(collector: Collector) -> sinal.SubscriptionPlan {
   ])
 }
 
-fn outcome_kind_string(kind: observation.OutcomeKind) -> String {
+fn outcome_kind_string(kind: telemetry.OutcomeKind) -> String {
   case kind {
-    observation.OutcomeCompleted -> "completed"
-    observation.OutcomeFailed -> "failed"
-    observation.OutcomeCancelled -> "cancelled"
-    observation.OutcomeUnresolved -> "unresolved"
+    telemetry.OutcomeCompleted -> "completed"
+    telemetry.OutcomeCompletedWithUnknownEffects -> "completed_unknown"
+    telemetry.OutcomeFailed -> "failed"
+    telemetry.OutcomeCancelled -> "cancelled"
+    telemetry.OutcomeUnresolved -> "unresolved"
   }
 }
 
-fn attempt_kind_string(kind: observation.AttemptKind) -> String {
+fn attempt_kind_string(kind: telemetry.AttemptKind) -> String {
   case kind {
-    observation.AttemptSucceeded -> "succeeded"
-    observation.AttemptFailed -> "failed"
-    observation.AttemptCrashed -> "crashed"
-    observation.AttemptTimedOut -> "timed_out"
-    observation.AttemptInterrupted -> "interrupted"
+    telemetry.AttemptSucceeded -> "succeeded"
+    telemetry.AttemptFailed -> "failed"
+    telemetry.AttemptUnknown -> "unknown"
+    telemetry.AttemptCrashed -> "crashed"
+    telemetry.AttemptTimedOut -> "timed_out"
+    telemetry.AttemptInterrupted -> "interrupted"
   }
 }
 
-fn decision_kind_string(kind: observation.DecisionKind) -> String {
+fn decision_kind_string(kind: telemetry.DecisionKind) -> String {
   case kind {
-    observation.DecisionRetry -> "retry"
-    observation.DecisionContinue -> "continue"
-    observation.DecisionAbort -> "abort"
-    observation.DecisionHold -> "hold"
-    observation.DecisionCrashed -> "crashed"
-    observation.DecisionTimedOut -> "timed_out"
+    telemetry.DecisionRetry -> "retry"
+    telemetry.DecisionContinue -> "continue"
+    telemetry.DecisionAbort -> "abort"
+    telemetry.DecisionHold -> "hold"
+    telemetry.DecisionCrashed -> "crashed"
+    telemetry.DecisionTimedOut -> "timed_out"
   }
 }
 
-fn undo_kind_string(kind: observation.UndoKind) -> String {
+fn undo_kind_string(kind: telemetry.UndoKind) -> String {
   case kind {
-    observation.UndoUndone -> "undone"
-    observation.UndoFailedKind -> "failed"
-    observation.UndoCrashedKind -> "crashed"
-    observation.UndoTimedOutKind -> "timed_out"
+    telemetry.UndoUndone -> "undone"
+    telemetry.UndoFailedKind -> "failed"
+    telemetry.UndoCrashedKind -> "crashed"
+    telemetry.UndoTimedOutKind -> "timed_out"
   }
 }
 
@@ -192,7 +196,7 @@ pub fn observation_events_cancelled_test() {
       )
     })
 
-  let config = execution.Config(..execution.config(), settle_timeout: 0)
+  let config = execution.config() |> execution.with_settle_timeout(0)
 
   let assert Ok(sinal.SubscriptionCompletion(_work_result, [])) =
     sinal.with_subscriptions(all_subscriptions(collector), fn() {
@@ -220,9 +224,9 @@ pub fn step_timeout_with_decider_emits_step_stopped_test() {
 
   let subscriptions =
     sinal.subscriptions([
-      sinal.subscription(observation.step_stopped(), fn(m, d) {
+      sinal.subscription(telemetry.step_stopped(), fn(m, d) {
         case d.result {
-          observation.AttemptTimedOut ->
+          telemetry.AttemptTimedOut ->
             process.send(durations, #(d.step, m.duration))
           _ -> Nil
         }
@@ -276,9 +280,9 @@ pub fn step_timeout_without_decider_reports_real_duration_test() {
 
   let subscriptions =
     sinal.subscriptions([
-      sinal.subscription(observation.step_stopped(), fn(m, d) {
+      sinal.subscription(telemetry.step_stopped(), fn(m, d) {
         case d.result {
-          observation.AttemptTimedOut ->
+          telemetry.AttemptTimedOut ->
             process.send(durations, #(d.step, m.duration))
           _ -> Nil
         }
@@ -317,7 +321,7 @@ pub fn raising_handler_does_not_change_outcome_test() {
     })
 
   let raising_subscription =
-    sinal.subscription(observation.run_started(), fn(_m, _d) {
+    sinal.subscription(telemetry.run_started(), fn(_m, _d) {
       panic as "boom in handler"
     })
 
@@ -325,4 +329,108 @@ pub fn raising_handler_does_not_change_outcome_test() {
     sinal.with_subscriptions(sinal.subscriptions([raising_subscription]), fn() {
       execution.run(workflow, 0, execution.config())
     })
+}
+
+/// `execution.with_correlation` reaches every event of the run, and a local
+/// run carries no durable execution id.
+pub fn correlation_reaches_every_event_test() {
+  let seen = process.new_subject()
+  let assert Ok(order) = correlation.from_string("order-42")
+  let assert Ok(workflow) =
+    saga.define("correlated", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("a", fn(x: Int) { Ok(x) })
+        |> saga.undo(fn(_input, _output) { Ok(Nil) }),
+      )
+      |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
+    })
+  let plan =
+    sinal.subscriptions([
+      sinal.subscription(telemetry.run_started(), fn(_m, d) {
+        process.send(seen, #("run_start", d.correlation, d.execution))
+      }),
+      sinal.subscription(telemetry.run_stopped(), fn(_m, d) {
+        process.send(seen, #("run_stop", d.correlation, d.execution))
+      }),
+      sinal.subscription(telemetry.step_started(), fn(_m, d) {
+        process.send(seen, #("step_start", d.correlation, d.execution))
+      }),
+      sinal.subscription(telemetry.step_stopped(), fn(_m, d) {
+        process.send(seen, #("step_stop", d.correlation, d.execution))
+      }),
+      sinal.subscription(telemetry.undo_stopped(), fn(_m, d) {
+        process.send(seen, #("undo_stop", d.correlation, d.execution))
+      }),
+    ])
+  let config = execution.config() |> execution.with_correlation(order)
+  let assert Ok(sinal.SubscriptionCompletion(Ok(execution.Failed(..)), [])) =
+    sinal.with_subscriptions(plan, fn() { execution.run(workflow, 1, config) })
+  let received = drain(seen, [])
+  list.map(received, fn(event) { event.0 })
+  |> should.equal([
+    "run_start", "step_start", "step_stop", "step_start", "step_stop",
+    "undo_stop", "run_stop",
+  ])
+  list.all(received, fn(event) { event.1 == Some(order) && event.2 == None })
+  |> should.be_true
+}
+
+/// Without a correlation the field is absent, and `execution.kind` gives
+/// `CompletedWithUnknownEffects` its own kind, as `run_stop` does.
+pub fn outcome_kind_is_shared_with_run_stop_test() {
+  let kinds = process.new_subject()
+  let attempts = probe.new_counter()
+  let assert Ok(workflow) =
+    saga.define("kinds", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("flaky", fn(x: Int) {
+          probe.counter_enter(attempts)
+          case probe.total_entries(attempts) {
+            1 -> panic as "first attempt crashes"
+            _ -> Ok(x)
+          }
+        })
+        |> saga.compensate(max_attempts: 2, with: fn(_input, _failure, _a) {
+          saga.Retry
+        }),
+      )
+    })
+  let plan =
+    sinal.subscriptions([
+      sinal.subscription(telemetry.run_stopped(), fn(_m, d) {
+        process.send(kinds, #(d.outcome, d.correlation))
+      }),
+    ])
+  let assert Ok(sinal.SubscriptionCompletion(Ok(outcome), [])) =
+    sinal.with_subscriptions(plan, fn() {
+      execution.run(workflow, 1, execution.config())
+    })
+  let assert execution.CompletedWithUnknownEffects(1, [_]) = outcome
+  execution.kind(outcome)
+  |> should.equal(telemetry.OutcomeCompletedWithUnknownEffects)
+  process.receive(kinds, 1000)
+  |> should.equal(Ok(#(telemetry.OutcomeCompletedWithUnknownEffects, None)))
+  telemetry.outcome_kind_name(execution.kind(outcome))
+  |> should.equal("completed_with_unknown_effects")
+}
+
+pub fn describe_cause_names_the_step_test() {
+  let address =
+    saga.StepAddress(scope: ["checkout"], name: "charge", occurrence: 1)
+  execution.describe_cause(execution.StepTimedOut(address))
+  |> should.equal("step checkout/charge timed out")
+  execution.describe_cause(execution.DeadlineExceeded)
+  |> should.equal("the run passed its deadline")
+}
+
+fn drain(
+  subject: Subject(#(String, Option(Correlation), Option(String))),
+  acc: List(#(String, Option(Correlation), Option(String))),
+) -> List(#(String, Option(Correlation), Option(String))) {
+  case process.receive(subject, 0) {
+    Ok(event) -> drain(subject, [event, ..acc])
+    Error(Nil) -> list.reverse(acc)
+  }
 }

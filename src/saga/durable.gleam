@@ -207,14 +207,17 @@ pub fn drive(
   persistence: Persistence(i, o, e, u),
   config: execution.Config,
 ) -> Result(execution.Outcome(o, e, u), Error) {
-  use config <- result.try(
-    execution.validate(config) |> result.map_error(InvalidConfig),
+  use settings <- result.try(
+    execution.settings(config, Some(reference.id))
+    |> result.map_error(InvalidConfig),
   )
   let reply = process.new_subject()
   let pid =
     process.spawn_unlinked(fn() {
       case
-        ffi.rescue(fn() { drive_owned(storage, reference, persistence, config) })
+        ffi.rescue(fn() {
+          drive_owned(storage, reference, persistence, settings)
+        })
       {
         ffi.Rescued(result) -> process.send(reply, result)
         ffi.Raised(_, _) -> process.send(reply, Error(RunnerLost))
@@ -234,7 +237,7 @@ fn drive_owned(
   storage: Storage,
   reference: Reference,
   persistence: Persistence(i, o, e, u),
-  config: execution.Config,
+  config: coordinator.Settings,
 ) -> Result(execution.Outcome(o, e, u), Error) {
   use record <- result.try(storage.claim() |> result.map_error(StorageError))
   let result = drive_claimed(storage, record, reference, persistence, config)
@@ -250,7 +253,7 @@ fn drive_claimed(
   record: storage.Record,
   reference: Reference,
   persistence: Persistence(i, o, e, u),
-  config: execution.Config,
+  config: coordinator.Settings,
 ) -> Result(execution.Outcome(o, e, u), Error) {
   use _ <- result.try(check_header(record.data, reference, persistence))
   use envelope <- result.try(decode(record.data, persistence))
@@ -305,11 +308,7 @@ fn drive_claimed(
         )
       coordinator.execute_saved(
         saga.name(persistence.workflow),
-        config.max_concurrency,
-        config.deadline,
-        config.step_timeout,
-        config.settle_timeout,
-        config.cleanup_timeout,
+        config,
         fn() { saga.for_run(persistence.workflow, input) },
         session,
         fn(outcome) {

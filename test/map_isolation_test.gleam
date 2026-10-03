@@ -81,7 +81,7 @@ pub fn slow_map_does_not_block_cancel_test() {
       |> saga.perform(saga.step("b", fn(x: Int) -> Result(Int, Nil) { Ok(x) }))
     })
 
-  let config = execution.Config(..execution.config(), settle_timeout: 100)
+  let config = execution.config() |> execution.with_settle_timeout(100)
   probe.with_run(wf, 1, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     // The map is blocked inside "b"'s attempt task. Cancellation must still
