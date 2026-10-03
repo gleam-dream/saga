@@ -7,7 +7,7 @@ import gleam/string
 import gleeunit/should
 import saga
 import saga/execution
-import saga/observation
+import saga/telemetry
 import saga/testing
 import sinal
 import support/probe
@@ -145,7 +145,7 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
   // all — `max_concurrency` is set explicitly (rather than relying on
   // `config()`'s scheduler-count default) so this passes under a
   // single-scheduler `+S 1:1` run too.
-  let config = execution.Config(..execution.config(), max_concurrency: 2)
+  let config = execution.config() |> execution.with_max_concurrency(2)
   let assert Ok(exec) = execution.start(workflow, 0, config)
   // Both attempts start together (`both` schedules independent nodes): wait
   // for the decider to be blocked, and for `failing` to be blocked, then
@@ -187,10 +187,10 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
 // ---------------------------------------------------------------------------
 
 fn collect_step_stop_durations(
-  collector: process.Subject(#(String, observation.AttemptKind, Int)),
+  collector: process.Subject(#(String, telemetry.AttemptKind, Int)),
 ) -> sinal.SubscriptionPlan {
   sinal.subscriptions([
-    sinal.subscription(observation.step_stopped(), fn(m, d) {
+    sinal.subscription(telemetry.step_stopped(), fn(m, d) {
       process.send(collector, #(d.step, d.result, m.duration))
     }),
   ])
@@ -214,7 +214,7 @@ pub fn step_stopped_reports_real_duration_test() {
       execution.run(workflow, 0, execution.config())
     })
 
-  let assert Ok(#("slow", observation.AttemptSucceeded, duration)) =
+  let assert Ok(#("slow", telemetry.AttemptSucceeded, duration)) =
     process.receive(collector, 500)
   // Not a hard-coded 0: the step body slept 60ms, so its reported duration
   // must be a meaningfully positive measurement.
@@ -248,11 +248,9 @@ pub fn settle_sweep_kill_emits_attempt_interrupted_test() {
   // relying on `config()`'s scheduler-count default) so this passes under
   // a single-scheduler `+S 1:1` run too.
   let config =
-    execution.Config(
-      ..execution.config(),
-      settle_timeout: 100,
-      max_concurrency: 2,
-    )
+    execution.config()
+    |> execution.with_settle_timeout(100)
+    |> execution.with_max_concurrency(2)
   let assert Ok(sinal.SubscriptionCompletion(Ok(_result), [])) =
     sinal.with_subscriptions(collect_step_stop_durations(collector), fn() {
       execution.run(workflow, 0, config)
@@ -262,7 +260,7 @@ pub fn settle_sweep_kill_emits_attempt_interrupted_test() {
 }
 
 fn drain_until_interrupted(
-  collector: process.Subject(#(String, observation.AttemptKind, Int)),
+  collector: process.Subject(#(String, telemetry.AttemptKind, Int)),
   remaining: Int,
 ) -> Nil {
   case remaining <= 0 {
@@ -270,7 +268,7 @@ fn drain_until_interrupted(
     False ->
       case process.receive(collector, 200) {
         Error(_) -> panic as "expected an AttemptInterrupted step_stopped event"
-        Ok(#("blocked", observation.AttemptInterrupted, _duration)) -> Nil
+        Ok(#("blocked", telemetry.AttemptInterrupted, _duration)) -> Nil
         Ok(_other) -> drain_until_interrupted(collector, remaining - 1)
       }
   }

@@ -1,8 +1,11 @@
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
 import saga
 import saga/execution
+import saga/telemetry
+import sinal
 import support/probe
 
 // ---------------------------------------------------------------------------
@@ -14,7 +17,36 @@ import support/probe
 /// silent change to the default value is caught even if every behavioral
 /// test below still passes.
 pub fn config_defaults_to_a_60_second_step_timeout_test() {
-  execution.config().step_timeout |> should.equal(Some(60_000))
+  let assert Ok(settings) = execution.settings(execution.config(), None)
+  settings.step_timeout |> should.equal(Some(60_000))
+}
+
+/// Every default in the README's defaults table, read from the checked
+/// settings a run starts with.
+pub fn config_defaults_match_the_defaults_table_test() {
+  let assert Ok(settings) = execution.settings(execution.config(), None)
+  settings.max_concurrency |> should.equal(schedulers_online())
+  settings.deadline |> should.equal(None)
+  settings.settle_timeout |> should.equal(5000)
+  settings.cleanup_timeout |> should.equal(5000)
+  settings.max_retry_delay |> should.equal(300_000)
+  settings.correlation |> should.equal(None)
+  let assert Ok(unbounded) =
+    execution.settings(
+      execution.config() |> execution.without_step_timeout,
+      None,
+    )
+  unbounded.step_timeout |> should.equal(None)
+}
+
+@external(erlang, "erlang", "system_info")
+fn system_info(item: atom) -> Int
+
+@external(erlang, "erlang", "binary_to_atom")
+fn to_atom(name: String) -> atom
+
+fn schedulers_online() -> Int {
+  system_info(to_atom("schedulers_online"))
 }
 
 /// A step with no `saga.timeout` of its own is still bounded by the run's
@@ -34,7 +66,7 @@ pub fn default_step_timeout_bounds_a_hung_step_test() {
       )
     })
 
-  let config = execution.Config(..execution.config(), step_timeout: Some(50))
+  let config = execution.config() |> execution.with_step_timeout(50)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
@@ -66,8 +98,7 @@ pub fn step_timeout_overrides_default_when_shorter_test() {
 
   // A default far longer than the step's own timeout: if the override did
   // not take effect, this test would hang until the default fired instead.
-  let config =
-    execution.Config(..execution.config(), step_timeout: Some(10_000))
+  let config = execution.config() |> execution.with_step_timeout(10_000)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
@@ -99,7 +130,7 @@ pub fn step_timeout_overrides_default_when_longer_test() {
 
   // A default far shorter than the step's own timeout: if the override did
   // not take effect, the default would kill the step before it can finish.
-  let config = execution.Config(..execution.config(), step_timeout: Some(1))
+  let config = execution.config() |> execution.with_step_timeout(1)
 
   let assert Ok(execution.Completed(0)) = execution.run(workflow, 0, config)
   probe.total_entries(counter) |> should.equal(1)
@@ -121,7 +152,7 @@ pub fn step_timeout_none_disables_the_default_test() {
       )
     })
 
-  let config = execution.Config(..execution.config(), step_timeout: None)
+  let config = execution.config() |> execution.without_step_timeout()
 
   let assert Ok(execution.Completed(0)) = execution.run(workflow, 0, config)
   probe.total_entries(counter) |> should.equal(1)
@@ -148,42 +179,14 @@ pub fn invalid_config_rejected_before_start_test() {
       )
     })
 
+  let c = execution.config()
   let bad_configs = [
-    execution.Config(
-      max_concurrency: 0,
-      deadline: None,
-      step_timeout: Some(60_000),
-      settle_timeout: 5000,
-      cleanup_timeout: 5000,
-    ),
-    execution.Config(
-      max_concurrency: 1,
-      deadline: Some(0),
-      step_timeout: Some(60_000),
-      settle_timeout: 5000,
-      cleanup_timeout: 5000,
-    ),
-    execution.Config(
-      max_concurrency: 1,
-      deadline: None,
-      step_timeout: Some(0),
-      settle_timeout: 5000,
-      cleanup_timeout: 5000,
-    ),
-    execution.Config(
-      max_concurrency: 1,
-      deadline: None,
-      step_timeout: Some(60_000),
-      settle_timeout: -1,
-      cleanup_timeout: 5000,
-    ),
-    execution.Config(
-      max_concurrency: 1,
-      deadline: None,
-      step_timeout: Some(60_000),
-      settle_timeout: 5000,
-      cleanup_timeout: 0,
-    ),
+    execution.with_max_concurrency(c, 0),
+    execution.with_deadline(c, 0),
+    execution.with_step_timeout(c, 0),
+    execution.with_settle_timeout(c, -1),
+    execution.with_cleanup_timeout(c, 0),
+    execution.with_max_retry_delay(c, -1),
   ]
 
   list.each(bad_configs, fn(config) {
@@ -198,55 +201,120 @@ pub fn invalid_config_rejected_before_start_test() {
 }
 
 pub fn every_config_error_variant_is_reachable_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+    })
   let config =
-    execution.Config(
-      max_concurrency: -1,
-      deadline: Some(-5),
-      step_timeout: Some(-2),
-      settle_timeout: -1,
-      cleanup_timeout: -1,
+    execution.config()
+    |> execution.with_max_concurrency(-1)
+    |> execution.with_deadline(-5)
+    |> execution.with_step_timeout(-2)
+    |> execution.with_settle_timeout(-1)
+    |> execution.with_cleanup_timeout(-1)
+    |> execution.with_max_retry_delay(-3)
+  let assert Error(execution.InvalidConfig(errors)) =
+    execution.run(workflow, 0, config)
+  errors
+  |> should.equal([
+    execution.MaxConcurrencyNotPositive(-1),
+    execution.DeadlineNotPositive(-5),
+    execution.StepTimeoutNotPositive(-2),
+    execution.SettleTimeoutNegative(-1),
+    execution.CleanupTimeoutNotPositive(-1),
+    execution.MaxRetryDelayNegative(-3),
+  ])
+  list.each(errors, fn(error) {
+    { execution.describe_config_error(error) != "" } |> should.be_true
+  })
+  execution.describe_config_error(execution.MaxRetryDelayNegative(-3))
+  |> should.equal(
+    "the retry delay cap must not be negative (with_max_retry_delay), got -3",
+  )
+}
+
+/// Every setter is accepted at its boundary value, and `without_step_timeout`
+/// is the explicit opt-out of the default per-attempt timeout.
+pub fn boundary_values_are_accepted_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
+    })
+  let config =
+    execution.config()
+    |> execution.with_max_concurrency(1)
+    |> execution.with_deadline(10_000)
+    |> execution.with_step_timeout(1000)
+    |> execution.without_step_timeout
+    |> execution.with_settle_timeout(0)
+    |> execution.with_cleanup_timeout(1)
+    |> execution.with_max_retry_delay(0)
+  let assert Ok(execution.Completed(3)) = execution.run(workflow, 3, config)
+}
+
+/// A `RetryAfter` delay above the cap is shortened to the cap: with a cap of
+/// 10 ms, a requested hour-long backoff retries at once and the run ends.
+pub fn retry_after_delay_is_capped_test() {
+  let attempts = probe.new_counter()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("flaky", fn(x: Int) {
+          probe.counter_enter(attempts)
+          case probe.total_entries(attempts) {
+            1 -> Error("first attempt fails")
+            _ -> Ok(x)
+          }
+        })
+        |> saga.compensate(
+          max_attempts: 2,
+          with: fn(_input, _failure, _attempt) { saga.RetryAfter(3_600_000) },
+        ),
+      )
+    })
+  let config = execution.config() |> execution.with_max_retry_delay(10)
+  let assert Ok(execution.Completed(7)) = execution.run(workflow, 7, config)
+  probe.total_entries(attempts) |> should.equal(2)
+}
+
+/// The default cap is 300 seconds: a decision asking for longer is clamped
+/// and its compensation event says so.
+pub fn default_retry_delay_cap_is_five_minutes_test() {
+  let delays = process.new_subject()
+  let attempts = probe.new_counter()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("flaky", fn(x: Int) {
+          probe.counter_enter(attempts)
+          case probe.total_entries(attempts) {
+            1 -> Error("first attempt fails")
+            _ -> Ok(x)
+          }
+        })
+        |> saga.compensate(
+          max_attempts: 2,
+          with: fn(_input, _failure, _attempt) { saga.RetryAfter(10_000_000) },
+        ),
+      )
+    })
+  let assert Ok(sinal.SubscriptionCompletion(Nil, [])) =
+    sinal.with_subscriptions(
+      sinal.subscriptions([
+        sinal.subscription(telemetry.compensation_stopped(), fn(_m, d) {
+          process.send(delays, #(d.retry_delay, d.retry_delay_capped))
+        }),
+      ]),
+      fn() {
+        let assert Ok(exec) = execution.start(workflow, 1, execution.config())
+        let assert Ok(#(Some(300_000), True)) = process.receive(delays, 5000)
+        execution.cancel(exec)
+        let assert Ok(execution.Cancelled(..)) = execution.await(exec, 10_000)
+        Nil
+      },
     )
-  case execution.validate(config) {
-    Error(errors) -> {
-      list.length(errors) |> should.equal(5)
-      list.any(errors, fn(e) {
-        case e {
-          execution.MaxConcurrencyNotPositive(-1) -> True
-          _ -> False
-        }
-      })
-      |> should.be_true
-      list.any(errors, fn(e) {
-        case e {
-          execution.DeadlineNotPositive(-5) -> True
-          _ -> False
-        }
-      })
-      |> should.be_true
-      list.any(errors, fn(e) {
-        case e {
-          execution.StepTimeoutNotPositive(-2) -> True
-          _ -> False
-        }
-      })
-      |> should.be_true
-      list.any(errors, fn(e) {
-        case e {
-          execution.SettleTimeoutNegative(-1) -> True
-          _ -> False
-        }
-      })
-      |> should.be_true
-      list.any(errors, fn(e) {
-        case e {
-          execution.CleanupTimeoutNotPositive(-1) -> True
-          _ -> False
-        }
-      })
-      |> should.be_true
-    }
-    Ok(_) -> panic as "expected Error"
-  }
 }
 
 pub fn concurrent_runs_are_isolated_test() {

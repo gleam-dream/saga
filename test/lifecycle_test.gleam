@@ -1,6 +1,5 @@
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{Some}
 import gleam/string
 import gleeunit/should
 import saga
@@ -49,11 +48,9 @@ pub fn deadline_interrupts_run_test() {
     })
 
   let config =
-    execution.Config(
-      ..execution.config(),
-      deadline: Some(50),
-      settle_timeout: 0,
-    )
+    execution.config()
+    |> execution.with_deadline(50)
+    |> execution.with_settle_timeout(0)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
@@ -83,11 +80,9 @@ pub fn deadline_during_backoff_test() {
     })
 
   let config =
-    execution.Config(
-      ..execution.config(),
-      deadline: Some(50),
-      settle_timeout: 0,
-    )
+    execution.config()
+    |> execution.with_deadline(50)
+    |> execution.with_settle_timeout(0)
 
   let assert Ok(execution.Failed(cause, _settlement)) =
     execution.run(workflow, 0, config)
@@ -225,7 +220,7 @@ pub fn undo_timeout_recorded_and_rollback_continues_test() {
       a |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
     })
 
-  let config = execution.Config(..execution.config(), cleanup_timeout: 50)
+  let config = execution.config() |> execution.with_cleanup_timeout(50)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
@@ -256,7 +251,7 @@ pub fn compensation_timeout_recorded_test() {
       )
     })
 
-  let config = execution.Config(..execution.config(), cleanup_timeout: 50)
+  let config = execution.config() |> execution.with_cleanup_timeout(50)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
@@ -316,11 +311,9 @@ pub fn cancel_with_active_siblings_test() {
   // scheduler-count default) so the test passes under a single-scheduler
   // `+S 1:1` run too.
   let config =
-    execution.Config(
-      ..execution.config(),
-      settle_timeout: 100,
-      max_concurrency: 2,
-    )
+    execution.config()
+    |> execution.with_settle_timeout(100)
+    |> execution.with_max_concurrency(2)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_) = probe.wait_entered(releasable_gate, 10_000)

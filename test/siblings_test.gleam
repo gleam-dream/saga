@@ -45,7 +45,7 @@ pub fn failure_with_active_siblings_settles_test() {
   // to happen at all — `max_concurrency` is set explicitly (rather than
   // relying on `config()`'s scheduler-count default) so this passes under
   // a single-scheduler `+S 1:1` run too.
-  let config = execution.Config(..execution.config(), max_concurrency: 2)
+  let config = execution.config() |> execution.with_max_concurrency(2)
   probe.with_run(workflow, 0, config, fn(exec) {
     // Let the slow sibling start, then release it once the run has already
     // failed via the fast sibling.

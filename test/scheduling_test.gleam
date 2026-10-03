@@ -95,7 +95,7 @@ pub fn max_concurrency_bounds_running_attempts_test() {
       saga.all(first, rest)
     })
 
-  let config = execution.Config(..execution.config(), max_concurrency: 3)
+  let config = execution.config() |> execution.with_max_concurrency(3)
 
   probe.with_run(workflow, 0, config, fn(exec) {
     // Wait until exactly 3 are attempting (bounded by max_concurrency).
@@ -197,7 +197,7 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
       let c = input |> saga.perform(gated("c", gate))
       saga.all(a, [d, b, c])
     })
-  let cfg = execution.Config(..execution.config(), max_concurrency: 2)
+  let cfg = execution.config() |> execution.with_max_concurrency(2)
 
   // Every wait below is a lower-bound "poll until true" (or a plain
   // completion wait), never paired with an upper-bound timing assertion —
@@ -302,7 +302,7 @@ pub fn siblings_admitted_in_builder_order_test() {
       saga.all(first, rest)
     })
 
-  let config = execution.Config(..execution.config(), max_concurrency: 1)
+  let config = execution.config() |> execution.with_max_concurrency(1)
   let assert Ok(execution.Completed(_)) = execution.run(workflow, 0, config)
 
   let order =

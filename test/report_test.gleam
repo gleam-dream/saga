@@ -212,11 +212,9 @@ pub fn owner_death_reports_an_interrupted_compensation_test() {
   let log = process.new_subject()
   let report = process.new_subject()
   let config =
-    execution.Config(
-      ..execution.config(),
-      settle_timeout: 0,
-      cleanup_timeout: 50,
-    )
+    execution.config()
+    |> execution.with_settle_timeout(0)
+    |> execution.with_cleanup_timeout(50)
   let #(owner, run) =
     start_owned_elsewhere(trip(gate, log), Hangs, config, report)
 
@@ -386,7 +384,7 @@ pub fn start_reporting_refuses_an_invalid_config_test() {
     execution.start_reporting(
       trip(gate, log),
       Releases,
-      execution.Config(..execution.config(), max_concurrency: 0),
+      execution.config() |> execution.with_max_concurrency(0),
       to: report,
     )
   let assert Error(Nil) = process.receive(report, 0)

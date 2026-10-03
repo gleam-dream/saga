@@ -6,6 +6,19 @@
 //// attach a handler to it with `sinal.observe` or `sinal.attach`. This
 //// module owns the events, not handler registration.
 ////
+//// Every metadata record carries:
+////
+//// - `workflow`: the workflow's name;
+//// - `run`: this VM's id for one run; a durable execution gets a new one on
+////   every `durable.drive`;
+//// - `execution`: the durable execution id given to
+////   `durable.start_or_reconnect`, or `None` for a local run;
+//// - `correlation`: the `sinal/correlation` value set with
+////   `execution.with_correlation` or `durable.with_correlation`, or `None`
+////   when the caller set none.
+////
+//// Read metadata fields by label: a later release may add fields.
+////
 //// A run's coordinator emits each event after the state change it
 //// describes, with `sinal.emit`. Handlers run synchronously in the
 //// coordinator process unless the application routes the `saga` prefix to
@@ -13,26 +26,33 @@
 //// never control a run.
 ////
 //// ```gleam
-//// import saga/observation
+//// import saga/telemetry
 //// import sinal
 ////
 //// let attachment =
-////   sinal.observe(observation.run_stopped(), fn(_measurements, metadata) {
-////     log_outcome(metadata.workflow, metadata.outcome)
+////   sinal.observe(telemetry.run_stopped(), fn(_measurements, metadata) {
+////     log_outcome(metadata.correlation, metadata.workflow, metadata.outcome)
 ////   })
 //// ```
 
+import gleam/option.{type Option}
 import sinal.{type Event}
+import sinal/correlation.{type Correlation}
 import sinal/fields
 
-/// `[saga, run, start]` measurements: native monotonic system time.
+/// `[saga, run, start]` measurements: native system time in milliseconds.
 pub type RunStartMeasurements {
   RunStartMeasurements(system_time: Int)
 }
 
-/// `[saga, run, start]` metadata: the workflow's name and this run's id.
+/// `[saga, run, start]` metadata.
 pub type RunMetadata {
-  RunMetadata(workflow: String, run: Int)
+  RunMetadata(
+    workflow: String,
+    run: Int,
+    execution: Option(String),
+    correlation: Option(Correlation),
+  )
 }
 
 /// `[saga, run, stop]` measurements: total duration and settlement counts.
@@ -45,41 +65,59 @@ pub type RunStopMeasurements {
   )
 }
 
-/// The closed set of ways a run can end, for `[saga, run, stop]` metadata.
+/// The closed set of ways a run can end. `execution.kind` returns it for an
+/// `execution.Outcome`, and `[saga, run, stop]` carries it.
 pub type OutcomeKind {
   OutcomeCompleted
+  OutcomeCompletedWithUnknownEffects
   OutcomeFailed
   OutcomeCancelled
   OutcomeUnresolved
 }
 
-/// `[saga, run, stop]` metadata: the workflow, the run, and its outcome kind.
+/// `[saga, run, stop]` metadata.
 pub type RunStopMetadata {
-  RunStopMetadata(workflow: String, run: Int, outcome: OutcomeKind)
+  RunStopMetadata(
+    workflow: String,
+    run: Int,
+    execution: Option(String),
+    correlation: Option(Correlation),
+    outcome: OutcomeKind,
+  )
 }
 
-/// `[saga, step, start]` measurements: native monotonic system time.
+/// `[saga, step, start]` measurements: native system time in milliseconds.
 pub type StepStartMeasurements {
   StepStartMeasurements(system_time: Int)
 }
 
-/// Shared metadata shape for a step's start: workflow, run, step address
-/// (rendered with `saga.address_to_string`), and 1-based attempt number.
+/// `[saga, step, start]` metadata: the step address (rendered with
+/// `saga.address_to_string`) and the 1-based attempt number.
 pub type StepMetadata {
-  StepMetadata(workflow: String, run: Int, step: String, attempt: Int)
+  StepMetadata(
+    workflow: String,
+    run: Int,
+    execution: Option(String),
+    correlation: Option(Correlation),
+    step: String,
+    attempt: Int,
+  )
 }
 
 /// `[saga, step, stop]`, `[saga, step, compensate, stop]`, and
 /// `[saga, step, undo, stop]` share this measurement shape: the duration of
-/// the attempt, compensation decision, or undo action.
+/// the attempt, compensation decision, or undo action, in milliseconds.
 pub type StepStopMeasurements {
   StepStopMeasurements(duration: Int)
 }
 
 /// The closed set of ways one attempt can end, for `[saga, step, stop]`.
+/// `AttemptUnknown` is a returned error that `saga.unknown_when` classified
+/// as a possible effect.
 pub type AttemptKind {
   AttemptSucceeded
   AttemptFailed
+  AttemptUnknown
   AttemptCrashed
   AttemptTimedOut
   AttemptInterrupted
@@ -90,6 +128,8 @@ pub type StepStopMetadata {
   StepStopMetadata(
     workflow: String,
     run: Int,
+    execution: Option(String),
+    correlation: Option(Correlation),
     step: String,
     attempt: Int,
     result: AttemptKind,
@@ -107,14 +147,22 @@ pub type DecisionKind {
   DecisionTimedOut
 }
 
-/// `[saga, step, compensate, stop]` metadata.
+/// `[saga, step, compensate, stop]` metadata. `retry_delay` is the delay,
+/// in milliseconds, that a `RetryAfter` decision was scheduled with after
+/// the `execution.with_max_retry_delay` cap, and `retry_delay_capped` is
+/// `True` when the cap shortened the requested delay. They are `None` and
+/// `False` for every other decision.
 pub type CompensationMetadata {
   CompensationMetadata(
     workflow: String,
     run: Int,
+    execution: Option(String),
+    correlation: Option(Correlation),
     step: String,
     attempt: Int,
     decision: DecisionKind,
+    retry_delay: Option(Int),
+    retry_delay_capped: Bool,
   )
 }
 
@@ -129,12 +177,23 @@ pub type UndoKind {
 
 /// `[saga, step, undo, stop]` metadata.
 pub type UndoMetadata {
-  UndoMetadata(workflow: String, run: Int, step: String, result: UndoKind)
+  UndoMetadata(
+    workflow: String,
+    run: Int,
+    execution: Option(String),
+    correlation: Option(Correlation),
+    step: String,
+    result: UndoKind,
+  )
 }
 
-fn outcome_kind_to_string(kind: OutcomeKind) -> String {
+/// The stable name of an outcome kind, as `[saga, run, stop]` encodes it:
+/// `"completed"`, `"completed_with_unknown_effects"`, `"failed"`,
+/// `"cancelled"` or `"unresolved"`.
+pub fn outcome_kind_name(kind: OutcomeKind) -> String {
   case kind {
     OutcomeCompleted -> "completed"
+    OutcomeCompletedWithUnknownEffects -> "completed_with_unknown_effects"
     OutcomeFailed -> "failed"
     OutcomeCancelled -> "cancelled"
     OutcomeUnresolved -> "unresolved"
@@ -145,6 +204,7 @@ fn attempt_kind_to_string(kind: AttemptKind) -> String {
   case kind {
     AttemptSucceeded -> "succeeded"
     AttemptFailed -> "failed"
+    AttemptUnknown -> "unknown"
     AttemptCrashed -> "crashed"
     AttemptTimedOut -> "timed_out"
     AttemptInterrupted -> "interrupted"
@@ -171,6 +231,10 @@ fn undo_kind_to_string(kind: UndoKind) -> String {
   }
 }
 
+fn execution_field() -> fields.Fields(Option(String)) {
+  fields.optional(fields.string("execution"))
+}
+
 /// The `[saga, run, start]` event descriptor.
 pub fn run_started() -> Event(RunStartMeasurements, RunMetadata) {
   let measurements = {
@@ -184,7 +248,13 @@ pub fn run_started() -> Event(RunStartMeasurements, RunMetadata) {
       m.workflow
     })
     use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
-    fields.success(RunMetadata(workflow:, run:))
+    use execution <- fields.include(execution_field(), get: fn(m) {
+      m.execution
+    })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
+    fields.success(RunMetadata(workflow:, run:, execution:, correlation:))
   }
   sinal.event(["saga", "run", "start"], measurements, metadata)
 }
@@ -214,15 +284,33 @@ pub fn run_stopped() -> Event(RunStopMeasurements, RunStopMetadata) {
       m.workflow
     })
     use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use execution <- fields.include(execution_field(), get: fn(m) {
+      m.execution
+    })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
     use outcome <- fields.include(
       fields.enum(
         "outcome",
-        [OutcomeCompleted, OutcomeFailed, OutcomeCancelled, OutcomeUnresolved],
-        outcome_kind_to_string,
+        [
+          OutcomeCompleted,
+          OutcomeCompletedWithUnknownEffects,
+          OutcomeFailed,
+          OutcomeCancelled,
+          OutcomeUnresolved,
+        ],
+        outcome_kind_name,
       ),
       get: fn(m) { m.outcome },
     )
-    fields.success(RunStopMetadata(workflow:, run:, outcome:))
+    fields.success(RunStopMetadata(
+      workflow:,
+      run:,
+      execution:,
+      correlation:,
+      outcome:,
+    ))
   }
   sinal.event(["saga", "run", "stop"], measurements, metadata)
 }
@@ -240,11 +328,24 @@ pub fn step_started() -> Event(StepStartMeasurements, StepMetadata) {
       m.workflow
     })
     use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use execution <- fields.include(execution_field(), get: fn(m) {
+      m.execution
+    })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
     use attempt <- fields.include(fields.int("attempt"), get: fn(m) {
       m.attempt
     })
-    fields.success(StepMetadata(workflow:, run:, step:, attempt:))
+    fields.success(StepMetadata(
+      workflow:,
+      run:,
+      execution:,
+      correlation:,
+      step:,
+      attempt:,
+    ))
   }
   sinal.event(["saga", "step", "start"], measurements, metadata)
 }
@@ -256,6 +357,12 @@ pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
       m.workflow
     })
     use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use execution <- fields.include(execution_field(), get: fn(m) {
+      m.execution
+    })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
     use attempt <- fields.include(fields.int("attempt"), get: fn(m) {
       m.attempt
@@ -266,6 +373,7 @@ pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
         [
           AttemptSucceeded,
           AttemptFailed,
+          AttemptUnknown,
           AttemptCrashed,
           AttemptTimedOut,
           AttemptInterrupted,
@@ -274,7 +382,15 @@ pub fn step_stopped() -> Event(StepStopMeasurements, StepStopMetadata) {
       ),
       get: fn(m) { m.result },
     )
-    fields.success(StepStopMetadata(workflow:, run:, step:, attempt:, result:))
+    fields.success(StepStopMetadata(
+      workflow:,
+      run:,
+      execution:,
+      correlation:,
+      step:,
+      attempt:,
+      result:,
+    ))
   }
   sinal.event(["saga", "step", "stop"], stop_measurements(), metadata)
 }
@@ -289,6 +405,12 @@ pub fn compensation_stopped() -> Event(
       m.workflow
     })
     use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use execution <- fields.include(execution_field(), get: fn(m) {
+      m.execution
+    })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
     use attempt <- fields.include(fields.int("attempt"), get: fn(m) {
       m.attempt
@@ -308,12 +430,24 @@ pub fn compensation_stopped() -> Event(
       ),
       get: fn(m) { m.decision },
     )
+    use retry_delay <- fields.include(
+      fields.optional(fields.int("retry_delay")),
+      get: fn(m) { m.retry_delay },
+    )
+    use retry_delay_capped <- fields.include(
+      fields.bool("retry_delay_capped"),
+      get: fn(m) { m.retry_delay_capped },
+    )
     fields.success(CompensationMetadata(
       workflow:,
       run:,
+      execution:,
+      correlation:,
       step:,
       attempt:,
       decision:,
+      retry_delay:,
+      retry_delay_capped:,
     ))
   }
   sinal.event(
@@ -330,6 +464,12 @@ pub fn undo_stopped() -> Event(StepStopMeasurements, UndoMetadata) {
       m.workflow
     })
     use run <- fields.include(fields.int("run"), get: fn(m) { m.run })
+    use execution <- fields.include(execution_field(), get: fn(m) {
+      m.execution
+    })
+    use correlation <- fields.include(correlation.field(), get: fn(m) {
+      m.correlation
+    })
     use step <- fields.include(fields.string("step"), get: fn(m) { m.step })
     use result <- fields.include(
       fields.enum(
@@ -339,7 +479,14 @@ pub fn undo_stopped() -> Event(StepStopMeasurements, UndoMetadata) {
       ),
       get: fn(m) { m.result },
     )
-    fields.success(UndoMetadata(workflow:, run:, step:, result:))
+    fields.success(UndoMetadata(
+      workflow:,
+      run:,
+      execution:,
+      correlation:,
+      step:,
+      result:,
+    ))
   }
   sinal.event(["saga", "step", "undo", "stop"], stop_measurements(), metadata)
 }

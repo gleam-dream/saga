@@ -413,7 +413,7 @@ fn run_d3() -> #(
   // waiting) to happen at all — `max_concurrency` is set explicitly (rather
   // than relying on `config()`'s scheduler-count default) so this passes
   // under a single-scheduler `+S 1:1` run too.
-  let config = execution.Config(..execution.config(), max_concurrency: 3)
+  let config = execution.config() |> execution.with_max_concurrency(3)
   let assert Ok(outcome) = execution.run(workflow, 0, config)
   #(outcome, snapshot(events))
 }
@@ -646,7 +646,7 @@ fn run_d6() -> #(execution.Outcome(List(Int), DemoError, DemoUndoError), Int) {
     execution.run(
       workflow,
       0,
-      execution.Config(..execution.config(), max_concurrency: 3),
+      execution.config() |> execution.with_max_concurrency(3),
     )
   #(outcome, peak_snapshot(tracker))
 }

@@ -19,7 +19,7 @@
 /// in reverse completion order, undoing one entry at a time, bounded by
 /// `cleanup_timeout` per entry, retaining every undo failure.
 ///
-/// `saga/observation` events are emitted after each corresponding state
+/// `saga/telemetry` events are emitted after each corresponding state
 /// transition, from this process; a raising Sinal handler cannot change the
 /// run's outcome (`sinal.emit`'s own dispatch isolates handler failure).
 import gleam/dict.{type Dict}
@@ -40,8 +40,9 @@ import saga/internal/node.{
   TimedOut,
 }
 import saga/internal/store.{type Store}
-import saga/observation
+import saga/telemetry
 import sinal
+import sinal/correlation.{type Correlation}
 
 /// One journal entry: a completed node's address and its undo thunk, if it
 /// has one. The journal's head is the most recently completed node, so
@@ -260,6 +261,11 @@ type NodeRunState {
 
 type RunState(o, e, u) {
   RunState(
+    // The ceiling applied to a `RetryAfter` delay (see `retry_after`).
+    max_retry_delay: Int,
+    // Labels copied into every telemetry event of this run.
+    correlation: Option(Correlation),
+    execution: Option(String),
     persistence: Option(Session(e, u)),
     dispatch: List(Subject(Nil)),
     pending_starts: List(Int),
@@ -351,6 +357,21 @@ pub type Trigger(e) {
   TriggerCancel(reason: CancelReason)
 }
 
+/// The validated bounds and labels of one run. `execution` is the durable
+/// execution id, `None` for a local run.
+pub type Settings {
+  Settings(
+    max_concurrency: Int,
+    deadline: Option(Int),
+    step_timeout: Option(Int),
+    settle_timeout: Int,
+    cleanup_timeout: Int,
+    max_retry_delay: Int,
+    correlation: Option(Correlation),
+    execution: Option(String),
+  )
+}
+
 /// Spawns a coordinator for one run and returns once it is alive, with its
 /// pid and the run's id. `build_graph` calls `saga.for_run` for this one
 /// run: the workflow's already-built node graph (built once, at `define`)
@@ -363,11 +384,7 @@ pub type Trigger(e) {
 pub fn start(
   workflow_name workflow_name: String,
   owner owner: Pid,
-  max_concurrency max_concurrency: Int,
-  deadline deadline: Option(Int),
-  step_timeout step_timeout: Option(Int),
-  settle_timeout settle_timeout: Int,
-  cleanup_timeout cleanup_timeout: Int,
+  settings settings: Settings,
   build_graph build_graph: fn() ->
     #(
       Dict(Int, Node(e, u)),
@@ -387,11 +404,7 @@ pub fn start(
         workflow_name,
         owner,
         run_id,
-        max_concurrency,
-        deadline,
-        step_timeout,
-        settle_timeout,
-        cleanup_timeout,
+        settings,
         build_graph,
         deliver,
         control_subject_out,
@@ -415,11 +428,7 @@ fn run(
   workflow_name: String,
   owner: Pid,
   run_id: Int,
-  max_concurrency: Int,
-  deadline: Option(Int),
-  step_timeout: Option(Int),
-  settle_timeout: Int,
-  cleanup_timeout: Int,
+  settings: Settings,
   build_graph: fn() ->
     #(
       Dict(Int, Node(e, u)),
@@ -453,6 +462,16 @@ fn run(
         _ -> heap
       }
     })
+  let Settings(
+    max_concurrency:,
+    deadline:,
+    step_timeout:,
+    settle_timeout:,
+    cleanup_timeout:,
+    max_retry_delay:,
+    correlation:,
+    execution:,
+  ) = settings
   let deadline_timer = case deadline {
     None -> None
     Some(ms) -> {
@@ -461,9 +480,11 @@ fn run(
     }
   }
   let start_time = ffi.monotonic_time()
-  emit_run_started(workflow_name, run_id)
   let initial =
     RunState(
+      max_retry_delay: max_retry_delay,
+      correlation: correlation,
+      execution: execution,
       persistence: persistence,
       dispatch: [],
       pending_starts: [],
@@ -500,6 +521,7 @@ fn run(
       start_time: start_time,
       unknown_effects: [],
     )
+  emit_run_started(initial)
   let restored = case persistence {
     None -> Ok(initial)
     Some(session) ->
@@ -984,7 +1006,7 @@ fn handle_attempt_done(
             ),
           )
         AttemptSucceeded(commit) ->
-          commit_success(state, node_id, commit, observation.AttemptSucceeded)
+          commit_success(state, node_id, commit, telemetry.AttemptSucceeded)
         AttemptFailed(failure, recover) ->
           case recover {
             None ->
@@ -1007,11 +1029,11 @@ fn handle_attempt_done(
   }
 }
 
-fn attempt_result_kind(failure: AttemptFailure(e)) -> observation.AttemptKind {
+fn attempt_result_kind(failure: AttemptFailure(e)) -> telemetry.AttemptKind {
   case failure {
-    Returned(_) -> observation.AttemptFailed
-    Crashed(_) -> observation.AttemptCrashed
-    TimedOut -> observation.AttemptTimedOut
+    Returned(_) -> telemetry.AttemptFailed
+    Crashed(_) -> telemetry.AttemptCrashed
+    TimedOut -> telemetry.AttemptTimedOut
   }
 }
 
@@ -1019,7 +1041,7 @@ fn commit_success(
   state: RunState(o, e, u),
   node_id: Int,
   commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
-  step_kind: observation.AttemptKind,
+  step_kind: telemetry.AttemptKind,
 ) -> RunState(o, e, u) {
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let attempt_number = attempt_number_for(state, node_id)
@@ -1196,6 +1218,7 @@ fn handle_recovery_done(
       )) = dict.get(state.state, node_id)
       let assert Ok(n) = dict.get(state.nodes, node_id)
       let duration = duration_since_started(state, node_id)
+      let delay = retry_delay(state, recovery)
       case recovery {
         node.EBlocked(_) -> Nil
         _ ->
@@ -1204,6 +1227,7 @@ fn handle_recovery_done(
             n.address,
             attempt_number,
             decision_kind(recovery),
+            delay,
             duration,
           )
       }
@@ -1229,22 +1253,26 @@ fn handle_recovery_done(
             }
             False -> fail_terminal_retry_limit(state, node_id)
           }
-        ERetryAfter(ms), False ->
-          case attempt_number < n.max_attempts {
-            True -> {
+        ERetryAfter(_), False ->
+          case attempt_number < n.max_attempts, delay {
+            True, ScheduledDelay(ms, _) -> {
               let state = RunState(..state, running: state.running - 1)
               retry_after(state, node_id, attempt_number + 1, ms)
             }
-            False -> fail_terminal_retry_limit(state, node_id)
+            True, NoRetryDelay -> {
+              let state = RunState(..state, running: state.running - 1)
+              retry_now(state, node_id, attempt_number + 1)
+            }
+            False, _ -> fail_terminal_retry_limit(state, node_id)
           }
         EContinue(commit), _ ->
-          commit_success(state, node_id, commit, observation.AttemptSucceeded)
+          commit_success(state, node_id, commit, telemetry.AttemptSucceeded)
         EAbort(error), _ ->
           fail_terminal(
             state,
             node_id,
             node.Returned(error),
-            observation.AttemptFailed,
+            telemetry.AttemptFailed,
           )
         EAbortCleanup(error, cleanup_error), _ -> {
           let cleanup_failure =
@@ -1253,7 +1281,7 @@ fn handle_recovery_done(
           |> fail_terminal(
             node_id,
             node.Returned(error),
-            observation.AttemptFailed,
+            telemetry.AttemptFailed,
           )
           |> record_compensation_failure(cleanup_failure)
         }
@@ -1268,12 +1296,12 @@ fn handle_recovery_done(
   }
 }
 
-fn decision_kind(recovery: ErasedRecovery(e, u)) -> observation.DecisionKind {
+fn decision_kind(recovery: ErasedRecovery(e, u)) -> telemetry.DecisionKind {
   case recovery {
-    ERetry | ERetryAfter(_) -> observation.DecisionRetry
-    EContinue(_) -> observation.DecisionContinue
-    EAbort(_) | EAbortCleanup(_, _) -> observation.DecisionAbort
-    EHold(_) | node.EBlocked(_) -> observation.DecisionHold
+    ERetry | ERetryAfter(_) -> telemetry.DecisionRetry
+    EContinue(_) -> telemetry.DecisionContinue
+    EAbort(_) | EAbortCleanup(_, _) -> telemetry.DecisionAbort
+    EHold(_) | node.EBlocked(_) -> telemetry.DecisionHold
   }
 }
 
@@ -1300,10 +1328,7 @@ fn retry_after(
   next_attempt: Int,
   ms: Int,
 ) -> RunState(o, e, u) {
-  let delay = case ms < 0 {
-    True -> 0
-    False -> ms
-  }
+  let delay = ms
   let seq = ffi.unique_integer()
   let control = state.control
   process.send_after(control, delay, RetryFire(node_id, seq))
@@ -1375,7 +1400,7 @@ fn handle_task_crashed(
                 state,
                 node_id,
                 Crashed(crash),
-                observation.AttemptCrashed,
+                telemetry.AttemptCrashed,
               )
             Some(prepare) ->
               start_crash_recovery(state, node_id, prepare, Crashed(crash))
@@ -1390,7 +1415,7 @@ fn handle_task_crashed(
             StepCompensation(attempt_number),
             ActionCrashed(crash),
           )
-          |> fail_terminal(node_id, Crashed(crash), observation.AttemptCrashed)
+          |> fail_terminal(node_id, Crashed(crash), telemetry.AttemptCrashed)
           |> record_compensation_failure(compensation_failure)
         }
         _ -> state
@@ -1479,12 +1504,7 @@ fn handle_step_timeout_fired(
               // same attempt's real duration (its `started_at` was just
               // preserved above) — a single, correct event, so nothing
               // extra is needed here.
-              fail_terminal(
-                state,
-                node_id,
-                TimedOut,
-                observation.AttemptTimedOut,
-              )
+              fail_terminal(state, node_id, TimedOut, telemetry.AttemptTimedOut)
             Some(prepare) -> {
               // A decider exists: the decision's own resolution
               // (`fail_terminal`/`commit_success`, from
@@ -1501,7 +1521,7 @@ fn handle_step_timeout_fired(
                 state,
                 n.address,
                 attempt_number,
-                observation.AttemptTimedOut,
+                telemetry.AttemptTimedOut,
                 duration,
               )
               start_crash_recovery(state, node_id, prepare, TimedOut)
@@ -1535,7 +1555,7 @@ fn handle_cleanup_timeout_fired(
             StepCompensation(attempt_number),
             ActionTimedOut,
           )
-          |> fail_terminal(node_id, TimedOut, observation.AttemptTimedOut)
+          |> fail_terminal(node_id, TimedOut, telemetry.AttemptTimedOut)
           |> record_compensation_failure(compensation_failure)
         }
         _ -> state
@@ -1607,7 +1627,7 @@ fn fail_terminal(
   state: RunState(o, e, u),
   node_id: Int,
   failure: AttemptFailure(e),
-  step_kind: observation.AttemptKind,
+  step_kind: telemetry.AttemptKind,
 ) -> RunState(o, e, u) {
   let address = node_address(state, node_id)
   let attempt_number = attempt_number_for(state, node_id)
@@ -1836,7 +1856,7 @@ fn handle_settle_fired(
             acc,
             address,
             attempt_number,
-            observation.AttemptInterrupted,
+            telemetry.AttemptInterrupted,
             duration,
           )
           let acc =
@@ -2019,12 +2039,12 @@ fn handle_known_undo(
   }
 }
 
-fn undo_outcome_kind(outcome: UndoOutcome(u)) -> observation.UndoKind {
+fn undo_outcome_kind(outcome: UndoOutcome(u)) -> telemetry.UndoKind {
   case outcome {
-    UndoBlocked(_) -> observation.UndoCrashedKind
-    UndoOk -> observation.UndoUndone
-    UndoErr(_) -> observation.UndoFailedKind
-    UndoCrash(_) -> observation.UndoCrashedKind
+    UndoBlocked(_) -> telemetry.UndoCrashedKind
+    UndoOk -> telemetry.UndoUndone
+    UndoErr(_) -> telemetry.UndoFailedKind
+    UndoCrash(_) -> telemetry.UndoCrashedKind
   }
 }
 
@@ -2043,7 +2063,7 @@ fn handle_undo_timeout(
       process.kill(pid)
       let address = node_address(state, node_id)
       let duration = duration_since_started(state, node_id)
-      emit_undo_stopped(state, address, observation.UndoTimedOutKind, duration)
+      emit_undo_stopped(state, address, telemetry.UndoTimedOutKind, duration)
       let state =
         RunState(
           ..state,
@@ -2145,12 +2165,16 @@ fn address_to_string(address: StepAddress) -> String {
   }
 }
 
-fn emit_run_started(workflow_name: String, run_id: Int) -> Nil {
-  let event = observation.run_started()
+fn emit_run_started(state: RunState(o, e, u)) -> Nil {
   sinal.emit(
-    event,
-    observation.RunStartMeasurements(system_time: ffi.system_time()),
-    observation.RunMetadata(workflow: workflow_name, run: run_id),
+    telemetry.run_started(),
+    telemetry.RunStartMeasurements(system_time: ffi.system_time()),
+    telemetry.RunMetadata(
+      workflow: state.workflow_name,
+      run: state.run_id,
+      execution: state.execution,
+      correlation: state.correlation,
+    ),
   )
 }
 
@@ -2174,28 +2198,35 @@ fn emit_run_stopped(
       list.length(settlement.interrupted),
     )
   }
-  let kind = case outcome {
-    Completed(_) -> observation.OutcomeCompleted
-    CompletedWithUnknownEffects(_, _) -> observation.OutcomeCompleted
-    Failed(_, _) -> observation.OutcomeFailed
-    Cancelled(_, _) -> observation.OutcomeCancelled
-    Unresolved(_, _, _) -> observation.OutcomeUnresolved
-  }
-  let event = observation.run_stopped()
   sinal.emit(
-    event,
-    observation.RunStopMeasurements(
+    telemetry.run_stopped(),
+    telemetry.RunStopMeasurements(
       duration: duration,
       undone: undone,
       undo_failures: undo_failures,
       interrupted: interrupted,
     ),
-    observation.RunStopMetadata(
+    telemetry.RunStopMetadata(
       workflow: state.workflow_name,
       run: state.run_id,
-      outcome: kind,
+      execution: state.execution,
+      correlation: state.correlation,
+      outcome: outcome_kind(outcome),
     ),
   )
+}
+
+/// The closed classification of an outcome, shared by `[saga, run, stop]`
+/// and `execution.kind`.
+pub fn outcome_kind(outcome: Outcome(o, e, u)) -> telemetry.OutcomeKind {
+  case outcome {
+    Completed(_) -> telemetry.OutcomeCompleted
+    CompletedWithUnknownEffects(_, _) ->
+      telemetry.OutcomeCompletedWithUnknownEffects
+    Failed(_, _) -> telemetry.OutcomeFailed
+    Cancelled(_, _) -> telemetry.OutcomeCancelled
+    Unresolved(_, _, _) -> telemetry.OutcomeUnresolved
+  }
 }
 
 fn emit_step_started(
@@ -2203,13 +2234,14 @@ fn emit_step_started(
   address: StepAddress,
   attempt: Int,
 ) -> Nil {
-  let event = observation.step_started()
   sinal.emit(
-    event,
-    observation.StepStartMeasurements(system_time: ffi.system_time()),
-    observation.StepMetadata(
+    telemetry.step_started(),
+    telemetry.StepStartMeasurements(system_time: ffi.system_time()),
+    telemetry.StepMetadata(
       workflow: state.workflow_name,
       run: state.run_id,
+      execution: state.execution,
+      correlation: state.correlation,
       step: address_to_string(address),
       attempt: attempt,
     ),
@@ -2220,16 +2252,17 @@ fn emit_step_stopped(
   state: RunState(o, e, u),
   address: StepAddress,
   attempt: Int,
-  result: observation.AttemptKind,
+  result: telemetry.AttemptKind,
   duration: Int,
 ) -> Nil {
-  let event = observation.step_stopped()
   sinal.emit(
-    event,
-    observation.StepStopMeasurements(duration: duration),
-    observation.StepStopMetadata(
+    telemetry.step_stopped(),
+    telemetry.StepStopMeasurements(duration: duration),
+    telemetry.StepStopMetadata(
       workflow: state.workflow_name,
       run: state.run_id,
+      execution: state.execution,
+      correlation: state.correlation,
       step: address_to_string(address),
       attempt: attempt,
       result: result,
@@ -2241,19 +2274,27 @@ fn emit_compensation_stopped(
   state: RunState(o, e, u),
   address: StepAddress,
   attempt: Int,
-  decision: observation.DecisionKind,
+  decision: telemetry.DecisionKind,
+  retry: RetryDelay,
   duration: Int,
 ) -> Nil {
-  let event = observation.compensation_stopped()
+  let #(retry_delay, retry_delay_capped) = case retry {
+    NoRetryDelay -> #(None, False)
+    ScheduledDelay(delay, capped) -> #(Some(delay), capped)
+  }
   sinal.emit(
-    event,
-    observation.StepStopMeasurements(duration: duration),
-    observation.CompensationMetadata(
+    telemetry.compensation_stopped(),
+    telemetry.StepStopMeasurements(duration: duration),
+    telemetry.CompensationMetadata(
       workflow: state.workflow_name,
       run: state.run_id,
+      execution: state.execution,
+      correlation: state.correlation,
       step: address_to_string(address),
       attempt: attempt,
       decision: decision,
+      retry_delay: retry_delay,
+      retry_delay_capped: retry_delay_capped,
     ),
   )
 }
@@ -2261,20 +2302,42 @@ fn emit_compensation_stopped(
 fn emit_undo_stopped(
   state: RunState(o, e, u),
   address: StepAddress,
-  result: observation.UndoKind,
+  result: telemetry.UndoKind,
   duration: Int,
 ) -> Nil {
-  let event = observation.undo_stopped()
   sinal.emit(
-    event,
-    observation.StepStopMeasurements(duration: duration),
-    observation.UndoMetadata(
+    telemetry.undo_stopped(),
+    telemetry.StepStopMeasurements(duration: duration),
+    telemetry.UndoMetadata(
       workflow: state.workflow_name,
       run: state.run_id,
+      execution: state.execution,
+      correlation: state.correlation,
       step: address_to_string(address),
       result: result,
     ),
   )
+}
+
+/// The delay a `RetryAfter` decision is scheduled with: a requested delay
+/// below zero becomes zero, and one above `max_retry_delay` becomes
+/// `max_retry_delay`, reported as `capped`.
+type RetryDelay {
+  NoRetryDelay
+  ScheduledDelay(milliseconds: Int, capped: Bool)
+}
+
+fn retry_delay(
+  state: RunState(o, e, u),
+  recovery: ErasedRecovery(e, u),
+) -> RetryDelay {
+  case recovery {
+    ERetryAfter(ms) if ms > state.max_retry_delay ->
+      ScheduledDelay(state.max_retry_delay, True)
+    ERetryAfter(ms) if ms < 0 -> ScheduledDelay(0, False)
+    ERetryAfter(ms) -> ScheduledDelay(ms, False)
+    _ -> NoRetryDelay
+  }
 }
 
 /// Runtime-independent execution progress. Node positions refer to the checked
@@ -2314,11 +2377,7 @@ pub type Session(e, u) {
 /// functions serve local execution; ownership and storage belong to `session`.
 pub fn execute_saved(
   workflow_name: String,
-  max_concurrency: Int,
-  deadline: Option(Int),
-  step_timeout: Option(Int),
-  settle_timeout: Int,
-  cleanup_timeout: Int,
+  settings: Settings,
   build_graph: fn() ->
     #(
       Dict(Int, Node(e, u)),
@@ -2336,11 +2395,7 @@ pub fn execute_saved(
     workflow_name,
     process.self(),
     ffi.unique_integer(),
-    max_concurrency,
-    deadline,
-    step_timeout,
-    settle_timeout,
-    cleanup_timeout,
+    settings,
     build_graph,
     deliver,
     control_out,

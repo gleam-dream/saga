@@ -70,7 +70,7 @@ pub fn main() -> Nil {
       storage,
       reference,
       persistence,
-      execution.Config(..execution.config(), max_concurrency: 2),
+      execution.config() |> execution.with_max_concurrency(2),
     )
   case first_vm {
     True -> Nil
