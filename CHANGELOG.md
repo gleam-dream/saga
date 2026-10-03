@@ -6,7 +6,109 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
-### Added
+### Release API redesign (wave 3)
+
+Every breaking change below has a before and after in
+[docs/migration-wave-3.md](docs/migration-wave-3.md).
+
+#### Breaking
+
+- **`execution.Config` is opaque.** Build it with `execution.config()` and
+  `with_max_concurrency`, `with_deadline`, `with_step_timeout`,
+  `without_step_timeout`, `with_settle_timeout`, `with_cleanup_timeout`,
+  `with_max_retry_delay` and `with_correlation`. A record literal or record
+  update no longer compiles, so a new setting never breaks callers again.
+  `execution.validate` is gone: `run`, `start`, `start_reporting` and
+  `durable.drive` check the configuration and return `InvalidConfig` with
+  every violation (new: `MaxRetryDelayNegative`).
+- **`RetryAfter` delays are capped**, 300 000 ms by default
+  (`with_max_retry_delay`). A longer delay is shortened, and the
+  compensation event reports `retry_delay` and `retry_delay_capped`.
+- **Callbacks take one labelled record.** `saga.undo` receives
+  `UndoRequest(input, output, key)` and `saga.compensate` receives
+  `FailedAttempt(input, failure, attempt, attempts_left, key)`. `saga.effect`
+  receives an `EffectKey(idempotency, attempt, attempt_key)` whose
+  `idempotency` is the same for every attempt of a step, so it can be sent
+  downstream as an idempotency key (CHK-8). `saga.undo_effect`,
+  `saga.compensate_with_key` and `saga.Attempt` are removed.
+- **Persistence modifiers moved to `saga/durable`**, with labels:
+  `durable.recoverable(step, version:, input:, output:, resolve:)`,
+  `durable.restore_undo`, `durable.resolve_undo` (was `reconcile_undo`) and
+  `durable.resolve_compensation` (was `reconcile_compensation`). Effect and
+  undo resolvers answer `durable.Evidence`: `Completed`, `Failed`, `NotSent`
+  (authorizes a replay) or `MaybeSent` (suspends). A compensation resolver
+  receives the input and the failed attempt's `EffectKey` and returns
+  `Option(Recovery)`. `saga.EffectStatus`, `UndoStatus` and
+  `CompensationStatus` are removed. `saga.map_step_errors` keeps the codecs
+  and maps resolver answers forward instead of dropping them.
+- **One durable `Run` handle, one storage per store.** `durable.new(workflow,
+version:, input:, output:, error:, undo_error:)` replaces `prepare`.
+  `durable.start_or_reconnect(persistence, storage, id:, input:)` returns a
+  `Run`, which `drive`, `read`, `cancel`, `id` and `with_correlation` take;
+  `durable.reconnect` attaches by id. Storage operations take the execution
+  id, so one `Storage` serves a whole database pool. `Reference`,
+  `reference_id` and `ReferenceMismatch` are removed.
+- **`durable.drive(run, timeout:)` is bounded.** On timeout, and when its
+  caller exits, the runner stops: in-flight attempts are killed, the claim
+  is released and the last checkpoint stays (CHK-6). This is never
+  cancellation; the next `drive` resumes.
+- **Typed durable errors.** `StorageError` is `StorageFailure`;
+  `InvalidDefinition(String)` is `NotPersistable(List(PersistenceProblem))`;
+  `CodecFailure` carries a `Boundary` and a `codec.CodecError`;
+  `InvalidCheckpoint` carries a `CheckpointProblem`; `RecoveryRequired`
+  carries `durable.Required(step: StepAddress, action: execution.Action,
+key: EffectKey)`. New: `CheckpointTooLarge`, `InvalidTimeout`,
+  `DriveTimedOut`. `durable.error_kind` and `durable.describe_error`
+  classify and describe every error. `saga/reconciliation` is removed.
+- **The storage contract is opaque.** Adapters build a `Storage` with
+  `storage.new(create:, load:, claim:, commit:, release:, cancel:,
+unfinished:)`. `claim` returns an opaque `Claim` that `commit` and
+  `release` take, so ownership is a value and a database adapter needs no
+  registry of claiming processes (CHK-4, RA-6). `commit` takes a labelled
+  `Commit` with the execution's phase. `Record` is replaced by the opaque
+  `Stored`; `Io(String)` by `Unavailable(detail)` and `TimedOut`.
+- **`saga/codec`** encoders and decoders return a typed `CodecError`.
+  `codec.encode`, `decode` and `version` leave the public surface.
+- **`saga/observation` is renamed `saga/telemetry`.** Every metadata record
+  gains `execution` (the durable id) and `correlation`, and `OutcomeKind`
+  gains `OutcomeCompletedWithUnknownEffects`, which `run_stop` reports
+  instead of `OutcomeCompleted` for such runs.
+- **Memory and file adapters.** `memory.start`, `memory.supervised(name)`,
+  `memory.named(name)` and `memory.stop` replace `new` and `close`; the
+  store is a gleam_otp actor holding every execution, with 5 second calls.
+  `file.open` takes a directory and keeps one file per execution.
+- **Conformance.** `conformance.run(fresh, timeout:, owner_loss_within:)`
+  takes the adapter's owner-loss window, and fixtures are built with
+  `conformance.fixture(storage, cleanup:)`.
+- `execution.Crash` and `execution.StepAddress` aliases, `saga.CrashOrTimeout`
+  and `execution.validate` are removed.
+
+#### Added
+
+- `saga.unknown_when(step, classify)`: a returned error the classifier
+  marks, such as a payment that may have been charged, is named in
+  `unknown_effects` with `ActionReturnedUnknown`, so a retried success
+  becomes `CompletedWithUnknownEffects` (CHK-3, SD-1). The decider still
+  receives the typed error, and the record survives a durable restart.
+- `codec.json(version, encode, decoder)` over `gleam/json` with a fallible
+  encoder, `codec.int()` and `codec.describe_error`.
+- `execution.kind`, `execution.describe_cause`,
+  `execution.describe_config_error` and `saga.describe_definition_error`.
+- `durable.unfinished(storage, limit:)` lists executions that wait for a
+  driver; `storage.with_renewal` declares lease renewal, run by a heartbeat
+  linked to the runner; `storage.with_call_timeout` bounds each storage call
+  (5 000 ms by default); `durable.with_max_checkpoint_bytes` bounds each
+  checkpoint (16 MiB by default); `durable.with_config` and
+  `durable.with_correlation`.
+- The `saga_postgres` package (`integrations/saga_postgres`): a PostgreSQL
+  storage on the application's own `pog.Connection`, with its schema
+  migration, passing the storage conformance suite.
+- Dependencies: `gleam_json >= 3.0.0 and < 4.0.0`, `gleam_otp >= 1.0.0 and
+< 2.0.0`.
+
+### Earlier pre-release changes
+
+#### Added
 
 - **Breaking: the outcome names every action whose effect is unknown.**
   A consumer that must tell a caller whether a run's effects are known
@@ -96,7 +198,7 @@ increments toward the first local-execution release.
   test-controlled release is generic BEAM concurrency, not anything
   Saga-specific.
 
-### Changed
+#### Changed
 
 - **Built on the wave 2 Sinal API.** `saga/observation`'s descriptors use
   Sinal's record builder and `fields.enum`, and the coordinator calls
@@ -181,7 +283,7 @@ increments toward the first local-execution release.
   and unaffected by this change). Run time, admission, and validation
   order are unchanged.
 
-### Removed
+#### Removed
 
 - `execution.Cause.DefinitionChanged` and the definition-shape check it
   reported: with the build function evaluated exactly once, there is no
@@ -194,7 +296,7 @@ increments toward the first local-execution release.
   exhaustive `case` over `execution.Cause` must drop its `DefinitionChanged`
   arm.
 
-### Added
+#### Added
 
 - External acceptance package at `examples/order_consumer`: a separate
   Gleam package, depending on saga only through its public modules
@@ -238,7 +340,7 @@ increments toward the first local-execution release.
   `undo_stopped` event's `duration` is a real elapsed measurement instead
   of a hard-coded `0`.
 
-### Changed
+#### Changed
 
 - Removed the unreachable `Finishing` variant from `saga/execution.Phase`
   (and its internal mirror in `saga/internal/coordinator.Phase`). The
@@ -270,7 +372,7 @@ assert` panic.
   }
   ```
 
-### Fixed
+#### Fixed
 
 - `embed` did not check its re-invoked builder's returned port for a
   foreign scope before restoring the parent's own scope on it

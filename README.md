@@ -3,11 +3,13 @@
 A strongly-typed saga/DAG orchestrator for Gleam: typed dependency graphs
 instead of dynamic step maps.
 
-**Status:** unpublished local and optionally persistent workflow execution.
-One typed `saga.Workflow` supports concurrent DAGs and closed choices through
-the same runner. Persistence uses a storage contract with memory and reference
-file adapters; local execution needs no codecs or storage.
-See [DURABILITY.md](DURABILITY.md) for recovery and adapter guarantees.
+**Status:** unpublished. One typed `saga.Workflow` runs in memory with
+`saga/execution`, or with saved checkpoints with `saga/durable` over a
+storage adapter: memory, file, or PostgreSQL through the separate
+[`saga_postgres`](integrations/saga_postgres) package. Local runs need no
+codecs or storage. See [DURABILITY.md](DURABILITY.md) for recovery rules and
+the adapter contract, and [docs/migration-wave-3.md](docs/migration-wave-3.md)
+for the changes from the previous API.
 
 Behavioral reference: Reactor 1.0.6 (Elixir). Saga is a typed reimagining,
 not a port: dependencies are typed `Port` values checked by the compiler,
@@ -15,121 +17,218 @@ not names resolved at runtime.
 
 ## The common path
 
+Define the workflow once, at startup, and run it for each order; the order
+is the run's input, not part of the definition.
+
 ```gleam
 import saga
 import saga/execution
 
 pub type CheckoutError {
   OutOfStock
+  Declined
+  MaybeCharged
 }
 
 pub fn checkout() {
-  saga.define("checkout", fn(input) {
-    let reserved =
-      input
-      |> saga.perform(
-        saga.step("reserve_inventory", fn(id: String) {
-          case has_stock(id) {
-            True -> Ok(id)
-            False -> Error(OutOfStock)
-          }
-        })
-        |> saga.undo(fn(id, _reserved) { release_inventory(id) }),
-      )
-    reserved
-    |> saga.perform(saga.step("charge_payment", fn(id) { charge(id) }))
+  let reserve =
+    saga.step("reserve_inventory", reserve)
+    |> saga.undo(fn(undo) { release(undo.output) })
+  let charge =
+    saga.effect("charge_payment", fn(reservation, key) {
+      // `key.idempotency` is the same for every attempt of this step.
+      charge(reservation, idempotency_key: key.idempotency)
+    })
+    |> saga.unknown_when(fn(error) { error == MaybeCharged })
+    |> saga.compensate(max_attempts: 3, with: fn(failed) {
+      case failed.failure {
+        saga.Returned(MaybeCharged) -> saga.RetryAfter(500)
+        saga.Returned(error) -> saga.Abort(error)
+        saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
+      }
+    })
+  saga.define("checkout", fn(order) {
+    order |> saga.perform(reserve) |> saga.perform(charge)
   })
 }
 
-pub fn run_checkout(workflow, order_id: String) {
-  execution.run(workflow, order_id, execution.config())
+pub fn run_checkout(workflow, order) {
+  case execution.run(workflow, order, execution.config()) {
+    Ok(execution.Completed(receipt)) -> Ok(receipt)
+    Ok(outcome) -> Error(execution.unknown_effects(outcome))
+    Error(_run_error) -> Error([])
+  }
 }
 ```
 
-Define the workflow once, at startup, and run it for each order: the order
-id is the run's input, not part of the definition. `define` validates the
-workflow once (names, attempt budgets, timeouts, and that every `Port` used
-belongs to this build); `execution.run` blocks until the run finishes and
-returns `Completed`, `CompletedWithUnknownEffects`, `Failed(cause, settlement)`,
-`Cancelled(reason, settlement)`, or `Unresolved(step, evidence, settlement)`.
+`define` validates the workflow once (names, attempt budgets, timeouts, and
+that every `Port` belongs to this build) and returns every
+`DefinitionError`; `saga.describe_definition_error` renders one.
+`execution.run` blocks until the run ends and returns `Completed`,
+`CompletedWithUnknownEffects`, `Failed(cause, settlement)`,
+`Cancelled(reason, settlement)` or `Unresolved(step, evidence, settlement)`.
+`execution.kind(outcome)` classifies an outcome, and
+`execution.unknown_effects(outcome)` names every action whose effect is
+unknown: a crashed or timed-out attempt, and a returned error that
+`unknown_when` marks, such as a payment that may have been charged.
 
-## The advanced path
+Step callbacks receive one record each: `saga.undo` gets
+`UndoRequest(input, output, key)`, `saga.compensate` gets
+`FailedAttempt(input, failure, attempt, attempts_left, key)`, and
+`saga.effect` gets an `EffectKey(idempotency, attempt, attempt_key)`. Read
+them by label.
 
-Configure concurrency, a run deadline, and cleanup bounds by updating the
-default config's record fields rather than constructing one from scratch;
-start without blocking; inspect progress; cancel:
+## Configuration
+
+`execution.config()` holds safe defaults; the `with_*` setters change one
+bound each. `run`, `start`, `start_reporting` and `durable.drive` check the
+configuration and return `InvalidConfig` with every violation.
 
 ```gleam
-import gleam/option.{Some}
 import saga/execution
+import sinal/correlation
 
 let config =
-  execution.Config(..execution.config(), max_concurrency: 4, deadline: Some(5000))
+  execution.config()
+  |> execution.with_max_concurrency(4)
+  |> execution.with_deadline(30_000)
+  |> execution.with_correlation(correlation.unique())
 
-let assert Ok(exec) = execution.start(workflow, order_id, config)
-let assert Ok(progress) = execution.progress(exec, 1000)
+let assert Ok(exec) = execution.start(workflow, order, config)
+let assert Ok(progress) = execution.progress(exec, timeout: 1000)
 execution.cancel(exec)
-let assert Ok(outcome) = execution.await(exec, 10_000)
+let assert Ok(outcome) = execution.await(exec, timeout: 10_000)
 ```
 
-`execution.config()` defaults to one attempt/compensation task per
-scheduler core (`max_concurrency`), no run `deadline`, a 60 second default
-per-attempt `step_timeout`, a 5 second `settle_timeout`, and a 5 second
-`cleanup_timeout` — the record-update (`..execution.config()`) is the
-advanced-config path; it changes only the fields you name and keeps the
-library's defaults for the rest, so a new `Config` field added later does
-not silently reset every existing caller's untouched settings back to a
-stale literal.
+A step's own `saga.timeout(..)` always overrides the per-attempt default, in
+either direction; `execution.without_step_timeout` is the explicit opt-out
+for steps that set none.
 
 To learn the outcome somewhere other than the starting process, start with
-`execution.start_reporting`. The run sends its outcome, once, to the
-`Subject` you pass: a subject of another process, which learns the outcome
-even after the starting process exits, or a subject of your own, which you
-can add to a `Selector` next to your other messages:
+`execution.start_reporting(workflow, input, config, to: subject)`. The run
+sends its outcome, once, to that `Subject`. The starting process still owns
+the run: its exit cancels the run, which settles and rolls back, and the
+`Cancelled(OwnerExited, settlement)` outcome still reaches the subject.
+
+Adapt a workflow's error and undo-error types to the application's own
+vocabulary with `saga.map_errors` (whole workflow) or `saga.map_step_errors`
+(one step); saga never requires a saga-owned error type.
+
+## Defaults
+
+Every wait, retry and saved value is bounded by default.
+
+| Operation                                              | Default                                    | Change it with                                                                  |
+| ------------------------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------------- |
+| Concurrent attempts and compensation decisions per run | schedulers online                          | `execution.with_max_concurrency`                                                |
+| Run deadline                                           | none; the run is bounded by the rows below | `execution.with_deadline`                                                       |
+| Each attempt of a step without its own timeout         | 60 000 ms                                  | `execution.with_step_timeout`, `execution.without_step_timeout`, `saga.timeout` |
+| Settle window after a run stops admitting work         | 5 000 ms                                   | `execution.with_settle_timeout`                                                 |
+| Each compensation decision and each undo               | 5 000 ms                                   | `execution.with_cleanup_timeout`                                                |
+| Attempts per step                                      | 1                                          | `saga.compensate(max_attempts:)`                                                |
+| `RetryAfter` delay                                     | capped at 300 000 ms                       | `execution.with_max_retry_delay`                                                |
+| `execution.run`                                        | until the run ends (finite, see below)     | use `start` and `await`                                                         |
+| `await`, `progress`, `testing.wait_until`              | the caller's timeout (required)            | `timeout:`, `within:`                                                           |
+| Coordinator startup handshake                          | 5 000 ms                                   | none                                                                            |
+| `durable.drive`                                        | the caller's timeout (required)            | `drive(run, timeout:)`                                                          |
+| `durable.drive` caller exits                           | runner stops, checkpoint kept              | none                                                                            |
+| Each storage call                                      | 5 000 ms, then `storage.TimedOut`          | `storage.with_call_timeout`                                                     |
+| Memory adapter call                                    | 5 000 ms                                   | none                                                                            |
+| File adapter mutation lock                             | 5 000 ms, then `storage.Busy`              | none                                                                            |
+| Checkpoint size                                        | 16 MiB (16 777 216 bytes)                  | `durable.with_max_checkpoint_bytes`                                             |
+| PostgreSQL claim lease                                 | 30 000 ms, renewed every 10 000 ms         | `saga_postgres.with_lease`                                                      |
+| Conformance owner-loss window                          | declared by the adapter                    | `conformance.run(owner_loss_within:)`                                           |
+| Sinal handlers                                         | synchronous in the coordinator             | route `["saga"]` to a `sinal/forwarder`                                         |
+
+Without a deadline a run is still finite: each step takes at most
+`max_attempts * (attempt timeout + cleanup_timeout + max_retry_delay)`, and
+once the run stops admitting work it ends within `settle_timeout +
+(completed steps + compensations) * cleanup_timeout`. Saga does not default
+a run deadline, because a deadline would cut healthy long workflows.
+
+## Durable runs
+
+A durable run saves a checkpoint at every step boundary, so it survives the
+loss of its runner, its caller or its VM. Every step declares how to save its
+values and how to establish the effect of an attempt that was interrupted.
 
 ```gleam
-import gleam/erlang/process
+import gleam/dynamic/decode
+import gleam/json
+import saga
+import saga/codec
+import saga/durable
+import saga/storage/memory
 
-let report = process.new_subject()
-let assert Ok(exec) =
-  execution.start_reporting(workflow, order_id, config, to: report)
-let selector =
-  process.new_selector()
-  |> process.select_map(report, RunEnded)
-  |> process.select_map(other_messages, Other)
+let order = codec.json("order-1", fn(id) { Ok(json.string(id)) }, decode.string)
+let text = codec.text()
+let charge =
+  saga.effect("charge", fn(order, key) { charge(order, key.idempotency) })
+  |> saga.undo(fn(undo) { refund(undo.output, undo.key.idempotency) })
+  |> durable.recoverable(version: "1", input: order, output: text, resolve: fn(order, key) {
+    case lookup_charge(order, key.idempotency) {
+      Ok(Charged(receipt)) -> durable.Completed(receipt)
+      Ok(NoCharge) -> durable.NotSent
+      Error(_) -> durable.MaybeSent
+    }
+  })
+  |> durable.resolve_undo(lookup_refund)
+let assert Ok(workflow) = saga.define("checkout", saga.perform(_, charge))
+let assert Ok(persistence) =
+  durable.new(workflow, version: "1", input: order, output: text, error: text, undo_error: text)
+
+let assert Ok(store) = memory.start()
+let assert Ok(run) =
+  durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout:o-1", input: "o-1")
+case durable.drive(run, timeout: 30_000) {
+  Ok(outcome) -> handle(outcome)
+  Error(error) ->
+    case durable.error_kind(error) {
+      durable.Busy | durable.Transient -> retry_later()
+      durable.NeedsReconciliation -> alert(durable.describe_error(error))
+      durable.Incompatible | durable.Defect -> fail(durable.describe_error(error))
+    }
+}
 ```
 
-The starting process still owns the run: its exit cancels the run, which
-settles and rolls back, and the `Cancelled(OwnerExited, settlement)` outcome
-still reaches `report`. `execution.await` on a reporting run returns
-`Error(NotOwner)`. A coordinator killed from outside sends nothing; monitor
-`execution.pid(exec)` to detect that, since its `Down` always arrives after
-its outcome.
+- One `Storage` serves every execution of a store; the execution id given
+  to `start_or_reconnect` addresses one. `start_or_reconnect` is idempotent
+  for the same id and input; `durable.reconnect` attaches by id alone.
+- `drive` waits at most `timeout`. On timeout, and when the calling process
+  exits, the runner stops: in-flight attempts are killed, the claim is
+  released, and the next `drive` resumes from the last checkpoint, asking
+  each interrupted attempt's resolver what happened. Only `durable.cancel`
+  cancels.
+- Waking a runner after a restart is the application's job, for example a
+  grind job per execution. `durable.unfinished(storage, limit:)` lists the
+  executions that wait for one.
+- Adapters: `saga/storage/memory` (in VM, supervised with
+  `memory.supervised(name)`), `saga/storage/file` (one directory, one VM at
+  a time) and the [`saga_postgres`](integrations/saga_postgres) package,
+  which takes the application's own `pog.Connection` so one pool serves the
+  application, grind and saga. `saga/storage/conformance` checks any
+  adapter.
 
-A step's own `saga.timeout(..)` always overrides `step_timeout`, in either
-direction (shorter or longer than the default). Opt out of the default
-entirely — for a step that may legitimately run unbounded, with only its own
-`saga.timeout` or the run's `deadline` (if any) to bound it — with
-`step_timeout: None`:
+## Telemetry
+
+`saga/telemetry` defines six Sinal events: run start and stop, step start
+and stop, compensation decisions and undo outcomes. Every event's metadata
+carries `workflow`, `run` (this VM's id for one run), `execution` (the
+durable id, or `None`) and `correlation` (from `execution.with_correlation`
+or `durable.with_correlation`).
 
 ```gleam
-let config = execution.Config(..execution.config(), step_timeout: None)
+import saga/telemetry
+import sinal
+
+let attachment =
+  sinal.observe(telemetry.run_stopped(), fn(_measurements, metadata) {
+    log(metadata.correlation, metadata.execution, metadata.outcome)
+  })
 ```
 
-Adapt a workflow's error and undo-error types to your own application
-vocabulary with `saga.map_errors` (whole workflow) or
-`saga.map_step_errors` (one step) — saga never requires you to adopt a
-saga-owned error type.
-
-A full external consumer package, exercising both paths plus compensation
-and caller-owned types from outside the package (public imports only), is
-under [`examples/order_consumer`](examples/order_consumer):
-
-```sh
-cd examples/order_consumer
-gleam run    # prints a readable trace of four scenarios
-gleam test   # asserts the same scenarios
-```
+A compensation event reports the delay a `RetryAfter` decision was
+scheduled with and whether the cap shortened it.
 
 ## Testing workflows
 
@@ -239,223 +338,67 @@ scenario for it in use alongside `execution.progress`.
 ## Semantics you should know before relying on this
 
 - **Cancellation never reverses an unknown effect.** A step whose attempt
-  or compensation is killed — by its own `timeout`, or because the settle
-  window closed before it finished — is reported `interrupted`, not
-  undone. Only steps known to have completed are rolled back. The same
-  rule applies to a run that times out on its `deadline`.
-  `Settlement.not_undoable` and `Settlement.interrupted` exist precisely
-  so a caller can see the difference between "reversed" and "unknown."
-- **Undo runs in reverse completion order**, not forward order (a
-  deliberate difference from the Reactor 1.0.6 oracle; see
-  `CAPABILITIES.md`).
-- **Resource bounds.** Worst-case run time is bounded by
-  `deadline + settle_timeout + (undone entries + compensations) *
-cleanup_timeout`: once a run stops admitting new work, in-flight
-  attempts and compensations get up to `settle_timeout` to finish on
-  their own before being killed, and each individual compensation
-  decision or undo action is bounded by `cleanup_timeout`.
-- **Every attempt is bounded by a default `step_timeout`; only the run
-  `deadline` is unbounded by default.** `execution.config()`'s
-  `step_timeout` defaults to `Some(60_000)` (60 seconds): a step with no
-  `saga.timeout` of its own still gets this default, so a step body that
-  never returns — a genuine hang, not a crash — is killed and reported
-  `StepTimedOut` rather than blocking `execution.run`/`execution.await`
-  forever. A step's own `saga.timeout(..)` always overrides the default, in
-  either direction; `step_timeout: None` opts out of the default entirely
-  for every step that does not set its own. `deadline` stays `None` by
-  default regardless: `step_timeout` already bounds each attempt and
-  `saga.compensate`'s `max_attempts` already bounds how many attempts a step
-  can accumulate, so every step already has a finite worst case without a
-  run-wide deadline; `deadline` is instead a coarser, opt-in ceiling on the
-  whole run, cutting across still-healthy steps too, for callers who
-  specifically want that.
-- **The workflow builder runs once, at `define` time.** `define` evaluates
-  it to validate the workflow and to build its node graph; no run ever
-  evaluates the builder again (see `saga.Workflow`'s doc comment for
-  precisely the two situations — `define` and `embed` — a builder is ever
-  invoked at all). The builder no longer needs to be pure or reproducible
-  run to run — it runs exactly once, period — though it should still be a
-  straightforward description of the workflow's shape, since whatever
-  graph it produces at `define` time is what every future run replays.
-  Per-run values live in a store keyed by node id, isolated per run, so
-  concurrent or successive runs of the same `Workflow` never see each
-  other's data despite sharing the same built graph (see "Design
-  decisions" below for the trade this makes).
-  **What is linear in the number of steps, per run:** a dependency value
-  read (a single map lookup, not a scan proportional to how many steps
-  have completed); admitting a ready step (a single min-heap operation,
-  not a scan over every step); the reverse-dependency index and
-  `saga.all`'s combined-list construction (each built once, in one linear
-  pass, not by repeated appends). Total scheduling work for a run is
-  therefore linear overall, not quadratic — see `bench/RESULTS.md` (roughly
-  14x-49x faster median run time at 2000 steps, depending on shape, versus
-  per-run builder re-evaluation with per-node mailbox reads and full-graph
-  admission scans, with growth per doubling dropping from ~4x to ~2x).
-  **What stays O(N) per call, deliberately, because it is not a per-step
-  hot path:** `execution.progress` (a caller-driven snapshot, not
-  triggered by run progress itself); the settle-window sweep and the
-  waiting-node skip on a run's first terminal trigger (each happens at
-  most once per run); and the search for which node a task pid belongs to
-  on an abnormal (non-`ffi.rescue`d) task exit (bounded by concurrently
-  in-flight tasks, not by total step count, and only reached on an
-  externally-killed task, not a normal completion).
-- **A step whose output port is never consumed is rejected at `define`
-  time**, as `DefinitionError.OrphanStep(step)`, instead of silently never
-  running: every step created via `perform`/`embed` must have its output
-  port threaded (directly or through `map`/`both`/`all`) into the
-  workflow's final returned port.
-- **Every outcome says which effects are unknown.** Each action of a run
-  — a step attempt, a compensation decision, an undo — ends with a known
-  result (it returned `Ok` or a typed error) or with an unknown effect (it
-  crashed or its process exited, it was killed at its time bound, or it was
-  killed when the settle window closed). `execution.unknown_effects(outcome)`
-  lists every action of the second kind as an
-  `UnknownEffect(step, action, ending)`, for every outcome kind, and is
-  `[]` exactly when every action returned:
-  ```gleam
-  case execution.unknown_effects(outcome) {
-    // Every effect is known: done, undone, or left in place by a result.
-    [] -> Definite
-    // Each names a step, `StepAttempt(n)`, `StepCompensation(n)` or
-    // `StepUndo`, and `ActionCrashed(_)`, `ActionTimedOut` or
-    // `ActionInterrupted`.
-    unknown -> Uncertain(unknown)
-  }
-  ```
-  An action is recorded when it ends, so a later decision cannot hide it: a
-  crashed attempt retried to success, continued, aborted or held is still
-  named. An effect a result left in place (an undo that returned an error,
-  a step with no undo, a held step) is known, and is reported by the
-  settlement instead.
-- **A `Completed` outcome does not always mean every effect is known.**
-  `execution.Outcome.CompletedWithUnknownEffects(output, unknown_effects)`
-  is `Completed`'s counterpart for a run that reached its output although
-  a step attempt crashed (or its process exited) or was killed by its own
-  `timeout`, and the step's `compensate` decider chose
-  `Retry`/`RetryAfter`/`Continue`. That attempt's own effect is still
-  unknown and was never journaled or undone — only the _replacement_
-  attempt is known. `unknown_effects` is never empty on this variant, and a
-  plain `Completed` means every action returned. `saga/observation`'s
-  `run_stopped` event reports this case as `OutcomeCompleted` (the same
-  `OutcomeKind` as a plain `Completed`), with its `interrupted` measurement
-  populated from `unknown_effects`'s length instead — check that field, not
-  the outcome kind, to tell the two apart from telemetry alone.
+  or compensation is killed (by its own timeout, or because the settle
+  window closed) is reported `interrupted`, not undone. Only steps known to
+  have completed are rolled back. `Settlement.not_undoable` and
+  `Settlement.interrupted` show the difference between "reversed" and
+  "unknown".
+- **Every outcome says which effects are unknown.** Each action of a run (a
+  step attempt, a compensation decision, an undo) ends with a known result
+  or with an unknown effect: it crashed, it was killed at its time bound or
+  when the settle window closed, or it returned an error that
+  `saga.unknown_when` marks. `execution.unknown_effects(outcome)` lists every
+  action of the second kind as `UnknownEffect(step, action, ending)` and is
+  `[]` exactly when every effect is known. An action is recorded when it
+  ends, so a later decision cannot hide it: a crashed or "maybe sent"
+  attempt retried to success makes the run `CompletedWithUnknownEffects`.
 - **A `StepFailed` cause may follow a crash.** A `compensate` decider is
   asked about crashed and timed-out attempts too, and its `Abort(error)` is
-  reported as `StepFailed(step, error)`, the same cause as an aborted typed
-  error, whether as the run's primary cause or as a sibling failure. The
-  crashed attempt is in `unknown_effects`. A decider that aborts after a
-  crash should return an error that says so if the caller must tell the
-  two apart from the cause alone.
-- **A refused retry is distinguished from an exhausted one.** A
-  `Retry`/`RetryAfter` compensation decision that arrives after the run has
-  already begun settling for a different, unrelated trigger cannot be
-  honored (it would race the settle window); it is recorded as
-  `Cause.RetrySuperseded(step, last)`, kept distinct from
-  `RetryLimitReached` (which means the step's own attempt budget was
-  actually exhausted) so a `case` over `Cause` cannot conflate "never got
-  the chance to retry" with "ran out of retries."
+  reported as `StepFailed(step, error)`. Return an error that says the
+  attempt crashed when the caller must tell the two apart from the cause.
+- **A refused retry is distinguished from an exhausted one.** A retry
+  decided after the run began settling for another reason is
+  `Cause.RetrySuperseded`, not `RetryLimitReached`.
+- **Undo runs in reverse completion order**, not forward order (a
+  deliberate difference from Reactor 1.0.6; see `CAPABILITIES.md`), and an
+  undo runs at most once.
+- **The workflow builder runs once, at `define` time.** No run evaluates the
+  builder again. Per-run values live in a store keyed by node id and
+  isolated per run, so concurrent runs of one `Workflow` never see each
+  other's data.
+- **A step whose output never reaches the workflow's output is rejected**
+  at `define` time as `OrphanStep(step)`, instead of silently never running.
 - **`saga.map` is not memoized.** It re-runs in every task that consumes
-  the resulting port. Use a `saga.step` for expensive or effectful
-  transforms.
-- **`saga.all` takes a required first port.**
-  `saga.all(first: Port(a, e, u), rest: List(Port(a, e, u))) -> Port(List(a), e, u)`
-  combines `first` and `rest` (in that order) into one port producing
-  their values as a list. There is no empty-list case to construct or
-  reject: a caller with zero ports has no `Port` to pass as `first` and
-  cannot call `all` at all, which the type system enforces at the call
-  site. To combine an existing `List(Port(..))` of unknown length, split
-  it yourself first with a `case`, handling the empty list explicitly
-  rather than asserting it away:
-  ```gleam
-  case ports {
-    [first, ..rest] -> Ok(saga.all(first, rest))
-    [] -> Error(NoPortsToCombine)
-  }
-  ```
-- **A killed attempt's own effect can outlive the run that killed it.**
-  `Settlement.interrupted`/`not_undoable` name exactly which steps' effects
-  are unknown, but an `Execution` you stop awaiting — an `await` that timed
-  out, followed by `cancel`, with no further `await` — can still leave a
-  monitor `Down` or an outcome message sitting in your own mailbox once the
-  run finally settles: `await` only demonitors/drains on the call that
-  actually consumes a signal. Always `await` again (even with a short
-  timeout) after `cancel`, so the run's eventual `Cancelled` outcome is
-  consumed and nothing is left behind in your mailbox.
+  the resulting port. Use a `saga.step` for expensive or effectful work.
+- **`saga.all` takes a required first port**, so there is no empty case:
+  split a `List(Port(..))` with a `case` and handle `[]` yourself.
+- **The settle window is set per run, not per cancel.** Settling ends as
+  soon as nothing is in flight; `with_settle_timeout(0)` rolls back at once
+  and reports in-flight steps `interrupted`.
+- **Await once more after `cancel`.** `await` drains its monitor and the
+  outcome only on the call that consumes them; an `Execution` dropped after
+  a timed-out `await` can leave a message in the owner's mailbox.
 - **A reported outcome survives the owner; a killed coordinator does not.**
-  `start_reporting`'s subject receives at most one message per run, sent
-  when the run ends, after any rollback. It receives exactly one unless the
-  coordinator itself is killed, or, for a `process.named_subject`, no
-  process holds the name at that moment (the outcome is then dropped). The
-  owner's exit is a cancellation, not a loss: the run settles, rolls back,
-  and reports `Cancelled(OwnerExited, settlement)`, whose settlement names
-  every failed, timed-out, or interrupted compensation.
-- **The settle window is set per run, not per cancel.** `settle_timeout`
-  is fixed when the run starts; an owner's exit cancels with no call to
-  carry another value. Settling ends as soon as nothing is in flight, so
-  the window only delays rollback while a step is still running.
-  `settle_timeout: 0` rolls back at once and reports in-flight steps
-  `interrupted`; a longer window lets them finish, so they are known and
-  undone.
-- **A repeated `await` cannot always tell `AlreadyAwaited` apart from a
-  previously-reported `Lost`.** `execution.await`/`AwaitError` are
-  deliberately stateless on the caller's side (no process-dictionary
-  bookkeeping survives between calls), so a _second_ `await` on an
-  `Execution` whose coordinator already exited reports `AlreadyAwaited`
-  whether the first `await` consumed a normal outcome or already reported
-  `Lost`. If you need to know which one actually happened, keep the first
-  `await`'s own result — do not rely on a second call to re-derive it.
+  `start_reporting`'s subject receives at most one message, after rollback.
+  Monitor `execution.pid(exec)` to detect a killed coordinator: its `Down`
+  always arrives after its outcome.
+- **A local `EffectKey` belongs to one run.** Its `idempotency` derives from
+  the run's id, which `execution.run` creates anew each time. A durable
+  execution's keys derive from its id and survive restarts.
 
 ## Design decisions
 
-**The scheduler keeps a central per-run value store, departing from
-saga-design.md's original stance (see "Typed DAG construction" /
-saga-design.md:197-215, which reads "The scheduler must not use a central
-native-value structure like `Dict(NodeId, Dynamic)`").**
-
-The local execution path originally
-gave every node its own single-value mailbox cell, allocated fresh each
-time the workflow's builder ran. That kept the scheduler's own state
-free of any central heterogeneous map — each node's result lived only in
-that node's own typed `Subject`. It also meant every run re-evaluated the
-builder from scratch, and every dependency read was a selective receive
-whose cost grew with how many prior messages already sat in that mailbox:
-O(N) per read, O(N^2) total per run for a workflow whose reads scale with
-N.
-`bench/RESULTS.md` measured this directly — before this change, a 2000-step
-chain's median run time was ~392ms and grew roughly 4x every time the step
-count doubled.
-
-The fix builds a workflow's graph exactly once, at `define`, and moves
-per-run values into `saga/internal/store` — one `Dict(Int, Native)` keyed
-by node id, `Native` being that module's own opaque, type-erased carrier
-(never `gleam/dynamic.Dynamic`, never inspected or decoded — only ever
-cast back to the exact type it was stored as). This is, structurally,
-exactly the central `Dict(NodeId, Dynamic)` shape saga-design.md ruled
-out. The trade was made deliberately: `store.get`'s one native identity
-coercion is sound _by construction_, not by convention or caller
-discipline — see `saga/internal/store`'s own doc comment for the full
-argument, summarized here:
-
-> A node id and its element type are bound together exactly once, in the
-> same `perform` call that both allocates the id and returns the typed,
-> opaque `Port` whose `fetch` closure reads that id back. No other code
-> path can construct a `Port` for one node id typed differently than the
-> `perform` call that created it, so no caller can ever read a node's
-> value at the wrong type.
-
-With that invariant holding, centralizing per-run storage turned an O(N)
-mailbox read into an O(1) map lookup, and a follow-on fix
-(`saga/internal/min_heap`, replacing a full node-order scan in the
-admission loop) turned an O(N) admission decision into an O(log N) one.
-Together these took the same 2000-step chain from ~392ms median to ~8ms
-(roughly 49x), and flattened the growth curve from ~4x per doubling
-(quadratic) to ~2x per doubling (linear) — see `bench/RESULTS.md` for the
-full before/after tables. The scheduler's _authoring_-time API is
-unaffected: no caller-facing type ever becomes `Dynamic`, no step looks up
-a dependency by name, and the one unsafe cast is confined to a single
-internal module with a stated soundness invariant, not spread through the
-scheduler or exposed to callers.
+**The scheduler keeps a central per-run value store** instead of the
+per-node typed cells that saga-design.md's "Typed DAG construction" section
+asks for. `saga/internal/store` holds one `Dict(Int, Native)` per run, keyed
+by node id, where `Native` is an opaque, type-erased carrier that is only
+ever cast back to the type it was stored as. The cast is sound by
+construction: a node id and its element type are bound together once, in
+the `perform` call that allocates the id and returns the typed, opaque
+`Port` whose `fetch` reads it back, and no other code can build a `Port` for
+that id. With that invariant, a dependency read is a map lookup and
+admission is a min-heap operation, so a run's scheduling cost is linear in
+its steps; `bench/RESULTS.md` has the measurements.
 
 ## Development
 
@@ -466,6 +409,11 @@ gleam build --warnings-as-errors
 gleam test
 (cd examples/order_consumer && gleam test && gleam run)
 scripts/check_negative.sh
+scripts/check_durable_restart.sh
+(cd integrations/saga_postgres && scripts/test-postgres.sh)
 nix fmt
 nix flake check
 ```
+
+`examples/order_consumer` is the external acceptance consumer: it imports
+only saga's public modules.

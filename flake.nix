@@ -38,6 +38,9 @@
             gleam
             beam28Packages.erlang
             rebar3
+            # A disposable PostgreSQL 16 for integrations/saga_postgres's
+            # storage conformance run (scripts/test-postgres.sh).
+            postgresql_16
           ];
         };
 

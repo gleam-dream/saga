@@ -51,7 +51,7 @@ Every capability below carries a status:
   (`execution.start_reporting`): one message per run, to any process or a
   registered name, delivered after rollback even when the owner's exit
   cancelled the run, and selectable in the receiver's own `Selector`.
-- Sinal-based observations (`saga/observation`): run start/stop, step
+- Sinal-based observations (`saga/telemetry`): run start/stop, step
   start/stop, compensation decisions, and undo outcomes, with typed
   measurements and metadata.
 - Caller-owned error and undo-error types throughout, via
