@@ -1,128 +1,195 @@
 -module(saga_storage).
--export([memory_new/0,memory_close/1,memory_create/2,memory_load/1,memory_claim/1,
-         memory_commit/5,memory_release/2,memory_cancel/1,
-         file_create/2,file_load/1,file_claim/1,file_commit/5,file_release/2,file_cancel/1]).
+-export([file_create/3, file_load/2, file_claim/2, file_commit/3, file_release/2,
+         file_cancel/2, file_unfinished/2]).
 
-memory_new() -> spawn(fun() -> loop(none, none) end).
-memory_close(Pid) -> exit(Pid, shutdown), nil.
-memory_create(Pid, Data) -> call(Pid, {create,Data}).
-memory_load(Pid) -> call(Pid, load).
-memory_claim(Pid) -> call(Pid, claim).
-memory_commit(Pid,T,R,C,D) -> call(Pid,{commit,T,R,C,D}).
-memory_release(Pid,T) -> call(Pid,{release,T}).
-memory_cancel(Pid) -> call(Pid,cancel).
-call(Pid,Request) ->
-    Ref=monitor(process,Pid), Pid ! {self(),Ref,Request},
-    receive {Ref,Reply} -> demonitor(Ref,[flush]), Reply;
-            {'DOWN',Ref,process,Pid,_} -> {error,{io,<<"storage closed">>}}
-    end.
-loop(Record, Owner) ->
-    receive
-        {'DOWN',Ref,process,_,_} ->
-            case Owner of {_,Ref} -> loop(Record,none); _ -> loop(Record,Owner) end;
-        {From,Ref,Request} ->
-            {Reply,Next,NextOwner}=request(Request,From,Record,Owner),
-            From ! {Ref,Reply}, loop(Next,NextOwner)
-    end.
-request({create,D},_,none,O) -> R={record,0,0,false,D}, {{ok,R},R,O};
-request({create,_},_,R,O) -> {{error,already_exists},R,O};
-request(_,_,none,O) -> {{error,not_found},none,O};
-request(load,_,R,O) -> {{ok,R},R,O};
-request(claim,From,R,O) ->
-    case owner_alive(O) of
-        true -> {{error,busy},R,O};
-        false -> Next=setelement(3,R,element(3,R)+1),
-                 {{ok,Next},Next,{From,monitor(process,From)}}
-    end;
-request({commit,T,V,C,D},From,R,O) ->
-    case O of
-        {From,_} -> case check(R,T,V,C) of
-            ok -> Next={record,V+1,T,C,D}, {{ok,Next},Next,O};
-            Error -> {Error,R,O}
-        end;
-        _ -> {{error,stale_owner},R,O}
-    end;
-request({release,T},From,R,{From,Ref}=O) ->
-    case element(3,R)=:=T of
-        true -> demonitor(Ref,[flush]), {{ok,nil},R,none};
-        false -> {{error,stale_owner},R,O}
-    end;
-request({release,_},_,R,O) -> {{error,stale_owner},R,O};
-request(cancel,_,R,O) -> {{ok,nil},setelement(4,R,true),O}.
-owner_alive(none) -> false;
-owner_alive({Pid,_}) -> is_process_alive(Pid).
-check({record,V,T,C,_},T,V,C) -> ok;
-check({record,_,G,_,_},T,_,_) when G =/= T -> {error,stale_owner};
-check({record,_,_,C,_},_,_,Observed) when C =/= Observed -> {error,cancellation_changed};
-check(_,_,_,_) -> {error,conflict}.
+%% One file per execution: <Directory>/<hex of the id>.saga, holding
+%% {record, Revision, Generation, Cancelled, Phase, Data, Owner}, where Owner
+%% is `none` or {owner, Token, Incarnation, Pid}. A claim stays while its
+%% claiming process lives in this VM incarnation; a file written by an
+%% earlier VM is unowned. Every mutation holds a VM-local lock on the path
+%% for at most 5 seconds, then fails with `busy`.
 
-file_create(Path,Data) -> mutate(Path,fun() ->
-    case file_load(Path) of
-        {error,not_found} -> write(Path,{record,0,0,false,Data});
-        {ok,_} -> {error,already_exists}; Error -> Error
-    end end).
-file_load(Path) ->
+path(Dir, Id) -> filename:join(Dir, <<(binary:encode_hex(Id))/binary, ".saga">>).
+
+file_create(Dir, Id, Data) ->
+    mutate(path(Dir, Id), fun(Path) ->
+        case read(Path) of
+            {error, not_found} ->
+                Record = {record, 0, 0, false, pending, Data, none},
+                case write(Path, Record) of ok -> {ok, stored(Record)}; Error -> Error end;
+            {ok, _} -> {error, already_exists};
+            Error -> Error
+        end
+    end).
+
+file_load(Dir, Id) ->
+    case read(path(Dir, Id)) of
+        {ok, Record} -> {ok, stored(Record)};
+        Error -> Error
+    end.
+
+file_claim(Dir, Id) ->
+    mutate(path(Dir, Id), fun(Path) ->
+        case read(Path) of
+            {ok, {record, V, G, C, P, D, Owner}} ->
+                case alive(Owner) of
+                    true -> {error, busy};
+                    false ->
+                        Token = integer_to_binary(erlang:unique_integer([positive])),
+                        Next = {record, V, G + 1, C, P, D,
+                                {owner, Token, incarnation(), list_to_binary(pid_to_list(self()))}},
+                        case write(Path, Next) of
+                            ok -> {ok, {{claim, Id, G + 1, Token}, stored(Next)}};
+                            Error -> Error
+                        end
+                end;
+            Error -> Error
+        end
+    end).
+
+file_commit(Dir, {claim, Id, Generation, Token}, {commit, Expected, Observed, Phase, Data}) ->
+    mutate(path(Dir, Id), fun(Path) ->
+        case read(Path) of
+            {ok, {record, V, G, C, _, _, Owner} = _} ->
+                case owns(Owner, G, Generation, Token) of
+                    false -> {error, stale_owner};
+                    true when V =/= Expected -> {error, conflict};
+                    true when C =/= Observed -> {error, cancellation_changed};
+                    true ->
+                        Next = {record, V + 1, G, C, Phase, Data, Owner},
+                        case write(Path, Next) of ok -> {ok, stored(Next)}; Error -> Error end
+                end;
+            Error -> Error
+        end
+    end).
+
+file_release(Dir, {claim, Id, Generation, Token}) ->
+    mutate(path(Dir, Id), fun(Path) ->
+        case read(Path) of
+            {ok, {record, V, G, C, P, D, Owner}} ->
+                case owns(Owner, G, Generation, Token) of
+                    false -> {error, stale_owner};
+                    true ->
+                        case write(Path, {record, V, G, C, P, D, none}) of
+                            ok -> {ok, nil};
+                            Error -> Error
+                        end
+                end;
+            Error -> Error
+        end
+    end).
+
+file_cancel(Dir, Id) ->
+    mutate(path(Dir, Id), fun(Path) ->
+        case read(Path) of
+            {ok, {record, V, G, _, P, D, Owner}} ->
+                case write(Path, {record, V, G, true, P, D, Owner}) of
+                    ok -> {ok, nil};
+                    Error -> Error
+                end;
+            Error -> Error
+        end
+    end).
+
+file_unfinished(Dir, Limit) ->
+    case file:list_dir(Dir) of
+        {ok, Names} ->
+            Ids = lists:filtermap(fun(Name) ->
+                Binary = unicode:characters_to_binary(Name),
+                case binary:split(Binary, <<".saga">>) of
+                    [Hex, <<>>] ->
+                        try binary:decode_hex(Hex) of
+                            Id ->
+                                case read(path(Dir, Id)) of
+                                    {ok, {record, _, _, _, Phase, _, Owner}} ->
+                                        case Phase =/= finished andalso not alive(Owner) of
+                                            true -> {true, Id};
+                                            false -> false
+                                        end;
+                                    _ -> false
+                                end
+                        catch _:_ -> false end;
+                    _ -> false
+                end
+            end, lists:sort(Names)),
+            {ok, lists:sublist(Ids, Limit)};
+        {error, E} -> unavailable(E)
+    end.
+
+stored({record, V, G, C, _, D, _}) -> {stored, V, G, C, D}.
+
+owns({owner, Token, _, _}, G, G, Token) -> true;
+owns(_, _, _, _) -> false.
+
+alive(none) -> false;
+alive({owner, _, Incarnation, Pid}) ->
+    case Incarnation =:= incarnation() of
+        true -> is_process_alive(list_to_pid(binary_to_list(Pid)));
+        false -> false
+    end.
+
+incarnation() ->
+    case persistent_term:get({?MODULE, incarnation}, undefined) of
+        undefined ->
+            Value = iolist_to_binary([os:getpid(), "-",
+                integer_to_binary(erlang:system_time(nanosecond))]),
+            persistent_term:put({?MODULE, incarnation}, Value),
+            Value;
+        Value -> Value
+    end.
+
+read(Path) ->
     case file:read_file(Path) of
-        {ok,Data} -> try binary_to_term(Data,[safe]) of
-            {record,V,G,C,D}=R when is_integer(V), V>=0, is_integer(G), G>=0,
-                                     is_boolean(C), is_binary(D) -> {ok,R};
-            _ -> {error,corrupt}
-        catch _:_ -> {error,corrupt} end;
-        {error,enoent} -> {error,not_found}; {error,E} -> io_error(E)
+        {ok, Data} ->
+            try binary_to_term(Data, [safe]) of
+                {record, V, G, C, P, D, Owner} = R
+                  when is_integer(V), V >= 0, is_integer(G), G >= 0, is_boolean(C),
+                       (P =:= pending orelse P =:= suspended orelse P =:= finished),
+                       is_binary(D) ->
+                    case Owner of
+                        none -> {ok, R};
+                        {owner, T, I, Pid} when is_binary(T), is_binary(I), is_binary(Pid) -> {ok, R};
+                        _ -> {error, corrupt}
+                    end;
+                _ -> {error, corrupt}
+            catch _:_ -> {error, corrupt} end;
+        {error, enoent} -> {error, not_found};
+        {error, E} -> unavailable(E)
     end.
-file_claim(Path) ->
-    case get({?MODULE,Path}) of
-        undefined -> file_claim_unowned(Path);
-        _ -> {error,busy}
+
+mutate(Path, Run) ->
+    Lock = {{?MODULE, Path}, self()},
+    Deadline = erlang:monotonic_time(millisecond) + 5000,
+    case acquire(Lock, Deadline) of
+        true -> try Run(Path) after global:del_lock(Lock, [node()]) end;
+        false -> {error, busy}
     end.
-file_claim_unowned(Path) ->
-    Lock={{?MODULE,owner,Path},self()},
-    case global:set_lock(Lock,[node()],0) of
-        false -> {error,busy};
-        true -> Result=mutate(Path,fun() ->
-                    case file_load(Path) of
-                        {ok,R} -> write(Path,setelement(3,R,element(3,R)+1));
-                        Error -> Error
-                    end end),
-                case Result of
-                    {ok,R} -> put({?MODULE,Path},element(3,R));
-                    _ -> global:del_lock(Lock,[node()])
-                end, Result
+
+acquire(Lock, Deadline) ->
+    case global:set_lock(Lock, [node()], 0) of
+        true -> true;
+        false ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true -> false;
+                false -> timer:sleep(5), acquire(Lock, Deadline)
+            end
     end.
-file_commit(Path,T,V,C,D) ->
-    case get({?MODULE,Path}) of
-        T -> mutate(Path,fun() -> case file_load(Path) of
-            {ok,R} -> case check(R,T,V,C) of
-                ok -> write(Path,{record,V+1,T,C,D}); Error -> Error end;
-            Error -> Error end end);
-        _ -> {error,stale_owner}
-    end.
-file_release(Path,T) ->
-    case get({?MODULE,Path}) of
-        T -> erase({?MODULE,Path}), global:del_lock({{?MODULE,owner,Path},self()},[node()]), {ok,nil};
-        _ -> {error,stale_owner}
-    end.
-file_cancel(Path) -> mutate(Path,fun() -> case file_load(Path) of
-    {ok,R} -> case write(Path,setelement(4,R,true)) of {ok,_} -> {ok,nil}; Error -> Error end;
-    Error -> Error end end).
-mutate(Path,Run) ->
-    Lock={{?MODULE,mutation,Path},self()},
-    case global:set_lock(Lock,[node()],infinity) of
-        true -> try Run() after global:del_lock(Lock,[node()]) end;
-        false -> {error,busy}
-    end.
-write(Path,Record) ->
-    Suffix=integer_to_binary(erlang:system_time(nanosecond)),
-    Unique=integer_to_binary(erlang:unique_integer([positive])),
-    Temp= <<Path/binary,".",Suffix/binary,".",Unique/binary,".tmp">>,
-    case file:open(Temp,[write,binary,exclusive]) of
-        {ok,F} ->
-            Result=case file:write(F,term_to_binary(Record)) of
-                ok -> file:sync(F); Error -> Error end,
+
+write(Path, Record) ->
+    Suffix = integer_to_binary(erlang:system_time(nanosecond)),
+    Unique = integer_to_binary(erlang:unique_integer([positive])),
+    Temp = <<(unicode:characters_to_binary(Path))/binary, ".", Suffix/binary, ".", Unique/binary, ".tmp">>,
+    case file:open(Temp, [write, binary, exclusive]) of
+        {ok, F} ->
+            Result = case file:write(F, term_to_binary(Record)) of
+                ok -> file:sync(F);
+                Error -> Error
+            end,
             file:close(F),
-            Saved=case Result of ok -> file:rename(Temp,Path); Other -> Other end,
+            Saved = case Result of ok -> file:rename(Temp, Path); Other -> Other end,
             file:delete(Temp),
-            case Saved of ok -> {ok,Record}; {error,E} -> io_error(E) end;
-        {error,E} -> io_error(E)
+            case Saved of ok -> ok; {error, E} -> unavailable(E) end;
+        {error, E} -> unavailable(E)
     end.
-io_error(E) -> {error,{io,atom_to_binary(E)}}.
+
+unavailable(E) -> {error, {unavailable, atom_to_binary(E)}}.

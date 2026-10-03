@@ -31,7 +31,7 @@ pub fn main() -> Nil {
 
       case first_vm {
         True -> {
-          write_ledger(path <> "." <> name, key)
+          write_ledger(path <> "/" <> name, key)
           process.sleep(60_000)
           saga.Abort("VM should have stopped")
         }
@@ -40,7 +40,7 @@ pub fn main() -> Nil {
     })
     |> durable.resolve_compensation(fn(input, key) {
       let assert 1 = key.attempt
-      case ledger_has(path <> "." <> name, key.attempt_key) {
+      case ledger_has(path <> "/" <> name, key.attempt_key) {
         True -> Some(saga.Continue(input <> name, saga.NoUndo))
         False -> None
       }
@@ -62,28 +62,32 @@ pub fn main() -> Nil {
       |> saga.map(fn(pair) { pair.0 <> pair.1 })
     })
   let assert Ok(persistence) =
-    durable.prepare(workflow, "1", text, text, text, text)
+    durable.new(
+      workflow,
+      version: "1",
+      input: text,
+      output: text,
+      error: text,
+      undo_error: text,
+    )
   let storage = file.open(path)
-  let assert Ok(reference) =
+  let assert Ok(run) =
     durable.start_or_reconnect(
+      persistence
+        |> durable.with_config(
+          execution.config() |> execution.with_max_concurrency(2),
+        ),
       storage,
-      "vm-compensation-ref",
-      persistence,
-      "order",
+      id: "vm-compensation-ref",
+      input: "order",
     )
-  let result =
-    durable.drive(
-      storage,
-      reference,
-      persistence,
-      execution.config() |> execution.with_max_concurrency(2),
-    )
+  let result = durable.drive(run, timeout: 60_000)
   case first_vm {
     True -> Nil
     False -> {
       let assert Ok(execution.Completed("orderaorderb")) = result
       let assert Ok(durable.Finished(execution.Completed("orderaorderb"))) =
-        durable.read(storage, reference, persistence)
+        durable.read(run)
       io.println("RECOVERED")
     }
   }

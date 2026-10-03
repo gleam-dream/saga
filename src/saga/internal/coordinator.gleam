@@ -268,6 +268,9 @@ type RunState(o, e, u) {
     correlation: Option(Correlation),
     execution: Option(String),
     persistence: Option(Session(e, u)),
+    // A persistent run whose driver went away stops without cancelling:
+    // its last checkpoint stays the recovery authority.
+    detached: Bool,
     dispatch: List(Subject(Nil)),
     pending_starts: List(Int),
     blocked: Option(checkpoint.Failure),
@@ -487,6 +490,7 @@ fn run(
       correlation: correlation,
       execution: execution,
       persistence: persistence,
+      detached: False,
       dispatch: [],
       pending_starts: [],
       blocked: None,
@@ -548,6 +552,21 @@ fn run(
 }
 
 fn loop(
+  state: RunState(o, e, u),
+  fetch_output: fn(Store) -> ffi.RescueResult(o),
+  deliver: fn(Outcome(o, e, u)) -> Nil,
+) -> Nil {
+  case state.detached, state.persistence {
+    True, Some(session) -> {
+      stop_workers(state)
+      cancel_deadline_timer(state)
+      session.stopped()
+    }
+    _, _ -> loop_checkpointed(state, fetch_output, deliver)
+  }
+}
+
+fn loop_checkpointed(
   state: RunState(o, e, u),
   fetch_output: fn(Store) -> ffi.RescueResult(o),
   deliver: fn(Outcome(o, e, u)) -> Nil,
@@ -798,7 +817,6 @@ fn start_attempt(
       let reply = process.new_subject()
       process.send(state.control, InputPrepared(node_id, seq, input, reply))
       process.receive_forever(reply)
-      Ok(Nil)
     })
   let body = case set.contains(state.resume_nodes, node_id), n.persistence {
     True, Some(p) -> p.resume(attempt, state.store)
@@ -896,7 +914,11 @@ fn handle_control(
         _ -> state
       }
     SettleFired(seq) -> handle_settle_fired(state, seq)
-    OwnerDown(_reason) -> begin_settling(state, TriggerCancel(OwnerExited))
+    OwnerDown(_reason) ->
+      case state.persistence {
+        None -> begin_settling(state, TriggerCancel(OwnerExited))
+        Some(_) -> RunState(..state, detached: True)
+      }
     TaskExited(pid, reason) -> handle_task_exited(state, pid, reason)
   }
 }
@@ -997,7 +1019,7 @@ fn handle_attempt_done(
     True -> {
       cancel_node_timer(state, node_id)
       case result {
-        node.AttemptBlocked(reason) -> RunState(..state, blocked: Some(reason))
+        node.AttemptBlocked(reason) -> block(state, node_id, reason)
         node.AttemptAbsent ->
           maybe_finish_settling(
             RunState(
@@ -1246,7 +1268,7 @@ fn handle_recovery_done(
         PhaseSettling(..) | PhaseRollingBack(..) -> True
       }
       case recovery, settling_or_rolling_back {
-        node.EBlocked(reason), _ -> RunState(..state, blocked: Some(reason))
+        node.EBlocked(reason), _ -> block(state, node_id, reason)
         // Retry/RetryAfter decisions are not honored once settling has
         // begun (§3.3): the run is already stopping admission, so a fresh
         // attempt would race the settle window. The exhausted-vs-not
@@ -1996,7 +2018,7 @@ fn handle_undo_done(
   outcome: UndoOutcome(u),
 ) -> RunState(o, e, u) {
   case outcome {
-    UndoBlocked(reason) -> RunState(..state, blocked: Some(reason))
+    UndoBlocked(reason) -> block(state, node_id, reason)
     _ -> handle_known_undo(state, node_id, seq, outcome)
   }
 }
@@ -2035,7 +2057,7 @@ fn handle_known_undo(
         )
       let _ = attempt_number
       let state = case outcome {
-        UndoBlocked(reason) -> RunState(..state, blocked: Some(reason))
+        UndoBlocked(reason) -> block(state, node_id, reason)
         UndoOk -> record_undone(state, address)
         UndoErr(error) -> record_undo_failure(state, UndoFailed(address, error))
         UndoCrash(crash) ->
@@ -2380,13 +2402,19 @@ pub type Session(e, u) {
     cancelled: Bool,
     save: fn(Snapshot(e, u)) -> Result(Nil, checkpoint.Failure),
     failed: fn(checkpoint.Failure) -> Nil,
+    stopped: fn() -> Nil,
   )
 }
 
-/// Used by the optional persistent runner. The same admission and lifecycle
-/// functions serve local execution; ownership and storage belong to `session`.
+/// Runs a persistent execution in the calling process (the runner). The same
+/// admission and lifecycle functions serve local execution; ownership and
+/// storage belong to `session`. `owner` is the process that drives the
+/// execution: when it exits, the runner stops its workers and calls
+/// `session.stopped` instead of cancelling, so the last checkpoint stays the
+/// recovery authority.
 pub fn execute_saved(
   workflow_name: String,
+  owner: Pid,
   settings: Settings,
   build_graph: fn() ->
     #(
@@ -2403,7 +2431,7 @@ pub fn execute_saved(
   let ready = process.new_subject()
   run(
     workflow_name,
-    process.self(),
+    owner,
     ffi.unique_integer(),
     settings,
     build_graph,
@@ -2432,20 +2460,40 @@ fn step_base(state: RunState(o, e, u), id: Int) -> String {
   <> int.to_string(position)
 }
 
+/// Records that node `node_id` cannot continue without outside help, at the
+/// node's resolved address. The next checkpoint stops the run with it.
+fn block(
+  state: RunState(o, e, u),
+  node_id: Int,
+  reason: checkpoint.Failure,
+) -> RunState(o, e, u) {
+  RunState(
+    ..state,
+    blocked: Some(checkpoint.at(
+      reason,
+      saved_address(node_address(state, node_id)),
+    )),
+  )
+}
+
+fn saved_address(address: StepAddress) -> checkpoint.Address {
+  checkpoint.Address(address.scope, address.name, address.occurrence)
+}
+
 fn checkpoint(state: RunState(o, e, u)) -> Result(Nil, checkpoint.Failure) {
   case state.blocked, state.persistence {
     Some(reason), _ -> Error(reason)
     None, None -> Ok(Nil)
     None, Some(session) -> {
-      use snapshot <- result.try(
-        freeze(state) |> result.map_error(checkpoint.CodecFailure),
-      )
+      use snapshot <- result.try(freeze(state))
       session.save(snapshot)
     }
   }
 }
 
-fn freeze(state: RunState(o, e, u)) -> Result(Snapshot(e, u), String) {
+fn freeze(
+  state: RunState(o, e, u),
+) -> Result(Snapshot(e, u), checkpoint.Failure) {
   let progress = build_progress(state)
   use nodes <- result.try(
     list.try_map(list.zip(state.order, progress.steps), fn(pair) {
@@ -2454,8 +2502,10 @@ fn freeze(state: RunState(o, e, u)) -> Result(Snapshot(e, u), String) {
       let values = case progress.state {
         Succeeded | Undoing | Undone | UndoFailedStep ->
           case n.persistence {
-            Some(p) -> p.freeze(state.store, step_base(state, id))
-            None -> Error("step has no persistence capability")
+            Some(p) ->
+              p.freeze(state.store, step_base(state, id))
+              |> result.map_error(checkpoint.at(_, saved_address(n.address)))
+            None -> Error(checkpoint.InvalidState(checkpoint.Malformed))
           }
         Attempting(_) | Compensating(_) ->
           Ok(case dict.get(state.inputs, id) {
@@ -2512,26 +2562,26 @@ fn restore(
   use _ <- result.try(
     case list.length(saved.nodes) == list.length(state.order) {
       True -> Ok(Nil)
-      False -> Error(checkpoint.InvalidState("checkpoint graph size mismatch"))
+      False -> Error(checkpoint.InvalidState(checkpoint.GraphMismatch))
     },
   )
-  use _ <- result.try(
-    case
-      list.count(saved.nodes, fn(n) {
-        case n.progress {
-          Attempting(_) | Compensating(_) -> True
-          _ -> False
-        }
-      })
-      > state.max_concurrency
-    {
-      True ->
-        Error(checkpoint.InvalidState(
-          "concurrency limit below saved in-flight count",
-        ))
-      False -> Ok(Nil)
-    },
-  )
+  let in_flight =
+    list.count(saved.nodes, fn(n) {
+      case n.progress {
+        Attempting(_) | Compensating(_) -> True
+        _ -> False
+      }
+    })
+  use _ <- result.try(case in_flight > state.max_concurrency {
+    True ->
+      Error(
+        checkpoint.InvalidState(checkpoint.ConcurrencyBelowInFlight(
+          in_flight: in_flight,
+          max_concurrency: state.max_concurrency,
+        )),
+      )
+    False -> Ok(Nil)
+  })
   let pairs = list.zip(state.order, saved.nodes)
   use restored <- result.try(
     list.try_fold(pairs, #(state.store, dict.new()), fn(acc, pair) {
@@ -2542,12 +2592,11 @@ fn restore(
           let assert Ok(n) = dict.get(state.nodes, id)
           use p <- result.try(case n.persistence {
             Some(p) -> Ok(p)
-            None ->
-              Error(checkpoint.InvalidState("missing persistence capability"))
+            None -> Error(checkpoint.InvalidState(checkpoint.Malformed))
           })
           use commit <- result.try(
             p.thaw(values, acc.0, step_base(state, id))
-            |> result.map_error(checkpoint.CodecFailure),
+            |> result.map_error(checkpoint.at(_, saved_address(n.address))),
           )
           let #(store, undo) = commit(acc.0)
           Ok(#(store, dict.insert(acc.1, id, undo)))
@@ -2597,13 +2646,12 @@ fn restore(
     list.try_map(saved.journal, fn(index) {
       use id <- result.try(case list.first(list.drop(state.order, index)) {
         Ok(id) -> Ok(id)
-        Error(_) -> Error(checkpoint.InvalidState("invalid journal position"))
+        Error(_) -> Error(checkpoint.InvalidState(checkpoint.Malformed))
       })
       let assert Ok(n) = dict.get(state.nodes, id)
       use undo <- result.try(case dict.get(undos, id) {
         Ok(undo) -> Ok(undo)
-        Error(_) ->
-          Error(checkpoint.InvalidState("journal has no saved output"))
+        Error(_) -> Error(checkpoint.InvalidState(checkpoint.Malformed))
       })
       Ok(JournalEntry(id, n.address, undo))
     }),
@@ -2640,7 +2688,7 @@ fn restore(
     list.try_map(saved.last_failure, fn(pair) {
       case list.first(list.drop(state.order, pair.0)) {
         Ok(id) -> Ok(#(id, pair.1))
-        Error(_) -> Error(checkpoint.InvalidState("invalid failure position"))
+        Error(_) -> Error(checkpoint.InvalidState(checkpoint.Malformed))
       }
     }),
   )
@@ -2648,7 +2696,7 @@ fn restore(
     list.try_each(pairs, fn(pair) {
       case pair.1.progress, dict.get(dict.from_list(failures), pair.0) {
         Compensating(_), Error(_) ->
-          Error(checkpoint.InvalidState("compensation has no saved failure"))
+          Error(checkpoint.InvalidState(checkpoint.Malformed))
         _, _ -> Ok(Nil)
       }
     }),
@@ -2794,7 +2842,7 @@ fn attempt_context(
     },
     option.is_some(state.persistence),
     dict.get(state.inputs, id) |> option.from_result,
-    fn(_) { Ok(Nil) },
+    fn(_) { Nil },
   )
 }
 

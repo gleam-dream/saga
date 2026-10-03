@@ -10,7 +10,7 @@ fn public_sources() -> List(#(String, String))
 /// at module level.
 pub fn every_public_module_starts_with_a_module_doc_test() {
   let sources = public_sources()
-  list.length(sources) |> should.equal(11)
+  list.length(sources) |> should.equal(10)
   sources
   |> list.filter(fn(source) { !string.starts_with(source.1, "//// ") })
   |> list.map(fn(source) { source.0 })

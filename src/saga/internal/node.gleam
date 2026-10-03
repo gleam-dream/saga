@@ -33,7 +33,7 @@ pub type Attempt {
     cancelled: Bool,
     persistent: Bool,
     saved_input: Option(String),
-    admit: fn(String) -> Result(Nil, String),
+    admit: fn(String) -> Nil,
   )
 }
 
@@ -116,7 +116,9 @@ pub fn map_errors(
     persistence: option.map(a_node.persistence, fn(p) {
       Persistence(
         version: p.version,
-        valid: p.valid,
+        step_version: p.step_version,
+        input_version: p.input_version,
+        output_version: p.output_version,
         recovery_undo_declared: p.recovery_undo_declared,
         freeze: p.freeze,
         thaw: fn(saved, run_store, key) {
@@ -306,11 +308,16 @@ pub fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
 pub type Persistence(e, u) {
   Persistence(
     version: String,
-    valid: Bool,
+    step_version: String,
+    input_version: String,
+    output_version: String,
     recovery_undo_declared: Bool,
-    freeze: fn(Store, String) -> Result(List(String), String),
+    freeze: fn(Store, String) -> Result(List(String), checkpoint.Failure),
     thaw: fn(List(String), Store, String) ->
-      Result(fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))), String),
+      Result(
+        fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
+        checkpoint.Failure,
+      ),
     resume_compensation: fn(Attempt, Store) -> fn() -> ErasedRecovery(e, u),
     resume_undo: fn(Store, String) ->
       fn() -> Result(Result(Nil, u), checkpoint.Failure),
