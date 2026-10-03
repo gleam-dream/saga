@@ -1,4 +1,5 @@
 import gleam/erlang/process
+import gleam/option.{None, Some}
 import gleeunit/should
 import saga
 import saga/codec
@@ -14,9 +15,12 @@ fn echo_workflow() -> saga.Workflow(String, String, String, String) {
       saga.perform(
         input,
         saga.step("echo", fn(value) { Ok(value <> "!") })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-            saga.EffectUnknown
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(_, _) { durable.MaybeSent },
+          ),
       )
     })
   workflow
@@ -81,9 +85,12 @@ pub fn persistent_concurrent_shared_dependency_test() {
       process.receive_forever(release)
       Ok(value <> name)
     })
-    |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-      saga.EffectUnknown
-    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   }
   let assert Ok(workflow) =
     saga.define("parallel", fn(input) {
@@ -91,9 +98,12 @@ pub fn persistent_concurrent_shared_dependency_test() {
         saga.perform(
           input,
           saga.step("shared", fn(value) { Ok(value <> "!") })
-            |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-              saga.EffectUnknown
-            }),
+            |> durable.recoverable(
+              version: "1",
+              input: codec.text(),
+              output: codec.text(),
+              resolve: fn(_, _) { durable.MaybeSent },
+            ),
         )
       saga.both(
         saga.perform(shared, branch("a")),
@@ -186,9 +196,12 @@ pub fn saved_success_and_uncertain_effect_resume_test() {
             process.send(events, "saved ran")
             Ok(value <> "!")
           })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-            saga.EffectUnknown
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(_, _) { durable.MaybeSent },
+          ),
         )
         |> saga.perform(
           saga.effect("uncertain", fn(value, _) {
@@ -196,12 +209,17 @@ pub fn saved_success_and_uncertain_effect_resume_test() {
             process.sleep_forever()
             Ok(value)
           })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(value, _) {
-            case recovering {
-              True -> saga.EffectCompleted(value <> "recovered")
-              False -> saga.EffectUnknown
-            }
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(value, _) {
+              case recovering {
+                True -> durable.Completed(value <> "recovered")
+                False -> durable.MaybeSent
+              }
+            },
+          ),
         )
       })
     prepare(workflow)
@@ -236,26 +254,32 @@ pub fn rollback_resumes_uncertain_undo_test() {
         input
         |> saga.perform(
           saga.step("resource", fn(value) { Ok(value) })
-          |> saga.undo(fn(_, _) {
+          |> saga.undo(fn(_undo) {
             process.send(events, "undo")
             process.sleep_forever()
             Ok(Nil)
           })
-          |> saga.reconcile_undo(fn(_, _, _) {
+          |> durable.resolve_undo(fn(_undo) {
             case recovering {
-              True -> saga.UndoCompleted
-              False -> saga.UndoUnknown
+              True -> durable.Completed(Nil)
+              False -> durable.MaybeSent
             }
           })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-            saga.EffectUnknown
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(_, _) { durable.MaybeSent },
+          ),
         )
         |> saga.perform(
           saga.step("fail", fn(_) { Error("boom") })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-            saga.EffectUnknown
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(_, _) { durable.MaybeSent },
+          ),
         )
       })
     prepare(workflow)
@@ -308,11 +332,13 @@ pub fn persisted_choice_survives_fresh_definition_test() {
                 process.sleep_forever()
                 Ok(value)
               })
-                |> saga.recoverable(
-                  "1",
-                  codec.text(),
-                  codec.text(),
-                  fn(value, _) { saga.EffectCompleted(value <> "-selected") },
+                |> durable.recoverable(
+                  version: "1",
+                  input: codec.text(),
+                  output: codec.text(),
+                  resolve: fn(value, _) {
+                    durable.Completed(value <> "-selected")
+                  },
                 ),
             )
           },
@@ -320,9 +346,12 @@ pub fn persisted_choice_survives_fresh_definition_test() {
             saga.perform(
               port,
               saga.step("unchosen", fn(_) { Error("unchosen branch ran") })
-                |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-                  saga.EffectUnknown
-                }),
+                |> durable.recoverable(
+                  version: "1",
+                  input: codec.text(),
+                  output: codec.text(),
+                  resolve: fn(_, _) { durable.MaybeSent },
+                ),
             )
           },
         )
@@ -355,13 +384,18 @@ pub fn restart_recovers_two_concurrent_admissions_test() {
         process.sleep_forever()
         Ok(value)
       })
-      |> saga.recoverable("1", codec.text(), codec.text(), fn(value, key) {
-        process.send(entered, #(name, key))
-        case recovering {
-          True -> saga.EffectCompleted(value <> name)
-          False -> saga.EffectUnknown
-        }
-      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(value, key) {
+          process.send(entered, #(name, key))
+          case recovering {
+            True -> durable.Completed(value <> name)
+            False -> durable.MaybeSent
+          }
+        },
+      )
     }
     let assert Ok(workflow) =
       saga.define("two", fn(input) {
@@ -404,16 +438,20 @@ pub fn retry_and_continue_share_local_semantics_test() {
       process.send(attempts, value)
       Error("retry")
     })
-    |> saga.compensate(max_attempts: 2, with: fn(value, _, attempt) {
-      case attempt.number {
+    |> saga.compensate(max_attempts: 2, with: fn(failed) {
+      let saga.FailedAttempt(input: value, ..) = failed
+      case failed.attempt {
         1 -> saga.RetryAfter(1)
         _ -> saga.Continue(value <> "-continued", saga.NoUndo)
       }
     })
-    |> saga.restore_undo(fn(_, _, _) { saga.NoUndo })
-    |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-      saga.EffectUnknown
-    })
+    |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   let assert Ok(workflow) =
     saga.define("retry", fn(input) { saga.perform(input, step) })
   let memory = memory.new()
@@ -490,9 +528,12 @@ pub fn cancellation_reconciles_admitted_absence_without_dispatch_test() {
           process.sleep_forever()
           Ok(value)
         })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-            saga.EffectAbsent
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(_, _) { durable.NotSent },
+          ),
       )
     })
   let persistence = prepare(workflow)
@@ -526,9 +567,12 @@ pub fn bad_input_codec_prevents_effect_test() {
           process.send(effects, Nil)
           Ok(value)
         })
-          |> saga.recoverable("1", bad, codec.text(), fn(_, _) {
-            saga.EffectUnknown
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: bad,
+            output: codec.text(),
+            resolve: fn(_, _) { durable.MaybeSent },
+          ),
       )
     })
   // Codec configuration has no cost or admission requirement for local use.
@@ -556,9 +600,12 @@ pub fn failed_commit_prevents_dispatch_test() {
           process.send(effects, Nil)
           Ok(value)
         })
-          |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-            saga.EffectUnknown
-          }),
+          |> durable.recoverable(
+            version: "1",
+            input: codec.text(),
+            output: codec.text(),
+            resolve: fn(_, _) { durable.MaybeSent },
+          ),
       )
     })
   let persistence = prepare(workflow)
@@ -591,13 +638,16 @@ pub fn parallel_rollback_covers_both_completed_branches_test() {
       process.receive_forever(release)
       Ok(value)
     })
-    |> saga.undo(fn(_, _) {
+    |> saga.undo(fn(_undo) {
       process.send(undone, name)
       Ok(Nil)
     })
-    |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-      saga.EffectUnknown
-    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   }
   let assert Ok(workflow) =
     saga.define("rollback-order", fn(input) {
@@ -607,9 +657,12 @@ pub fn parallel_rollback_covers_both_completed_branches_test() {
       |> saga.map(fn(pair) { pair.0 <> pair.1 })
       |> saga.perform(
         saga.step("fail", fn(_) { Error("boom") })
-        |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-          saga.EffectUnknown
-        }),
+        |> durable.recoverable(
+          version: "1",
+          input: codec.text(),
+          output: codec.text(),
+          resolve: fn(_, _) { durable.MaybeSent },
+        ),
       )
     })
   let persistence = prepare(workflow)
@@ -640,12 +693,17 @@ pub fn persistent_compensation_requires_undo_contract_before_effects_test() {
       process.send(effects, value)
       Error("failed")
     })
-    |> saga.compensate(1, fn(value, _, _) {
+    |> saga.compensate(1, fn(failed) {
+      let saga.FailedAttempt(input: value, ..) = failed
+
       saga.Continue(value, saga.UndoWith(fn() { Ok(Nil) }))
     })
-    |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-      saga.EffectUnknown
-    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   let assert Ok(workflow) =
     saga.define("eligibility", fn(input) { saga.perform(input, step) })
   let text = codec.text()
@@ -660,15 +718,21 @@ pub fn interrupted_compensation_requires_explicit_resolution_test() {
   let make = fn(resolve) {
     let step =
       saga.step("compensate", fn(_) { Error("failed") })
-      |> saga.compensate_with_key(2, fn(_, _, attempt, key) {
+      |> saga.compensate(max_attempts: 2, with: fn(failed) {
+        let attempt = failed.attempt
+        let key = failed.key.attempt_key
+
         process.send(entered, #(attempt, key))
         process.receive_forever(process.new_subject())
       })
-      |> saga.restore_undo(fn(_, _, _) { saga.NoUndo })
-      |> saga.reconcile_compensation(resolve)
-      |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-        saga.EffectUnknown
-      })
+      |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+      |> durable.resolve_compensation(resolve)
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) { durable.MaybeSent },
+      )
     let assert Ok(workflow) =
       saga.define("compensation-recovery", fn(input) {
         saga.perform(input, step)
@@ -677,7 +741,7 @@ pub fn interrupted_compensation_requires_explicit_resolution_test() {
   }
   let memory = memory.new()
   let backend = memory.storage(memory)
-  let persistence = make(fn(_, _, _) { saga.CompensationUnknown })
+  let persistence = make(fn(_, _) { None })
   let assert Ok(reference) =
     durable.start_or_reconnect(backend, "compensation", persistence, "x")
   let result = drive_later(watched(backend, owner), reference, persistence)
@@ -696,10 +760,10 @@ pub fn interrupted_compensation_requires_explicit_resolution_test() {
   durable.read(backend, reference, persistence)
   |> should.equal(Ok(durable.Suspended(expected)))
   let recovered =
-    make(fn(input, saved_attempt, saved_key) {
-      saved_attempt |> should.equal(attempt)
-      saved_key |> should.equal(key)
-      saga.CompensationResolved(saga.Continue(input <> "!", saga.NoUndo))
+    make(fn(input, saved_key) {
+      saved_key.attempt |> should.equal(attempt)
+      saved_key.attempt_key |> should.equal(key)
+      Some(saga.Continue(input <> "!", saga.NoUndo))
     })
   durable.drive(backend, reference, recovered, execution.config())
   |> should.equal(Ok(execution.Completed("x!")))
@@ -724,24 +788,29 @@ fn resolve_interrupted(
           False -> Error("original")
         }
       })
-      |> saga.compensate_with_key(budget, fn(_, _, _, _) {
+      |> saga.compensate(max_attempts: budget, with: fn(_failed) {
         process.send(entered, Nil)
         process.receive_forever(process.new_subject())
       })
-      |> saga.restore_undo(fn(_, _, _) { saga.NoUndo })
-      |> saga.reconcile_compensation(fn(_, attempt, _) {
-        attempt.number |> should.equal(1)
-        attempt.remaining |> should.equal(budget - 1)
-        saga.CompensationResolved(decision)
+      |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+      |> durable.resolve_compensation(fn(_, key) {
+        key.attempt |> should.equal(1)
+        Some(decision)
       })
       |> saga.map_step_errors(fn(e) { "mapped " <> e }, fn(u) { "mapped " <> u })
-      |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-        saga.EffectUnknown
-      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) { durable.MaybeSent },
+      )
       // Reattaching codecs must preserve both reconciliation callbacks.
-      |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-        saga.EffectUnknown
-      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) { durable.MaybeSent },
+      )
     let assert Ok(workflow) =
       saga.define("decision", fn(input) { saga.perform(input, step) })
     prepare(workflow)
@@ -824,38 +893,48 @@ pub fn compensation_continue_restores_undo_after_second_restart_test() {
   let make = fn(stage) {
     let first =
       saga.step("first", fn(_) { Error("failed") })
-      |> saga.compensate(1, fn(_, _, _) {
+      |> saga.compensate(1, fn(_failed) {
         process.send(entered, "compensation")
         process.receive_forever(process.new_subject())
       })
-      |> saga.restore_undo(fn(input, output, _) {
+      |> durable.restore_undo(fn(undo) {
+        let saga.UndoRequest(input: input, output: output, ..) = undo
+
         saga.UndoWith(fn() {
           process.send(undos, input <> output)
           Ok(Nil)
         })
       })
-      |> saga.reconcile_compensation(fn(input, _, _) {
-        saga.CompensationResolved(saga.Continue(
+      |> durable.resolve_compensation(fn(input, _) {
+        Some(saga.Continue(
           input <> "!",
           saga.UndoWith(fn() {
             panic as "original closure must not survive restart"
           }),
         ))
       })
-      |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-        saga.EffectUnknown
-      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) { durable.MaybeSent },
+      )
     let second =
       saga.step("second", fn(_) {
         process.send(entered, "next effect")
         process.receive_forever(process.new_subject())
       })
-      |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-        case stage {
-          2 -> saga.EffectFailed("stop")
-          _ -> saga.EffectUnknown
-        }
-      })
+      |> durable.recoverable(
+        version: "1",
+        input: codec.text(),
+        output: codec.text(),
+        resolve: fn(_, _) {
+          case stage {
+            2 -> durable.Failed("stop")
+            _ -> durable.MaybeSent
+          }
+        },
+      )
     let assert Ok(workflow) =
       saga.define("restore-continue", fn(input) {
         input |> saga.perform(first) |> saga.perform(second)
@@ -947,9 +1026,12 @@ pub fn suspension_recording_reports_both_failures_test() {
     )
   let step =
     saga.step("checked", fn(value) { Ok(value) })
-    |> saga.recoverable("1", broken, codec.text(), fn(_, _) {
-      saga.EffectUnknown
-    })
+    |> durable.recoverable(
+      version: "1",
+      input: broken,
+      output: codec.text(),
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   let assert Ok(workflow) =
     saga.define("recording", fn(input) { saga.perform(input, step) })
   let persistence = prepare(workflow)
@@ -986,13 +1068,18 @@ pub fn suspension_recording_reports_both_failures_test() {
 pub fn false_undo_declaration_blocks_continue_commit_test() {
   let step =
     saga.step("continue", fn(_) { Error("fail") })
-    |> saga.compensate(1, fn(input, _, _) {
+    |> saga.compensate(1, fn(failed) {
+      let saga.FailedAttempt(input: input, ..) = failed
+
       saga.Continue(input, saga.UndoWith(fn() { Ok(Nil) }))
     })
-    |> saga.restore_undo(fn(_, _, _) { saga.NoUndo })
-    |> saga.recoverable("1", codec.text(), codec.text(), fn(_, _) {
-      saga.EffectUnknown
-    })
+    |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   let assert Ok(workflow) =
     saga.define("false-declaration", fn(input) { saga.perform(input, step) })
   let persistence = prepare(workflow)

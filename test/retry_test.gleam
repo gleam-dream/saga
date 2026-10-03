@@ -25,7 +25,7 @@ pub fn retry_until_success_test() {
             False -> Ok(42)
           }
         })
-        |> saga.compensate(max_attempts: 5, with: fn(_i, _f, _a) { saga.Retry }),
+        |> saga.compensate(max_attempts: 5, with: fn(_failed) { saga.Retry }),
       )
     })
 
@@ -41,7 +41,7 @@ pub fn retry_limit_triggers_rollback_test() {
       input
       |> saga.perform(
         saga.step("always_fails", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 3, with: fn(_i, _f, _a) { saga.Retry }),
+        |> saga.compensate(max_attempts: 3, with: fn(_failed) { saga.Retry }),
       )
     })
 
@@ -62,15 +62,16 @@ pub fn compensation_receives_attempt_numbers_test() {
       input
       |> saga.perform(
         saga.step("flaky", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 3, with: fn(_i, failure, attempt) {
+        |> saga.compensate(max_attempts: 3, with: fn(failed) {
+          let saga.FailedAttempt(failure: failure, ..) = failed
           probe.counter_enter(counter)
           let entries = probe.total_entries(counter)
           // 1-based attempt numbers: 1, 2, 3
-          case attempt.number == entries {
+          case failed.attempt == entries {
             True -> Nil
             False -> panic as "attempt number mismatch"
           }
-          case attempt.remaining == 3 - attempt.number {
+          case failed.attempts_left == 3 - failed.attempt {
             True -> Nil
             False -> panic as "remaining mismatch"
           }
@@ -95,7 +96,7 @@ pub fn compensation_decisions_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 3, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 3, with: fn(_failed) {
           saga.Abort(Declined)
         }),
       )
@@ -132,7 +133,7 @@ pub fn compensation_decisions_test() {
             False -> Ok(Nil)
           }
         })
-        |> saga.compensate(max_attempts: 3, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 3, with: fn(_failed) {
           saga.RetryAfter(1)
         }),
       )

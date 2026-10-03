@@ -164,7 +164,7 @@ pub fn observation_events_failed_with_undo_failure_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_i, _o) { Error(UndoBoom) }),
+          |> saga.undo(fn(_undo) { Error(UndoBoom) }),
         )
       a |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
     })
@@ -248,7 +248,9 @@ pub fn step_timeout_with_decider_emits_step_stopped_test() {
           }
         })
         |> saga.timeout(50)
-        |> saga.compensate(max_attempts: 2, with: fn(_i, failure, _a) {
+        |> saga.compensate(max_attempts: 2, with: fn(failed) {
+          let saga.FailedAttempt(failure: failure, ..) = failed
+
           case failure {
             saga.TimedOut -> saga.Retry
             _ -> panic as "expected TimedOut"
@@ -341,7 +343,7 @@ pub fn correlation_reaches_every_event_test() {
       input
       |> saga.perform(
         saga.step("a", fn(x: Int) { Ok(x) })
-        |> saga.undo(fn(_input, _output) { Ok(Nil) }),
+        |> saga.undo(fn(_undo) { Ok(Nil) }),
       )
       |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
     })
@@ -392,9 +394,7 @@ pub fn outcome_kind_is_shared_with_run_stop_test() {
             _ -> Ok(x)
           }
         })
-        |> saga.compensate(max_attempts: 2, with: fn(_input, _failure, _a) {
-          saga.Retry
-        }),
+        |> saga.compensate(max_attempts: 2, with: fn(_failed) { saga.Retry }),
       )
     })
   let plan =

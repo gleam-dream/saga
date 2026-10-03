@@ -30,7 +30,7 @@ pub fn map_panic_between_steps_is_recovered_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_, _) {
+          |> saga.undo(fn(_undo) {
             process.send(undone, Nil)
             Ok(Nil)
           }),
@@ -135,7 +135,7 @@ pub fn map_step_errors_runtime_test() {
         _ -> Ok(x)
       }
     })
-    |> saga.undo(fn(_i, _o) {
+    |> saga.undo(fn(_undo) {
       process.send(undo_ran, Nil)
       Error(UndoBoom)
     })

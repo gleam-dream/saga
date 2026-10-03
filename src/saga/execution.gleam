@@ -381,6 +381,10 @@ pub type UnknownEnding {
   ActionTimedOut
   /// It was still running when the settle window closed, and was killed.
   ActionInterrupted
+  /// The attempt returned an error that `saga.unknown_when` classified as a
+  /// possible effect, such as a timeout after the request may have been
+  /// sent.
+  ActionReturnedUnknown
 }
 
 /// A run's terminal result: success, a failure with its settlement, a
@@ -1107,6 +1111,7 @@ fn to_public_unknown_effect(
         ActionCrashed(saga.crash_from_node(crash))
       coordinator.ActionTimedOut -> ActionTimedOut
       coordinator.ActionInterrupted -> ActionInterrupted
+      coordinator.ActionReturnedUnknown -> ActionReturnedUnknown
     },
   )
 }

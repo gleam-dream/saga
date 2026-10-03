@@ -73,7 +73,9 @@ fn reserve_inventory_step(
       _ -> Error(InventoryUnavailable(order.id, missing))
     }
   })
-  |> saga.undo(fn(_order, hold: InventoryHold) {
+  |> saga.undo(fn(undo) {
+    let saga.UndoRequest(output: hold, ..) = undo
+
     case list_contains(undo_fails_for, hold.order_id) {
       True -> Error(ReleaseInventoryFailed(hold.order_id, "warehouse offline"))
       False -> Ok(Nil)
@@ -97,7 +99,7 @@ fn authorize_payment_step(
         ))
     }
   })
-  |> saga.undo(fn(_order, _authorization: PaymentAuthorization) { Ok(Nil) })
+  |> saga.undo(fn(_undo) { Ok(Nil) })
 }
 
 // ---------------------------------------------------------------------------

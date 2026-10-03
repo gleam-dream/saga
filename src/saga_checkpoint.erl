@@ -78,7 +78,7 @@ schema(compensation_failure) -> [{cleanup_failed,[address,undo]},
     {compensation_crashed,[address,crash]},{compensation_timed_out,[address]}];
 schema(unknown) -> [{unknown_effect,[address,action,ending]}];
 schema(action) -> [{step_attempt,[natural]},{step_compensation,[natural]},{step_undo,[]}];
-schema(ending) -> [{action_crashed,[crash]},{action_timed_out,[]},{action_interrupted,[]}].
+schema(ending) -> [{action_crashed,[crash]},{action_timed_out,[]},{action_interrupted,[]},{action_returned_unknown,[]}].
 
 validate({envelope,1,_,_,_,none,none,_}) -> ok;
 validate({envelope,1,_,_,_,{some,{snapshot,Nodes,Journal,Phase,Failures,_,_}},_,_}) ->

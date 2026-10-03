@@ -47,7 +47,7 @@ pub fn define_rejects_invalid_attempts_test() {
       input
       |> saga.perform(
         saga.step("a", fn(x: Int) { Ok(x) })
-        |> saga.compensate(max_attempts: 0, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 0, with: fn(_failed) {
           saga.Abort(Boom)
         }),
       )
@@ -123,8 +123,8 @@ pub fn describe_reports_capabilities_test() {
       input
       |> saga.perform(
         saga.step("a", fn(x: Int) { Ok(x) })
-        |> saga.undo(fn(_i, _o) { Ok(Nil) })
-        |> saga.compensate(max_attempts: 2, with: fn(_i, _f, _a) {
+        |> saga.undo(fn(_undo) { Ok(Nil) })
+        |> saga.compensate(max_attempts: 2, with: fn(_failed) {
           saga.Abort(Boom)
         }),
       )
@@ -373,7 +373,7 @@ pub fn map_step_errors_translates_run_and_undo_test() {
         _ -> Ok(x)
       }
     })
-    |> saga.undo(fn(_i, _o) { Error(UndoBoom) })
+    |> saga.undo(fn(_undo) { Error(UndoBoom) })
 
   let mapped =
     saga.map_step_errors(

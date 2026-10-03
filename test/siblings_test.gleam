@@ -29,7 +29,7 @@ pub fn failure_with_active_siblings_settles_test() {
             probe.enter(slow_gate)
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             probe.counter_enter(slow_undo_counter)
             Ok(Nil)
           }),

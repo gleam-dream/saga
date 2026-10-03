@@ -15,7 +15,7 @@ pub type Err {
 
 pub fn valid() {
   saga.step("s", fn(x: Int) -> Result(Int, Err) { Ok(x) })
-  |> saga.compensate(max_attempts: 2, with: fn(_input, _failure, _attempt) {
+  |> saga.compensate(max_attempts: 2, with: fn(_failed) {
     saga.Continue(42, saga.NoUndo)
   })
 }

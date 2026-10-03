@@ -28,7 +28,9 @@ fn trip(
 ) -> saga.Workflow(Release, String, String, String) {
   let reserve =
     saga.step("reserve", fn(release: Release) { Ok(release) })
-    |> saga.undo(fn(_input, release) {
+    |> saga.undo(fn(undo) {
+      let saga.UndoRequest(output: release, ..) = undo
+
       process.send(log, "release")
       case release {
         Releases -> Ok(Nil)
@@ -44,7 +46,7 @@ fn trip(
       probe.enter(gate)
       Ok("charged")
     })
-    |> saga.undo(fn(_input, _output) {
+    |> saga.undo(fn(_undo) {
       process.send(log, "refund")
       Ok(Nil)
     })

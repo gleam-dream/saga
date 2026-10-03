@@ -207,7 +207,7 @@ fn run_d2() -> #(
             record(events, #("run", "e1"))
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             record(events, #("undo", "e1"))
             Ok(Nil)
           }),
@@ -219,7 +219,7 @@ fn run_d2() -> #(
             record(events, #("run", "e2"))
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             record(events, #("undo", "e2"))
             Error(UndoBoom("e2"))
           }),
@@ -231,7 +231,7 @@ fn run_d2() -> #(
             record(events, #("run", "e3"))
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             record(events, #("undo", "e3"))
             Error(UndoBoom("e3"))
           }),
@@ -368,7 +368,7 @@ fn run_d3() -> #(
             record(events, #("done", "slow"))
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             record(events, #("undo", "slow"))
             Ok(Nil)
           }),
@@ -388,7 +388,7 @@ fn run_d3() -> #(
             process.send(slow_gate, Release)
             Error(Boom)
           })
-          |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+          |> saga.compensate(max_attempts: 1, with: fn(_failed) {
             record(events, #("compensate", "fast_fail"))
             saga.Abort(Boom)
           }),
@@ -400,7 +400,7 @@ fn run_d3() -> #(
             record(events, #("start", "quick"))
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             record(events, #("undo", "quick"))
             Ok(Nil)
           }),
@@ -483,7 +483,7 @@ fn run_d4() -> #(execution.Outcome(Nil, DemoError, DemoUndoError), Int) {
             False -> Ok(Nil)
           }
         })
-        |> saga.compensate(max_attempts: 3, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 3, with: fn(_failed) {
           record(events, #("retry_decision", ""))
           saga.Retry
         }),
@@ -528,7 +528,7 @@ fn run_d5() -> #(
           record(events, #("run", ""))
           Error(Boom)
         })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           record(events, #("compensate", ""))
           saga.Continue("replacement", saga.NoUndo)
         }),
