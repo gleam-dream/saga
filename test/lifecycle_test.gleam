@@ -33,7 +33,7 @@ pub fn deadline_interrupts_run_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             probe.counter_enter(undo_counter)
             Ok(Nil)
           }),
@@ -73,7 +73,7 @@ pub fn deadline_during_backoff_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 5, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 5, with: fn(_failed) {
           saga.RetryAfter(60_000)
         }),
       )
@@ -138,7 +138,9 @@ pub fn step_timeout_recovery_can_retry_test() {
           }
         })
         |> saga.timeout(50)
-        |> saga.compensate(max_attempts: 2, with: fn(_i, failure, _a) {
+        |> saga.compensate(max_attempts: 2, with: fn(failed) {
+          let saga.FailedAttempt(failure: failure, ..) = failed
+
           case failure {
             saga.TimedOut -> saga.Retry
             _ -> panic as "expected TimedOut"
@@ -178,7 +180,7 @@ pub fn late_result_after_timeout_is_discarded_test() {
           Ok(x)
         })
         |> saga.timeout(50)
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Abort(Boom)
         }),
       )
@@ -212,7 +214,7 @@ pub fn undo_timeout_recorded_and_rollback_continues_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             probe.enter(gate)
             Ok(Nil)
           }),
@@ -244,7 +246,7 @@ pub fn compensation_timeout_recorded_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           probe.enter(gate)
           saga.Abort(Boom)
         }),
@@ -289,7 +291,7 @@ pub fn cancel_with_active_siblings_test() {
             probe.enter(releasable_gate)
             Ok(x)
           })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             probe.counter_enter(undo_counter)
             Ok(Nil)
           }),
@@ -385,7 +387,7 @@ pub fn completion_processed_before_cancel_is_undone_test() {
       input
       |> saga.perform(
         saga.step("s", fn(x: Int) { Ok(x) })
-        |> saga.undo(fn(_i, _o) { Ok(Nil) }),
+        |> saga.undo(fn(_undo) { Ok(Nil) }),
       )
     })
 
@@ -433,7 +435,7 @@ pub fn owner_exit_cancels_and_rolls_back_test() {
           probe.enter(step_gate)
           Ok(x)
         })
-        |> saga.undo(fn(_i, _o) {
+        |> saga.undo(fn(_undo) {
           probe.counter_enter(undo_counter)
           Ok(Nil)
         }),

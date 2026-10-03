@@ -45,6 +45,7 @@ import saga/execution
 import saga/internal/checkpoint
 import saga/internal/coordinator
 import saga/internal/ffi
+import saga/internal/node
 import saga/reconciliation
 import saga/storage.{type Storage}
 
@@ -61,6 +62,93 @@ pub type Error {
   SuspensionNotSaved(cause: Error, recording: Error)
   InvalidConfig(List(execution.ConfigError))
   RunnerLost
+}
+
+/// What a recovery resolver established about an action that was
+/// interrupted before saga saved its result:
+///
+/// - `Completed(value)`: it happened, with this result;
+/// - `Failed(error)`: it happened and failed with this error;
+/// - `NotSent`: it provably never happened, which authorizes saga to run it
+///   again under the same key;
+/// - `MaybeSent`: its effect is unknown, so the execution suspends with
+///   `RecoveryRequired` until a later `drive` can establish it.
+///
+/// The union is closed.
+pub type Evidence(o, e) {
+  Completed(o)
+  Failed(e)
+  NotSent
+  MaybeSent
+}
+
+fn evidence_to_node(evidence: Evidence(o, e)) -> node.Evidence(o, e) {
+  case evidence {
+    Completed(value) -> node.EvidenceCompleted(value)
+    Failed(error) -> node.EvidenceFailed(error)
+    NotSent -> node.EvidenceNotSent
+    MaybeSent -> node.EvidenceMaybeSent
+  }
+}
+
+/// Makes a step recoverable after a restart: `version` names the step's
+/// behavior (change it when the step's callbacks change meaning),
+/// `input` and `output` save its values, and `resolve` establishes the
+/// effect of an attempt that was admitted but whose result was not saved.
+/// `resolve` receives the attempt's input and `EffectKey`, must be safe to
+/// call repeatedly, and is called instead of repeating the attempt. Every
+/// step of a durable workflow needs this capability; `new` names each step
+/// that lacks it. The order relative to `saga.compensate`,
+/// `saga.unknown_when` and `saga.map_step_errors` does not matter, except
+/// that a `Failed` answer from a `recoverable` added after
+/// `map_step_errors` needs a `compensate` decider written in the mapped
+/// vocabulary (see `saga.map_step_errors`).
+pub fn recoverable(
+  step: saga.Step(i, o, e, u),
+  version version: String,
+  input input: Codec(i),
+  output output: Codec(o),
+  resolve resolve: fn(i, saga.EffectKey) -> Evidence(o, e),
+) -> saga.Step(i, o, e, u) {
+  saga.set_recoverable(step, version, input, output, fn(value, key) {
+    evidence_to_node(resolve(value, key))
+  })
+}
+
+/// Declares how to rebuild a compensating step's undo from its saved input
+/// and output, after a restart or after a `Continue` decision. Every
+/// persistent step with `saga.compensate` needs it, even when the answer is
+/// `saga.NoUndo`. The factory must be pure: saga may call it while saving a
+/// checkpoint to check that the undo can be rebuilt.
+pub fn restore_undo(
+  step: saga.Step(i, o, e, u),
+  restore: fn(saga.UndoRequest(i, o)) -> saga.Undo(u),
+) -> saga.Step(i, o, e, u) {
+  saga.set_restore_undo(step, restore)
+}
+
+/// Establishes the effect of an undo that was interrupted: `Completed(Nil)`
+/// when the undo happened, `Failed(error)` when it failed, `NotSent` to run
+/// the saved undo again, and `MaybeSent` to suspend. Without a resolver an
+/// interrupted undo suspends the execution.
+pub fn resolve_undo(
+  step: saga.Step(i, o, e, u),
+  resolve: fn(saga.UndoRequest(i, o)) -> Evidence(Nil, u),
+) -> saga.Step(i, o, e, u) {
+  saga.set_resolve_undo(step, fn(request) { evidence_to_node(resolve(request)) })
+}
+
+/// Establishes the decision of a `saga.compensate` decider that was
+/// interrupted, from the failed attempt's input and `EffectKey`:
+/// `Some(decision)` applies that decision under the original attempt
+/// budget, and `None` keeps the execution suspended. Saga never repeats
+/// the decider itself after a restart, so a decider with an external
+/// effect records its decision under `key.attempt_key`.
+pub fn resolve_compensation(
+  step: saga.Step(i, o, e, u),
+  resolve: fn(i, saga.EffectKey) -> Option(saga.Recovery(o, e, u)),
+) -> saga.Step(i, o, e, u) {
+  saga.set_resolve_compensation(step, resolve)
 }
 
 /// A checked persistence capability for an existing workflow. It adds codecs

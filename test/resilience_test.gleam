@@ -121,7 +121,7 @@ pub fn retry_refused_while_settling_is_distinct_cause_test() {
         input
         |> saga.perform(
           saga.step("retryable", fn(_x: Int) -> Result(Int, Nil) { Error(Nil) })
-          |> saga.compensate(max_attempts: 5, with: fn(_i, _f, _a) {
+          |> saga.compensate(max_attempts: 5, with: fn(_failed) {
             // Blocks until settling has already begun (via `fail_gate`
             // below), so this decision is received by the coordinator only
             // after the run has a different, unrelated terminal trigger.

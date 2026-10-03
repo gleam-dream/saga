@@ -1,3 +1,4 @@
+import gleam/option.{Some}
 import saga
 import saga/codec
 import saga/durable
@@ -17,18 +18,24 @@ pub fn public_durable_choice_test() {
           saga.perform(
             port,
             saga.step("left", fn(_) { Error("unchosen branch ran") })
-              |> saga.recoverable("1", text, text, fn(_, _) {
-                saga.EffectUnknown
-              }),
+              |> durable.recoverable(
+                version: "1",
+                input: text,
+                output: text,
+                resolve: fn(_, _) { durable.MaybeSent },
+              ),
           )
         },
         fn(port) {
           saga.perform(
             port,
             saga.step("right", fn(value) { Ok(value <> "-right") })
-              |> saga.recoverable("1", text, text, fn(_, _) {
-                saga.EffectUnknown
-              }),
+              |> durable.recoverable(
+                version: "1",
+                input: text,
+                output: text,
+                resolve: fn(_, _) { durable.MaybeSent },
+              ),
           )
         },
       )
@@ -67,14 +74,21 @@ pub fn public_compensation_configuration_test() {
   let text = codec.text()
   let step =
     saga.step("recovered", fn(_) { Error("declined") })
-    |> saga.compensate_with_key(1, fn(input, _, _, _) {
+    |> saga.compensate(max_attempts: 1, with: fn(failed) {
+      let saga.FailedAttempt(input: input, ..) = failed
+
       saga.Continue(input, saga.NoUndo)
     })
-    |> saga.reconcile_compensation(fn(input, _, _) {
-      saga.CompensationResolved(saga.Continue(input, saga.NoUndo))
+    |> durable.resolve_compensation(fn(input, _) {
+      Some(saga.Continue(input, saga.NoUndo))
     })
-    |> saga.restore_undo(fn(_, _, _) { saga.NoUndo })
-    |> saga.recoverable("1", text, text, fn(_, _) { saga.EffectUnknown })
+    |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+    |> durable.recoverable(
+      version: "1",
+      input: text,
+      output: text,
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   let assert Ok(workflow) =
     saga.define("compensation", fn(input) { saga.perform(input, step) })
   let assert Ok(persistence) =

@@ -13,32 +13,37 @@
 //// step on a port and returns a port for its output, and `map`, `both`,
 //// `all` and `choose` combine ports. The compiler checks the wiring.
 ////
-//// A step returns `Ok(output)` or a typed `Error(error)`. `undo` registers
-//// the action that reverses a completed step when a later step fails;
-//// `compensate` decides, after a failed attempt, whether to retry, continue
-//// with a substitute output, abort, or hold. `embed` and `map_errors`
-//// compose one workflow into another. `recoverable`, `restore_undo`,
-//// `reconcile_undo` and `reconcile_compensation` add what `saga/durable`
-//// needs to recover a step after a restart.
+//// A step returns `Ok(output)` or a typed `Error(error)`. `effect` gives a
+//// step a stable `EffectKey` to send downstream as an idempotency key.
+//// `undo` registers the action that reverses a completed step when a later
+//// step fails; `compensate` decides, after a failed attempt, whether to
+//// retry, continue with a substitute output, abort, or hold; `unknown_when`
+//// names the returned errors after which the step's effect is unknown.
+//// `embed` and `map_errors` compose one workflow into another.
+//// `saga/durable` adds what a step needs to recover after a restart.
 ////
 //// ```gleam
 //// import saga
 //// import saga/execution
 ////
 //// pub fn checkout() {
-////   saga.define("checkout", fn(order_id) {
-////     order_id
+////   saga.define("checkout", fn(order) {
+////     order
 ////     |> saga.perform(
 ////       saga.step("reserve_inventory", reserve)
-////       |> saga.undo(fn(_order_id, reservation) { release(reservation) }),
+////       |> saga.undo(fn(undo) { release(undo.output) }),
 ////     )
-////     |> saga.perform(saga.step("charge_payment", charge))
+////     |> saga.perform(
+////       saga.effect("charge_payment", fn(reservation, key) {
+////         charge(reservation, idempotency_key: key.idempotency)
+////       })
+////       |> saga.unknown_when(is_maybe_sent),
+////     )
 ////   })
 //// }
 ////
-//// pub fn run_checkout(order_id: String) {
-////   let assert Ok(workflow) = checkout()
-////   execution.run(workflow, order_id, execution.config())
+//// pub fn run_checkout(workflow, order: Order) {
+////   execution.run(workflow, order, execution.config())
 //// }
 //// ```
 
@@ -54,25 +59,59 @@ import saga/internal/cell
 import saga/internal/checkpoint
 import saga/internal/ffi
 import saga/internal/node.{
-  type ErasedRecovery, type Node, AttemptSucceeded, Node,
+  type ErasedRecovery, type Evidence, type Node, AttemptSucceeded,
+  EvidenceCompleted, EvidenceFailed, EvidenceMaybeSent, EvidenceNotSent, Node,
 }
 import saga/internal/store.{type Store}
 import saga/reconciliation
 
-/// A step's recorded location: nested scope (from `embed`), a name, and the
-/// 1-based occurrence rank among nodes sharing the same scope + name.
+/// A step's recorded location: nested scope (from `embed` and `choose`), a
+/// name, and the 1-based occurrence rank among steps sharing the same scope
+/// and name.
 pub type StepAddress {
   StepAddress(scope: List(String), name: String, occurrence: Int)
 }
 
-/// One attempt of a step: its 1-based `number`, and how many further
-/// attempts `remaining` allows (excluding this one).
-pub type Attempt {
-  Attempt(number: Int, remaining: Int)
+/// The keys of one action of a step, for external systems.
+///
+/// - `idempotency` is the same for every attempt of the step within one run
+///   of a local workflow, or one durable execution across restarts. Send it
+///   as the downstream idempotency key, so a retry after an unknown outcome
+///   cannot repeat the effect.
+/// - `attempt` is the 1-based attempt number.
+/// - `attempt_key` is unique to this attempt; use it to record or look up
+///   one attempt.
+///
+/// A local run derives `idempotency` from its run id, which is new for every
+/// `execution.run`; a durable execution derives it from the id given to
+/// `durable.start_or_reconnect`, so it survives restarts. The text of a key
+/// is opaque: compare and store it, never parse it.
+pub type EffectKey {
+  EffectKey(idempotency: String, attempt: Int, attempt_key: String)
+}
+
+/// What an undo action receives: the step's input, the output that
+/// succeeded, and the undo action's own `EffectKey`.
+pub type UndoRequest(i, o) {
+  UndoRequest(input: i, output: o, key: EffectKey)
+}
+
+/// What a `compensate` decider receives about a failed attempt: the step's
+/// input, why the attempt failed, its 1-based number, how many further
+/// attempts the budget allows, and the failed attempt's `EffectKey`.
+pub type FailedAttempt(i, e) {
+  FailedAttempt(
+    input: i,
+    failure: AttemptFailure(e),
+    attempt: Int,
+    attempts_left: Int,
+    key: EffectKey,
+  )
 }
 
 /// Why one attempt did not succeed: the step's own `run` returned an
-/// application error, the attempt task crashed, or it timed out.
+/// application error, the attempt task crashed, or it timed out. The union
+/// is closed.
 pub type AttemptFailure(e) {
   Returned(error: e)
   Crashed(crash: Crash)
@@ -80,7 +119,8 @@ pub type AttemptFailure(e) {
 }
 
 /// A reified native exception: which class was raised, and a formatted
-/// reason. Produced only when a task crashes outside its own `Result`.
+/// reason for logs. Produced only when a task crashes outside its own
+/// `Result`.
 pub type Crash {
   Crash(class: CrashClass, reason: String)
 }
@@ -106,22 +146,16 @@ pub fn address_to_string(address: StepAddress) -> String {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Conversions to/from `saga/internal/node`'s own copies of this vocabulary.
-//
-// `node.gleam` cannot import these types from `saga.gleam` (that would
-// create an import cycle: `saga` already imports `Node`/`ErasedRecovery`
-// from `node`), so `node` keeps its own structurally identical definitions
-// and every value crosses the boundary through these functions.
-// ---------------------------------------------------------------------------
+// `node.gleam` cannot import these types from `saga.gleam` (`saga` imports
+// `node`), so `node` keeps structurally identical copies and every value
+// crosses the boundary through these functions.
 
 fn address_to_node(address: StepAddress) -> node.StepAddress {
   node.StepAddress(address.scope, address.name, address.occurrence)
 }
 
-/// Converts a `node`-owned address back to the public vocabulary. Exposed
-/// for `saga/execution`, which must translate `saga/internal/coordinator`
-/// outcomes (built in terms of `node`'s copies) into the public `Outcome`.
+/// Converts a `node`-owned address back to the public vocabulary, for
+/// `saga/execution` and `saga/durable`.
 @internal
 pub fn address_from_node(address: node.StepAddress) -> StepAddress {
   StepAddress(address.scope, address.name, address.occurrence)
@@ -143,8 +177,7 @@ fn crash_class_from_node(class: ffi.CrashClass) -> CrashClass {
   }
 }
 
-/// Converts a `node`-owned crash back to the public vocabulary. Exposed for
-/// `saga/execution`, for the same reason as `address_from_node`.
+/// Converts a `node`-owned crash back to the public vocabulary.
 @internal
 pub fn crash_from_node(crash: node.Crash) -> Crash {
   Crash(crash_class_from_node(crash.class), crash.reason)
@@ -154,8 +187,7 @@ fn crash_to_node(crash: Crash) -> node.Crash {
   node.Crash(crash_class_to_node(crash.class), crash.reason)
 }
 
-/// Converts a `node`-owned failure back to the public vocabulary. Exposed
-/// for `saga/execution`, for the same reason as `address_from_node`.
+/// Converts a `node`-owned failure back to the public vocabulary.
 @internal
 pub fn failure_from_node(failure: node.AttemptFailure(e)) -> AttemptFailure(e) {
   case failure {
@@ -171,11 +203,12 @@ pub fn failure_from_node(failure: node.AttemptFailure(e)) -> AttemptFailure(e) {
 
 /// An explicit decision about a failing attempt, returned from a
 /// `compensate` decider. `Retry`/`RetryAfter` request another attempt (if
-/// the budget allows); `Continue` accepts a replacement output with its own
-/// undo; `Abort` fails the run and permits rollback of completed steps;
-/// `AbortAfterCleanupFailure` additionally records a cleanup error that
-/// happened while deciding; `Hold` leaves prior effects unresolved with no
-/// rollback authority.
+/// the budget allows; the delay is capped by
+/// `execution.with_max_retry_delay`); `Continue` accepts a replacement
+/// output with its own undo; `Abort` fails the run and permits rollback of
+/// completed steps; `AbortAfterCleanupFailure` additionally records a
+/// cleanup error that happened while deciding; `Hold` leaves prior effects
+/// unresolved with no rollback authority. The union is closed.
 pub type Recovery(o, e, u) {
   Retry
   RetryAfter(milliseconds: Int)
@@ -197,17 +230,47 @@ pub type Undo(u) {
 
 /// A defect in a workflow's authored shape, found by `define` before any
 /// runtime resource exists. All errors are collected, not just the first.
+/// Later releases may add variants, for example for further graph checks:
+/// describe them with `describe_definition_error`.
 pub type DefinitionError {
   EmptyWorkflowName
   EmptyStepName(scope: List(String))
   InvalidMaxAttempts(step: StepAddress, value: Int)
   InvalidTimeout(step: StepAddress, value: Int)
   ForeignPort(step: StepAddress)
-  /// A node was created during the builder (via `perform`/`embed`) but its
-  /// output port was never consumed by anything reaching the workflow's
-  /// final output — the step would silently never run. Named so the
-  /// message can point at exactly which step(s) are unreachable.
+  /// A step was created during the builder (via `perform`/`embed`) but its
+  /// output port never reaches the workflow's final output, so it would
+  /// never run.
   OrphanStep(step: StepAddress)
+}
+
+/// Describes a definition error for logs.
+pub fn describe_definition_error(error: DefinitionError) -> String {
+  case error {
+    EmptyWorkflowName -> "the workflow name is empty"
+    EmptyStepName([]) -> "a step name is empty"
+    EmptyStepName(scope) ->
+      "a step name in " <> string.join(scope, "/") <> " is empty"
+    InvalidMaxAttempts(step, value) ->
+      "step "
+      <> address_to_string(step)
+      <> " has max_attempts "
+      <> int.to_string(value)
+      <> "; it must be at least 1"
+    InvalidTimeout(step, value) ->
+      "step "
+      <> address_to_string(step)
+      <> " has timeout "
+      <> int.to_string(value)
+      <> " ms; it must be positive"
+    ForeignPort(step) ->
+      "a port from another workflow definition is used in "
+      <> address_to_string(step)
+    OrphanStep(step) ->
+      "step "
+      <> address_to_string(step)
+      <> " never reaches the workflow's output, so it would never run"
+  }
 }
 
 /// A static, read-only description of one step: its address, its
@@ -233,19 +296,14 @@ pub type StepDescriptor {
 /// with `perform` inside a `define` builder; they never run until a
 /// `Workflow` starts.
 ///
-/// `attempt`'s `Failed` case carries `recover_returned` already *bound* to
-/// the concrete `e`-typed error it just produced and to the caller-supplied
-/// `decide` — it is never re-exposed as a standalone function of an
-/// abstract failure. This is what keeps `map_step_errors` sound: mapping a
-/// step only ever has to translate the *outputs* `attempt` itself computed
-/// (a fresh `e`/`u` value it produced, never one reconstructed from a
-/// translated value), so `map_error: e1 -> e2` is only ever called forward,
-/// never inverted. `decide_crash` is separate and covers the other two
-/// `AttemptFailure` variants (`Crashed`/`TimedOut`), which is how the
-/// coordinator asks for a recovery decision on a failure it detected
-/// itself (the task never returned a value) without re-invoking — and
-/// re-running the side effect of — `attempt`. Those variants carry no
-/// `e`-typed payload, so `decide_crash` needs no such binding trick either.
+/// A failed attempt (`Failed` below) carries its recovery decision already
+/// bound to the concrete error it produced and to the decider in effect.
+/// This keeps `map_step_errors` sound: mapping a step only translates
+/// values the step itself produced, so `map_error: e1 -> e2` is only ever
+/// called forward, never inverted. `decide_crash` covers `Crashed` and
+/// `TimedOut`, which the coordinator detects itself and which carry no
+/// error value. `resolve` does the same for a durable restart: it is the
+/// recovery resolver with the decider bound in.
 pub opaque type Step(i, o, e, u) {
   Step(
     name: String,
@@ -253,33 +311,47 @@ pub opaque type Step(i, o, e, u) {
     timeout: Option(Int),
     undoable: Bool,
     compensates: Bool,
-    attempt: fn(i, String) -> RunOutcome(o, u, e),
-    persistence: Option(StepPersistence(i, o, e)),
-    undo_for: fn(i, o, String) -> Undo(u),
+    attempt: fn(i, EffectKey) -> RunOutcome(o, u, e),
+    unknown: fn(e) -> Bool,
+    persistence: Option(StepPersistence(i, o)),
+    resolve: Option(fn(i, EffectKey) -> Resumed(o, u, e)),
+    undo_for: fn(UndoRequest(i, o)) -> Undo(u),
     recovery_undo_declared: Bool,
-    resolve_undo: fn(i, o, String) -> UndoStatus(u),
-    resolve_compensation: fn(i, Attempt, String) -> CompensationStatus(o, e, u),
-    decide_returned: Option(fn(i, e, Attempt, String) -> Recovery(o, e, u)),
-    decide_crash: Option(
-      fn(i, CrashOrTimeout, Attempt, String) -> Recovery(o, e, u),
-    ),
+    resolve_undo: fn(UndoRequest(i, o)) -> Evidence(Nil, u),
+    resolve_compensation: fn(i, EffectKey) -> Option(Recovery(o, e, u)),
+    decide_returned: Option(fn(FailedAttempt(i, e)) -> Recovery(o, e, u)),
+    decide_crash: Option(fn(FailedAttempt(i, e)) -> Recovery(o, e, u)),
   )
 }
 
-/// A recovery-triggering failure that never carries an `e`-typed payload:
-/// exactly the two `AttemptFailure` variants the coordinator can detect on
-/// its own, without the task ever returning a value.
-pub type CrashOrTimeout {
-  StepCrashed(crash: Crash)
-  StepTimedOut
+/// The attempt context a bound decision is completed with.
+type Context {
+  Context(number: Int, remaining: Int, key: EffectKey)
 }
 
 type RunOutcome(o, u, e) {
   Succeeded(output: o, undo: Undo(u))
   Failed(
     failure: AttemptFailure(e),
-    recover_returned: Option(fn(Attempt, String) -> Recovery(o, e, u)),
+    recover_returned: Option(fn(Context) -> Recovery(o, e, u)),
+    unknown: Bool,
   )
+}
+
+/// A recovery resolver's answer with the decider bound in.
+type Resumed(o, u, e) {
+  ResumedCompleted(output: o)
+  ResumedFailed(
+    error: e,
+    recover_returned: Option(fn(Context) -> Recovery(o, e, u)),
+    unknown: Bool,
+  )
+  ResumedNotSent
+  ResumedMaybeSent
+}
+
+type StepPersistence(i, o) {
+  StepPersistence(version: String, input: Codec(i), output: Codec(o))
 }
 
 /// Creates a step from its name and its run function. With no further
@@ -289,10 +361,13 @@ pub fn step(name: String, run: fn(i) -> Result(o, e)) -> Step(i, o, e, u) {
   effect(name, fn(input, _key) { run(input) })
 }
 
-/// An effect receives a stable per-attempt key when persistence is enabled.
+/// Creates a step whose run function also receives the attempt's
+/// `EffectKey`. Send `key.idempotency` to the external system as its
+/// idempotency key: it stays the same across retries, so a retry after an
+/// unknown outcome cannot repeat the effect.
 pub fn effect(
   name: String,
-  run: fn(i, String) -> Result(o, e),
+  run: fn(i, EffectKey) -> Result(o, e),
 ) -> Step(i, o, e, u) {
   Step(
     name: name,
@@ -301,15 +376,17 @@ pub fn effect(
     undoable: False,
     compensates: False,
     persistence: None,
-    undo_for: fn(_, _, _) { NoUndo },
+    resolve: None,
+    unknown: fn(_) { False },
+    undo_for: fn(_) { NoUndo },
     recovery_undo_declared: False,
-    resolve_undo: fn(_, _, _) { UndoUnknown },
-    resolve_compensation: fn(_, _, _) { CompensationUnknown },
+    resolve_undo: fn(_) { EvidenceMaybeSent },
+    resolve_compensation: fn(_, _) { None },
     decide_returned: None,
     attempt: fn(input, key) {
       case run(input, key) {
         Ok(output) -> Succeeded(output, NoUndo)
-        Error(error) -> Failed(Returned(error), None)
+        Error(error) -> Failed(Returned(error), None, False)
       }
     },
     decide_crash: None,
@@ -317,32 +394,27 @@ pub fn effect(
 }
 
 /// Attaches an undo action, run only if this step's attempt already
-/// succeeded and the run later rolls back. Receives the same input and the
-/// output that succeeded.
+/// succeeded and the run later rolls back. It receives the step's input,
+/// the output that succeeded and the undo's own `EffectKey`, and runs at
+/// most once: a failed, crashed or timed-out undo is reported in the
+/// settlement and never retried.
 pub fn undo(
   step: Step(i, o, e, u),
-  undo_fn: fn(i, o) -> Result(Nil, u),
-) -> Step(i, o, e, u) {
-  undo_effect(step, fn(input, output, _) { undo_fn(input, output) })
-}
-
-/// An undo action with the execution's stable undo key, used identically
-/// during normal rollback and restoration.
-pub fn undo_effect(
-  step: Step(i, o, e, u),
-  undo_fn: fn(i, o, String) -> Result(Nil, u),
+  run: fn(UndoRequest(i, o)) -> Result(Nil, u),
 ) -> Step(i, o, e, u) {
   let attempt = step.attempt
   Step(
     ..step,
     undoable: True,
-    undo_for: fn(i, o, key) { UndoWith(fn() { undo_fn(i, o, key) }) },
+    undo_for: fn(request) { UndoWith(fn() { run(request) }) },
     attempt: fn(input, key) {
       case attempt(input, key) {
         Succeeded(output, NoUndo) ->
           Succeeded(
             output,
-            UndoWith(fn() { undo_fn(input, output, undo_key(key)) }),
+            UndoWith(fn() {
+              run(UndoRequest(input, output, undo_key(key.idempotency)))
+            }),
           )
         unchanged -> unchanged
       }
@@ -357,122 +429,185 @@ pub fn undo_effect(
 /// **A crash stays visible whatever `decide` returns.** `decide` receives
 /// `Crashed`/`TimedOut` for an attempt that never returned, whose effect may
 /// or may not have happened. Whatever it returns, that attempt is named in
-/// the outcome's `execution.unknown_effects`. In particular, `Abort(error)`
-/// after a crash ends the run with `execution.StepFailed(step, error)`, the
-/// same cause as an aborted typed error: choose an `error` that says the
-/// attempt crashed if the caller must tell the two apart from the cause.
+/// the outcome's `execution.unknown_effects`, as is a returned error that
+/// `unknown_when` classified. In particular, `Abort(error)` after a crash
+/// ends the run with `execution.StepFailed(step, error)`, the same cause as
+/// an aborted typed error: choose an `error` that says the attempt crashed
+/// if the caller must tell the two apart from the cause.
 pub fn compensate(
   step: Step(i, o, e, u),
   max_attempts max_attempts: Int,
-  with decide: fn(i, AttemptFailure(e), Attempt) -> Recovery(o, e, u),
-) -> Step(i, o, e, u) {
-  compensate_with_key(step, max_attempts, fn(input, failure, attempt, _) {
-    decide(input, failure, attempt)
-  })
-}
-
-/// A compensation callback receives a stable key for this step and attempt.
-/// A restart consults `reconcile_compensation`; it never repeats this callback.
-pub fn compensate_with_key(
-  step: Step(i, o, e, u),
-  max_attempts max_attempts: Int,
-  with decide: fn(i, AttemptFailure(e), Attempt, String) -> Recovery(o, e, u),
+  with decide: fn(FailedAttempt(i, e)) -> Recovery(o, e, u),
 ) -> Step(i, o, e, u) {
   let attempt = step.attempt
+  let bind = fn(input, failure) {
+    Some(fn(context: Context) {
+      decide(FailedAttempt(
+        input: input,
+        failure: failure,
+        attempt: context.number,
+        attempts_left: context.remaining,
+        key: context.key,
+      ))
+    })
+  }
   Step(
     ..step,
     max_attempts: max_attempts,
     compensates: True,
-    decide_returned: Some(fn(input, error, attempt, key) {
-      decide(input, Returned(error), attempt, key)
-    }),
+    decide_returned: Some(decide),
+    decide_crash: Some(decide),
     attempt: fn(input, key) {
       case attempt(input, key) {
-        Failed(failure, _) ->
-          Failed(
-            failure,
-            Some(fn(attempt_no, key) { decide(input, failure, attempt_no, key) }),
-          )
+        Failed(failure, _, unknown) ->
+          Failed(failure, bind(input, failure), unknown)
         unchanged -> unchanged
       }
     },
-    decide_crash: Some(fn(input, crash_or_timeout, attempt_no, key) {
-      let failure = case crash_or_timeout {
-        StepCrashed(crash) -> Crashed(crash)
-        StepTimedOut -> TimedOut
+    resolve: option.map(step.resolve, fn(resolve) {
+      fn(input, key) {
+        case resolve(input, key) {
+          ResumedFailed(error, _, unknown) ->
+            ResumedFailed(error, bind(input, Returned(error)), unknown)
+          unchanged -> unchanged
+        }
       }
-      decide(input, failure, attempt_no, key)
     }),
   )
 }
 
-/// Bounds one attempt (and one compensation decision) to `milliseconds`.
+/// Marks the returned errors after which the step's effect is unknown: a
+/// timeout or connection loss after the request may have been sent, for
+/// example. A matching error still reaches the `compensate` decider as
+/// `Returned(error)`, or ends the step like any error when there is none,
+/// and the attempt is also named in the outcome's
+/// `execution.unknown_effects` with `execution.ActionReturnedUnknown`, so a
+/// retried success becomes `CompletedWithUnknownEffects`. Calling it twice
+/// marks the errors either classifier matches.
+pub fn unknown_when(
+  step: Step(i, o, e, u),
+  classify: fn(e) -> Bool,
+) -> Step(i, o, e, u) {
+  let attempt = step.attempt
+  let unknown = step.unknown
+  Step(
+    ..step,
+    unknown: fn(error) { unknown(error) || classify(error) },
+    attempt: fn(input, key) {
+      case attempt(input, key) {
+        Failed(Returned(error) as failure, recover, unknown) ->
+          Failed(failure, recover, unknown || classify(error))
+        unchanged -> unchanged
+      }
+    },
+    resolve: option.map(step.resolve, fn(resolve) {
+      fn(input, key) {
+        case resolve(input, key) {
+          ResumedFailed(error, recover, unknown) ->
+            ResumedFailed(error, recover, unknown || classify(error))
+          unchanged -> unchanged
+        }
+      }
+    }),
+  )
+}
+
+/// Bounds one attempt of this step to `milliseconds`, overriding the run's
+/// `execution.with_step_timeout` default in either direction.
 pub fn timeout(step: Step(i, o, e, u), milliseconds: Int) -> Step(i, o, e, u) {
   Step(..step, timeout: Some(milliseconds))
 }
 
 /// Adapts a step's error and undo-error types into a unified workflow
-/// vocabulary. See the `Step` doc comment for why this only ever
-/// translates `attempt`/`decide_crash`'s *outputs*.
+/// vocabulary. Persistence added by `saga/durable` before the mapping is
+/// kept: its resolver's answers are mapped forward like the step's own
+/// results. A `compensate` decider written in the old vocabulary keeps
+/// deciding the step's failures, including a failure that a resolver added
+/// before the mapping establishes after a restart. A resolver added after
+/// the mapping answers in the new vocabulary, so a `Failed` answer from it
+/// needs a decider in the new vocabulary too: without one the execution
+/// suspends with `durable.InvalidCheckpoint`.
 pub fn map_step_errors(
   step: Step(i, o, e1, u1),
   error map_error: fn(e1) -> e2,
   undo_error map_undo_error: fn(u1) -> u2,
 ) -> Step(i, o, e2, u2) {
+  let map_bound = fn(recover_returned) {
+    option.map(recover_returned, fn(recover_fn) {
+      fn(context) {
+        recover_fn(context) |> map_recovery(map_error, map_undo_error)
+      }
+    })
+  }
+  let map_decider = fn(
+    decide: Option(fn(FailedAttempt(i, e1)) -> Recovery(o, e1, u1)),
+  ) {
+    option.map(decide, fn(decide_fn) {
+      fn(failed: FailedAttempt(i, e2)) {
+        // Only crashes and timeouts reach this mapped decider, and they
+        // carry no error value, so re-tagging touches no `e`.
+        let failure = case failed.failure {
+          Crashed(crash) -> Crashed(crash)
+          TimedOut -> TimedOut
+          Returned(_) ->
+            panic as "saga: a returned failure reached a mapped crash decider"
+        }
+        decide_fn(FailedAttempt(..failed, failure: failure))
+        |> map_recovery(map_error, map_undo_error)
+      }
+    })
+  }
   Step(
     name: step.name,
     max_attempts: step.max_attempts,
     timeout: step.timeout,
     undoable: step.undoable,
     compensates: step.compensates,
-    persistence: None,
+    persistence: step.persistence,
+    unknown: fn(_) { False },
+    resolve: option.map(step.resolve, fn(resolve) {
+      fn(input, key) {
+        case resolve(input, key) {
+          ResumedCompleted(output) -> ResumedCompleted(output)
+          ResumedNotSent -> ResumedNotSent
+          ResumedMaybeSent -> ResumedMaybeSent
+          ResumedFailed(error, recover_returned, unknown) ->
+            ResumedFailed(
+              map_error(error),
+              map_bound(recover_returned),
+              unknown,
+            )
+        }
+      }
+    }),
     recovery_undo_declared: step.recovery_undo_declared,
-    resolve_undo: fn(i, o, key) {
-      case step.resolve_undo(i, o, key) {
-        UndoCompleted -> UndoCompleted
-        UndoStillApplied -> UndoStillApplied
-        UndoUnknown -> UndoUnknown
-        UndoFailed(error) -> UndoFailed(map_undo_error(error))
+    resolve_undo: fn(request) {
+      case step.resolve_undo(request) {
+        EvidenceCompleted(Nil) -> EvidenceCompleted(Nil)
+        EvidenceNotSent -> EvidenceNotSent
+        EvidenceMaybeSent -> EvidenceMaybeSent
+        EvidenceFailed(error) -> EvidenceFailed(map_undo_error(error))
       }
     },
-    resolve_compensation: fn(input, attempt, key) {
-      case step.resolve_compensation(input, attempt, key) {
-        CompensationUnknown -> CompensationUnknown
-        CompensationResolved(recovery) ->
-          CompensationResolved(map_recovery(recovery, map_error, map_undo_error))
-      }
+    resolve_compensation: fn(input, key) {
+      step.resolve_compensation(input, key)
+      |> option.map(map_recovery(_, map_error, map_undo_error))
     },
     decide_returned: None,
-    undo_for: fn(i, o, key) {
-      map_undo(step.undo_for(i, o, key), map_undo_error)
-    },
+    undo_for: fn(request) { map_undo(step.undo_for(request), map_undo_error) },
     attempt: fn(input, key) {
       case step.attempt(input, key) {
         Succeeded(output, undo_choice) ->
           Succeeded(output, map_undo(undo_choice, map_undo_error))
-        Failed(failure, recover_returned) ->
+        Failed(failure, recover_returned, unknown) ->
           Failed(
             failure: map_attempt_failure(failure, map_error),
-            recover_returned: option.map(recover_returned, fn(recover_fn) {
-              fn(attempt_no, key) {
-                recover_fn(attempt_no, key)
-                |> map_recovery(map_error, map_undo_error)
-              }
-            }),
+            recover_returned: map_bound(recover_returned),
+            unknown: unknown,
           )
       }
     },
-    decide_crash: option.map(step.decide_crash, fn(decide_fn) {
-      fn(
-        input: i,
-        crash_or_timeout: CrashOrTimeout,
-        attempt_no: Attempt,
-        key: String,
-      ) {
-        decide_fn(input, crash_or_timeout, attempt_no, key)
-        |> map_recovery(map_error, map_undo_error)
-      }
-    }),
+    decide_crash: map_decider(step.decide_crash),
   )
 }
 
@@ -515,6 +650,102 @@ fn map_undo(undo_choice: Undo(u1), f: fn(u1) -> u2) -> Undo(u2) {
         }
       })
   }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence capability, set by `saga/durable`
+// ---------------------------------------------------------------------------
+
+/// Adds the persistence capability `durable.recoverable` describes: the
+/// step's version, its input and output codecs, and the resolver for an
+/// interrupted attempt, with the current decider and `unknown_when`
+/// classifier bound in.
+@internal
+pub fn set_recoverable(
+  step: Step(i, o, e, u),
+  version: String,
+  input: Codec(i),
+  output: Codec(o),
+  resolve: fn(i, EffectKey) -> Evidence(o, e),
+) -> Step(i, o, e, u) {
+  let decide = step.decide_returned
+  let unknown = step.unknown
+  Step(
+    ..step,
+    persistence: Some(StepPersistence(version, input, output)),
+    resolve: Some(fn(value, key) {
+      case resolve(value, key) {
+        EvidenceCompleted(output) -> ResumedCompleted(output)
+        EvidenceNotSent -> ResumedNotSent
+        EvidenceMaybeSent -> ResumedMaybeSent
+        EvidenceFailed(error) ->
+          ResumedFailed(
+            error,
+            option.map(decide, fn(decide_fn) {
+              fn(context: Context) {
+                decide_fn(FailedAttempt(
+                  input: value,
+                  failure: Returned(error),
+                  attempt: context.number,
+                  attempts_left: context.remaining,
+                  key: context.key,
+                ))
+              }
+            }),
+            unknown(error),
+          )
+      }
+    }),
+  )
+}
+
+/// Declares how to rebuild the step's undo from saved values.
+@internal
+pub fn set_restore_undo(
+  step: Step(i, o, e, u),
+  restore: fn(UndoRequest(i, o)) -> Undo(u),
+) -> Step(i, o, e, u) {
+  Step(..step, undo_for: restore, recovery_undo_declared: True)
+}
+
+/// Sets the resolver for an interrupted undo.
+@internal
+pub fn set_resolve_undo(
+  step: Step(i, o, e, u),
+  resolve: fn(UndoRequest(i, o)) -> Evidence(Nil, u),
+) -> Step(i, o, e, u) {
+  Step(..step, resolve_undo: resolve)
+}
+
+/// Sets the resolver for an interrupted compensation decision.
+@internal
+pub fn set_resolve_compensation(
+  step: Step(i, o, e, u),
+  resolve: fn(i, EffectKey) -> Option(Recovery(o, e, u)),
+) -> Step(i, o, e, u) {
+  Step(..step, resolve_compensation: resolve)
+}
+
+/// The `EffectKey` of attempt `number` of a step with stable key `base`.
+fn effect_key(base: String, number: Int) -> EffectKey {
+  EffectKey(
+    idempotency: base,
+    attempt: number,
+    attempt_key: base <> ":attempt:" <> int.to_string(number),
+  )
+}
+
+/// The `EffectKey` of the undo of a step with stable key `base`.
+fn undo_key(base: String) -> EffectKey {
+  effect_key(base <> ":undo", 1)
+}
+
+fn context_from_node(attempt: node.Attempt) -> Context {
+  Context(
+    number: attempt.number,
+    remaining: attempt.remaining,
+    key: effect_key(attempt.base, attempt.number),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -704,8 +935,8 @@ pub fn choose(
     perform(
       decision,
       step(name, fn(value) { Ok(value) })
-        |> recoverable("choice-1", codec.bool(), codec.bool(), fn(value, _) {
-          EffectCompleted(value)
+        |> set_recoverable("choice-1", codec.bool(), codec.bool(), fn(value, _) {
+          EvidenceCompleted(value)
         }),
     )
   let yes = choice_branch(input, selected, name, True, when_true)
@@ -805,10 +1036,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             run_store
               |> store.put(id, output)
               |> store.put_record(id, #(input, output, has_undo(undo_choice))),
-            case undo_choice {
-              NoUndo -> None
-              UndoWith(run) -> Some(fn() { run() })
-            },
+            undo_option(undo_choice),
           )
         })
       Abort(error) -> node.EAbort(error)
@@ -818,19 +1046,34 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
     }
   }
 
-  // `prepare_attempt`/`prepare_crash_recovery` are themselves called by the
-  // coordinator, so this is where `capture_input` (the port's fetch,
-  // level 2 — see `Port`'s doc comment) is invoked: every underlying
-  // dependency read it performs (`store.get`, which only the coordinator —
-  // the process that owns this run's `Store` — may call) happens here, in
-  // the coordinator. Its result, `produce_value`, is the pure level-3
-  // thunk: for a plain dependency it just returns the already-read value,
-  // but for a `map`med port it also closes over the caller-supplied
-  // (potentially panicking, potentially slow) transformation function.
-  // `produce_value` is therefore only ever invoked from inside the spawned
-  // task body below, under `rescue`, never here — so a panicking or slow
-  // `map` becomes an ordinary attempt crash/duration instead of taking the
-  // coordinator down or blocking it.
+  let bind_recovery = fn(
+    recover_returned: Option(fn(Context) -> Recovery(o, e, u)),
+    value: i,
+  ) {
+    option.map(recover_returned, fn(recover_fn) {
+      fn(node_attempt: node.Attempt) {
+        fn() {
+          to_erased_recovery(recover_fn(context_from_node(node_attempt)), value)
+        }
+      }
+    })
+  }
+
+  let succeeded = fn(value: i, output: o, undo_choice: Undo(u)) {
+    AttemptSucceeded(commit: fn(commit_store) {
+      #(
+        commit_store
+          |> store.put(id, output)
+          |> store.put_record(id, #(value, output, has_undo(undo_choice))),
+        undo_option(undo_choice),
+      )
+    })
+  }
+
+  // `prepare_attempt`/`prepare_crash_recovery` run in the coordinator, which
+  // alone owns the run's `Store`: `capture_input(run_store)` performs every
+  // dependency read there. The thunk it returns, which may run a slow or
+  // panicking `map`, runs only inside the spawned task, under `rescue`.
   let prepare_attempt = fn(node_attempt: node.Attempt, run_store: Store) -> fn() ->
     node.AttemptResult(e, u) {
     let produce_value = capture_input(run_store)
@@ -850,54 +1093,28 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       case prepared {
         Error(reason) -> node.AttemptBlocked(checkpoint.CodecFailure(reason))
         Ok(value) ->
-          case step.attempt(value, node_attempt.key) {
+          case
+            step.attempt(
+              value,
+              effect_key(node_attempt.base, node_attempt.number),
+            )
+          {
             Succeeded(output, undo_choice) ->
-              AttemptSucceeded(commit: fn(commit_store) {
-                #(
-                  commit_store
-                    |> store.put(id, output)
-                    |> store.put_record(id, #(
-                      value,
-                      output,
-                      has_undo(undo_choice),
-                    )),
-                  case undo_choice {
-                    NoUndo -> None
-                    UndoWith(run) -> Some(fn() { run() })
-                  },
-                )
-              })
-            Failed(failure, recover_returned) ->
+              succeeded(value, output, undo_choice)
+            Failed(failure, recover_returned, unknown) ->
               node.AttemptFailed(
                 failure: failure_to_node(failure),
-                recover: option.map(recover_returned, fn(recover_fn) {
-                  fn(node_attempt: node.Attempt) {
-                    fn() {
-                      to_erased_recovery(
-                        recover_fn(
-                          attempt_from_node(node_attempt),
-                          compensation_key(node_attempt.key),
-                        ),
-                        value,
-                      )
-                    }
-                  }
-                }),
+                recover: bind_recovery(recover_returned, value),
+                unknown: unknown,
               )
           }
       }
     }
   }
 
-  // The coordinator's path for a crash/timeout it observed itself (the task
-  // never returned an `AttemptResult` at all, so `AttemptFailed.recover` was
-  // never bound). This calls `decide_crash` directly with the input value
-  // for this attempt — not a re-run of the step's effect, so nothing is
-  // repeated. As with `prepare_attempt` above, `capture_input(run_store)`
-  // (every underlying dependency read) runs here, in the coordinator, while
-  // the resulting `produce_value` thunk is only invoked inside the returned
-  // inner thunk (run inside the recovery task, under `rescue`), so a
-  // panicking or slow upstream `map` cannot crash or block the coordinator.
+  // The coordinator's path for a crash or timeout it observed itself: the
+  // task never returned, so this asks the decider directly, with the input
+  // of this attempt, and never repeats the step's effect.
   let prepare_crash_recovery =
     option.map(step.decide_crash, fn(decide_fn) {
       fn(
@@ -906,13 +1123,13 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
         run_store: Store,
       ) -> fn() -> ErasedRecovery(e, u) {
         let produce_value = capture_input(run_store)
-        let crash_or_timeout = case node_failure {
-          node.Crashed(crash) -> StepCrashed(crash_from_node(crash))
-          node.TimedOut -> StepTimedOut
+        let failure = case node_failure {
+          node.Crashed(crash) -> Crashed(crash_from_node(crash))
+          node.TimedOut -> TimedOut
           node.Returned(_) ->
             panic as "saga: prepare_crash_recovery received a Returned failure"
         }
-        let attempt = attempt_from_node(node_attempt)
+        let context = context_from_node(node_attempt)
         fn() {
           let input = case
             node_attempt.persistent,
@@ -927,12 +1144,13 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             Error(reason) -> node.EBlocked(checkpoint.CodecFailure(reason))
             Ok(input) ->
               to_erased_recovery(
-                decide_fn(
-                  input,
-                  crash_or_timeout,
-                  attempt,
-                  compensation_key(node_attempt.key),
-                ),
+                decide_fn(FailedAttempt(
+                  input: input,
+                  failure: failure,
+                  attempt: context.number,
+                  attempts_left: context.remaining,
+                  key: context.key,
+                )),
                 input,
               )
           }
@@ -958,14 +1176,15 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             [p.version, codec.version(p.input), codec.version(p.output)],
             "",
           ),
-          freeze: fn(run_store, key) {
+          freeze: fn(run_store, base) {
             use pair <- result.try(case store.get_record(run_store, id) {
               Ok(pair) -> Ok(pair)
               Error(Nil) -> Error("missing checkpoint value")
             })
             let #(input, output, undoable) = pair
+            let request = UndoRequest(input, output, undo_key(base))
             use _ <- result.try(
-              case undoable && !has_undo(step.undo_for(input, output, key)) {
+              case undoable && !has_undo(step.undo_for(request)) {
                 True ->
                   Error(
                     "undo reconstruction contract returned NoUndo: "
@@ -985,7 +1204,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               },
             ])
           },
-          thaw: fn(saved, _run_store, key) {
+          thaw: fn(saved, _run_store, base) {
             case saved {
               [input, output, undo_kind] -> {
                 use input <- result.try(codec.decode(p.input, input))
@@ -993,7 +1212,9 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                 use undo <- result.try(case undo_kind {
                   "none" -> Ok(None)
                   "undo" ->
-                    case step.undo_for(input, output, key) {
+                    case
+                      step.undo_for(UndoRequest(input, output, undo_key(base)))
+                    {
                       NoUndo ->
                         Error("saved undo requires restore_undo: " <> step.name)
                       UndoWith(run) -> Ok(Some(run))
@@ -1018,7 +1239,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           },
           resume_compensation: fn(attempt, _run_store) {
             fn() {
-              let key = compensation_key(attempt.key)
+              let key = effect_key(attempt.base, attempt.number)
               case attempt.saved_input {
                 None ->
                   node.EBlocked(checkpoint.InvalidState(
@@ -1029,29 +1250,22 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                     Error(reason) ->
                       node.EBlocked(checkpoint.CodecFailure(reason))
                     Ok(input) ->
-                      case
-                        step.resolve_compensation(
-                          input,
-                          attempt_from_node(attempt),
-                          key,
-                        )
-                      {
-                        CompensationUnknown ->
+                      case step.resolve_compensation(input, key) {
+                        None ->
                           node.EBlocked(
                             checkpoint.Uncertain(reconciliation.Required(
                               step.name,
                               reconciliation.Compensation,
-                              key,
+                              key.attempt_key,
                             )),
                           )
-                        CompensationResolved(recovery) ->
-                          to_erased_recovery(recovery, input)
+                        Some(recovery) -> to_erased_recovery(recovery, input)
                       }
                   }
               }
             }
           },
-          resume_undo: fn(run_store, key) {
+          resume_undo: fn(run_store, base) {
             fn() {
               use pair <- result.try(case store.get_record(run_store, id) {
                 Ok(pair) -> Ok(pair)
@@ -1059,19 +1273,20 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                   Error(checkpoint.InvalidState("missing undo values"))
               })
               let #(input, output, _) = pair
-              case step.resolve_undo(input, output, key) {
-                UndoCompleted -> Ok(Ok(Nil))
-                UndoFailed(error) -> Ok(Error(error))
-                UndoUnknown ->
+              let request = UndoRequest(input, output, undo_key(base))
+              case step.resolve_undo(request) {
+                EvidenceCompleted(Nil) -> Ok(Ok(Nil))
+                EvidenceFailed(error) -> Ok(Error(error))
+                EvidenceMaybeSent ->
                   Error(
                     checkpoint.Uncertain(reconciliation.Required(
                       step.name,
                       reconciliation.Undo,
-                      key,
+                      request.key.attempt_key,
                     )),
                   )
-                UndoStillApplied ->
-                  case step.undo_for(input, output, key) {
+                EvidenceNotSent ->
+                  case step.undo_for(request) {
                     NoUndo ->
                       Error(checkpoint.InvalidState("missing restored undo"))
                     UndoWith(run) -> Ok(run())
@@ -1082,9 +1297,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           resume: fn(attempt, run_store) {
             let produce = capture_input(run_store)
             fn() {
+              let key = effect_key(attempt.base, attempt.number)
               let input = case attempt.saved_input {
                 None -> Ok(produce())
                 Some(encoded) -> codec.decode(p.input, encoded)
+              }
+              let resumed = case step.resolve {
+                Some(resolve) -> resolve
+                None -> fn(_, _) { ResumedMaybeSent }
               }
               case input {
                 Error(reason) ->
@@ -1097,60 +1317,41 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                         False -> prepare_attempt(attempt, run_store)()
                       }
                     Some(_) ->
-                      case p.resolve(input, attempt.key) {
-                        EffectUnknown ->
+                      case resumed(input, key) {
+                        ResumedMaybeSent ->
                           node.AttemptBlocked(
                             checkpoint.Uncertain(reconciliation.Required(
                               step.name,
                               reconciliation.Activity,
-                              attempt.key,
+                              key.attempt_key,
                             )),
                           )
-                        EffectAbsent ->
+                        ResumedNotSent ->
                           case attempt.cancelled {
                             True -> node.AttemptAbsent
                             False -> prepare_attempt(attempt, run_store)()
                           }
-                        EffectCompleted(output) -> {
-                          let undo =
-                            step.undo_for(input, output, undo_key(attempt.key))
-                          AttemptSucceeded(fn(run_store) {
-                            #(
-                              run_store
-                                |> store.put(id, output)
-                                |> store.put_record(id, #(
-                                  input,
-                                  output,
-                                  has_undo(undo),
-                                )),
-                              undo_option(undo),
-                            )
-                          })
-                        }
-                        EffectFailed(error) ->
-                          case step.decide_returned, step.compensates {
+                        ResumedCompleted(output) ->
+                          succeeded(
+                            input,
+                            output,
+                            step.undo_for(UndoRequest(
+                              input,
+                              output,
+                              undo_key(attempt.base),
+                            )),
+                          )
+                        ResumedFailed(error, recover_returned, unknown) ->
+                          case recover_returned, step.compensates {
                             None, True ->
                               node.AttemptBlocked(checkpoint.InvalidState(
                                 "mapped recovery requires a decider after error mapping",
                               ))
-                            decider, _ ->
+                            _, _ ->
                               node.AttemptFailed(
                                 node.Returned(error),
-                                option.map(decider, fn(decide) {
-                                  fn(node_attempt) {
-                                    fn() {
-                                      to_erased_recovery(
-                                        decide(
-                                          input,
-                                          error,
-                                          attempt_from_node(node_attempt),
-                                          compensation_key(node_attempt.key),
-                                        ),
-                                        input,
-                                      )
-                                    }
-                                  }
-                                }),
+                                bind_recovery(recover_returned, input),
+                                unknown,
                               )
                           }
                       }
@@ -1199,10 +1400,6 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       }
     },
   )
-}
-
-fn attempt_from_node(attempt: node.Attempt) -> Attempt {
-  Attempt(attempt.number, attempt.remaining)
 }
 
 fn failure_to_node(failure: AttemptFailure(e)) -> node.AttemptFailure(e) {
@@ -1746,69 +1943,11 @@ fn retype_empty_port(
   )
 }
 
-/// Status of an interrupted external attempt. Absence explicitly authorizes a
-/// retry under the original key; unknown never authorizes another effect.
-pub type EffectStatus(o, e) {
-  EffectCompleted(o)
-  EffectFailed(e)
-  EffectAbsent
-  EffectUnknown
-}
-
-type StepPersistence(i, o, e) {
-  StepPersistence(
-    version: String,
-    input: Codec(i),
-    output: Codec(o),
-    resolve: fn(i, String) -> EffectStatus(o, e),
-  )
-}
-
-/// Adds persistence capability to an ordinary step. Call after error mapping.
-/// The definition version covers callback semantics, including pure maps.
-pub fn recoverable(
-  step: Step(i, o, e, u),
-  version: String,
-  input: Codec(i),
-  output: Codec(o),
-  resolve: fn(i, String) -> EffectStatus(o, e),
-) -> Step(i, o, e, u) {
-  Step(
-    ..step,
-    persistence: Some(StepPersistence(version, input, output, resolve)),
-  )
-}
-
-/// Declares how to reconstruct undo from saved values and a stable key.
-/// Required for every persistent compensating step, including an explicit
-/// `NoUndo` declaration. The factory must be pure; checkpoints may call it to
-/// validate the capability before saving a Continue result.
-pub fn restore_undo(
-  step: Step(i, o, e, u),
-  restore: fn(i, o, String) -> Undo(u),
-) -> Step(i, o, e, u) {
-  Step(..step, undo_for: restore, recovery_undo_declared: True)
-}
-
 fn undo_option(undo: Undo(u)) -> Option(fn() -> Result(Nil, u)) {
   case undo {
     NoUndo -> None
     UndoWith(run) -> Some(run)
   }
-}
-
-pub type UndoStatus(u) {
-  UndoCompleted
-  UndoStillApplied
-  UndoFailed(u)
-  UndoUnknown
-}
-
-pub fn reconcile_undo(
-  step: Step(i, o, e, u),
-  resolve: fn(i, o, String) -> UndoStatus(u),
-) -> Step(i, o, e, u) {
-  Step(..step, resolve_undo: resolve)
 }
 
 /// Checks that every node can be restored and fingerprints its structural
@@ -1904,42 +2043,4 @@ fn has_undo(undo: Undo(u)) -> Bool {
     NoUndo -> False
     UndoWith(_) -> True
   }
-}
-
-fn undo_key(attempt_key: String) -> String {
-  attempt_key
-  |> string.split(":")
-  |> list.reverse
-  |> list.drop(2)
-  |> list.reverse
-  |> string.join(":")
-  |> string.append(":undo")
-}
-
-/// Evidence for an interrupted compensation decision. Unknown keeps the run
-/// suspended. A resolved decision is subject to the original attempt budget
-/// and the execution's cancellation state.
-pub type CompensationStatus(o, e, u) {
-  CompensationResolved(Recovery(o, e, u))
-  CompensationUnknown
-}
-
-/// Reads external evidence using the original input, attempt, and stable key.
-/// The resolver must be safe to call repeatedly. Configuration order relative
-/// to `recoverable` does not matter.
-pub fn reconcile_compensation(
-  step: Step(i, o, e, u),
-  resolve: fn(i, Attempt, String) -> CompensationStatus(o, e, u),
-) -> Step(i, o, e, u) {
-  Step(..step, resolve_compensation: resolve)
-}
-
-fn compensation_key(attempt_key: String) -> String {
-  let parts = string.split(attempt_key, ":") |> list.reverse
-  let number = list.first(parts) |> result.unwrap("1")
-  parts
-  |> list.drop(2)
-  |> list.reverse
-  |> string.join(":")
-  |> string.append(":compensation:" <> number)
 }

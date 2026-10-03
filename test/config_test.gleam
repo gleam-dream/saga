@@ -267,10 +267,9 @@ pub fn retry_after_delay_is_capped_test() {
             _ -> Ok(x)
           }
         })
-        |> saga.compensate(
-          max_attempts: 2,
-          with: fn(_input, _failure, _attempt) { saga.RetryAfter(3_600_000) },
-        ),
+        |> saga.compensate(max_attempts: 2, with: fn(_failed) {
+          saga.RetryAfter(3_600_000)
+        }),
       )
     })
   let config = execution.config() |> execution.with_max_retry_delay(10)
@@ -294,10 +293,9 @@ pub fn default_retry_delay_cap_is_five_minutes_test() {
             _ -> Ok(x)
           }
         })
-        |> saga.compensate(
-          max_attempts: 2,
-          with: fn(_input, _failure, _attempt) { saga.RetryAfter(10_000_000) },
-        ),
+        |> saga.compensate(max_attempts: 2, with: fn(_failed) {
+          saga.RetryAfter(10_000_000)
+        }),
       )
     })
   let assert Ok(sinal.SubscriptionCompletion(Nil, [])) =

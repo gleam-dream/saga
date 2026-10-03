@@ -1,6 +1,7 @@
 /// Fresh-VM compensation recovery, invoked by check_durable_restart.sh.
 import gleam/erlang/process
 import gleam/io
+import gleam/option.{None, Some}
 import saga
 import saga/codec
 import saga/durable
@@ -25,7 +26,9 @@ pub fn main() -> Nil {
   let text = codec.text()
   let branch = fn(name) {
     saga.step(name, fn(_) { Error("declined") })
-    |> saga.compensate_with_key(2, fn(_, _, _, key) {
+    |> saga.compensate(max_attempts: 2, with: fn(failed) {
+      let key = failed.key.attempt_key
+
       case first_vm {
         True -> {
           write_ledger(path <> "." <> name, key)
@@ -35,17 +38,20 @@ pub fn main() -> Nil {
         False -> saga.Abort("compensation repeated")
       }
     })
-    |> saga.reconcile_compensation(fn(input, attempt, key) {
-      let assert 1 = attempt.number
-      let assert 1 = attempt.remaining
-      case ledger_has(path <> "." <> name, key) {
-        True ->
-          saga.CompensationResolved(saga.Continue(input <> name, saga.NoUndo))
-        False -> saga.CompensationUnknown
+    |> durable.resolve_compensation(fn(input, key) {
+      let assert 1 = key.attempt
+      case ledger_has(path <> "." <> name, key.attempt_key) {
+        True -> Some(saga.Continue(input <> name, saga.NoUndo))
+        False -> None
       }
     })
-    |> saga.restore_undo(fn(_, _, _) { saga.NoUndo })
-    |> saga.recoverable("1", text, text, fn(_, _) { saga.EffectUnknown })
+    |> durable.restore_undo(fn(_undo) { saga.NoUndo })
+    |> durable.recoverable(
+      version: "1",
+      input: text,
+      output: text,
+      resolve: fn(_, _) { durable.MaybeSent },
+    )
   }
   let assert Ok(workflow) =
     saga.define("vm-compensation", fn(input) {

@@ -28,19 +28,24 @@ fn definition(
     saga.effect(name, fn(input, key) {
       case first_vm {
         True -> {
-          write_ledger(path <> "." <> name, key)
+          write_ledger(path <> "." <> name, key.attempt_key)
           process.sleep(60_000)
           Ok(input <> name)
         }
         False -> Error("effect ran twice")
       }
     })
-    |> saga.recoverable("1", text, text, fn(input, key) {
-      case ledger_has(path <> "." <> name, key) {
-        True -> saga.EffectCompleted(input <> name)
-        False -> saga.EffectUnknown
-      }
-    })
+    |> durable.recoverable(
+      version: "1",
+      input: text,
+      output: text,
+      resolve: fn(input, key) {
+        case ledger_has(path <> "." <> name, key.attempt_key) {
+          True -> durable.Completed(input <> name)
+          False -> durable.MaybeSent
+        }
+      },
+    )
   }
   let assert Ok(workflow) =
     saga.define("vm-recovery", fn(input) {
@@ -53,7 +58,12 @@ fn definition(
               False -> Error("saved step reran")
             }
           })
-            |> saga.recoverable("1", text, text, fn(_, _) { saga.EffectUnknown }),
+            |> durable.recoverable(
+              version: "1",
+              input: text,
+              output: text,
+              resolve: fn(_, _) { durable.MaybeSent },
+            ),
         )
       saga.both(
         saga.perform(shared, branch("a")),

@@ -22,13 +22,13 @@ pub fn failure_undoes_completed_steps_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x + 1) })
-          |> saga.undo(fn(_i, _o) { Ok(Nil) }),
+          |> saga.undo(fn(_undo) { Ok(Nil) }),
         )
       let b =
         a
         |> saga.perform(
           saga.step("b", fn(x: Int) { Ok(x + 1) })
-          |> saga.undo(fn(_i, _o) { Ok(Nil) }),
+          |> saga.undo(fn(_undo) { Ok(Nil) }),
         )
       b |> saga.perform(saga.step("c", fn(_x: Int) { Error(Boom) }))
     })
@@ -53,13 +53,13 @@ pub fn multiple_undo_failures_retained_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x + 1) })
-          |> saga.undo(fn(_i, _o) { Error(UndoBoom("a")) }),
+          |> saga.undo(fn(_undo) { Error(UndoBoom("a")) }),
         )
       let b =
         a
         |> saga.perform(
           saga.step("b", fn(x: Int) { Ok(x + 1) })
-          |> saga.undo(fn(_i, _o) { Error(UndoBoom("b")) }),
+          |> saga.undo(fn(_undo) { Error(UndoBoom("b")) }),
         )
       b |> saga.perform(saga.step("c", fn(_x: Int) { Error(Boom) }))
     })
@@ -83,7 +83,7 @@ pub fn compensation_vs_undo_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x + 1) })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             probe.counter_enter(undo_counter)
             Ok(Nil)
           }),
@@ -91,7 +91,7 @@ pub fn compensation_vs_undo_test() {
       a
       |> saga.perform(
         saga.step("b", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           probe.counter_enter(compensate_counter)
           saga.Abort(Boom)
         }),
@@ -128,12 +128,12 @@ pub fn hold_leaves_completed_effects_unresolved_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x + 1) })
-          |> saga.undo(fn(_i, _o) { Ok(Nil) }),
+          |> saga.undo(fn(_undo) { Ok(Nil) }),
         )
       a
       |> saga.perform(
         saga.step("b", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Hold(Boom)
         }),
       )
@@ -157,7 +157,13 @@ pub fn undo_receives_input_and_output_test() {
         input
         |> saga.perform(
           saga.step("a", fn(x: Int) { Ok(x + 10) })
-          |> saga.undo(fn(received_input, received_output) {
+          |> saga.undo(fn(undo) {
+            let saga.UndoRequest(
+              input: received_input,
+              output: received_output,
+              ..,
+            ) = undo
+
             case received_input == 5 && received_output == 15 {
               True -> Ok(Nil)
               False -> Error(UndoBoom("a: wrong args"))
@@ -182,7 +188,7 @@ pub fn continue_replacement_undo_used_test() {
       input
       |> saga.perform(
         saga.step("a", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Continue(42, saga.UndoWith(fn() { Ok(Nil) }))
         }),
       )

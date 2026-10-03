@@ -185,8 +185,8 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
             probe.counter_leave(counter)
             Error(Nil)
           })
-          |> saga.compensate(max_attempts: 2, with: fn(_i, _f, attempt) {
-            case attempt.number {
+          |> saga.compensate(max_attempts: 2, with: fn(failed) {
+            case failed.attempt {
               1 -> saga.RetryAfter(300)
               _ -> saga.Continue(0, saga.NoUndo)
             }

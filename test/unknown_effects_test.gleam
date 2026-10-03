@@ -4,6 +4,7 @@
 //// pin that the final `Outcome` alone names every action of the second kind,
 //// for each outcome kind, through `execution.unknown_effects`.
 
+import gleam/erlang/process
 import gleam/list
 import gleeunit/should
 import saga
@@ -12,6 +13,7 @@ import support/probe
 
 pub type DemoError {
   Boom
+  MaybeSent
 }
 
 pub type DemoUndoError {
@@ -22,6 +24,7 @@ type Kind {
   Crashed
   TimedOut
   Interrupted
+  ReturnedUnknown
 }
 
 /// The outcome's unknown effects as `#(step name, action, kind)`, dropping
@@ -34,6 +37,7 @@ fn effects(
       execution.ActionCrashed(_) -> Crashed
       execution.ActionTimedOut -> TimedOut
       execution.ActionInterrupted -> Interrupted
+      execution.ActionReturnedUnknown -> ReturnedUnknown
     })
   })
 }
@@ -61,7 +65,7 @@ pub fn retried_typed_errors_complete_with_known_effects_test() {
             False -> Ok(42)
           }
         })
-        |> saga.compensate(max_attempts: 5, with: fn(_i, _f, _a) { saga.Retry }),
+        |> saga.compensate(max_attempts: 5, with: fn(_failed) { saga.Retry }),
       )
     })
 
@@ -85,7 +89,9 @@ pub fn crash_retried_to_success_is_an_unknown_effect_test() {
             _ -> Ok(x + 1)
           }
         })
-        |> saga.compensate(max_attempts: 2, with: fn(_i, failure, _a) {
+        |> saga.compensate(max_attempts: 2, with: fn(failed) {
+          let saga.FailedAttempt(failure: failure, ..) = failed
+
           case failure {
             saga.Crashed(_) -> saga.Retry
             _ -> panic as "expected Crashed"
@@ -113,7 +119,7 @@ pub fn crash_continued_is_an_unknown_effect_test() {
         saga.step("flaky", fn(_x: Int) -> Result(Int, DemoError) {
           panic as "crashed"
         })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Continue(7, saga.NoUndo)
         }),
       )
@@ -145,7 +151,7 @@ pub fn timeout_retried_to_success_is_an_unknown_effect_test() {
           }
         })
         |> saga.timeout(50)
-        |> saga.compensate(max_attempts: 2, with: fn(_i, _f, _a) { saga.Retry }),
+        |> saga.compensate(max_attempts: 2, with: fn(_failed) { saga.Retry }),
       )
     })
 
@@ -169,7 +175,7 @@ pub fn typed_error_aborted_fails_with_known_effects_test() {
         saga.step("charge", fn(_x: Int) -> Result(Int, DemoError) {
           Error(Boom)
         })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Abort(Boom)
         }),
       )
@@ -193,7 +199,7 @@ pub fn crash_aborted_with_typed_error_is_an_unknown_effect_test() {
         saga.step("charge", fn(_x: Int) -> Result(Int, DemoError) {
           panic as "charged, then crashed"
         })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Abort(Boom)
         }),
       )
@@ -226,7 +232,7 @@ pub fn sibling_crash_in_settle_window_is_an_unknown_effect_test() {
             probe.enter(gate)
             panic as "effect performed, then crashed"
           })
-          |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+          |> saga.compensate(max_attempts: 1, with: fn(_failed) {
             saga.Abort(Boom)
           }),
         )
@@ -263,7 +269,7 @@ pub fn retry_limit_names_each_crashed_attempt_test() {
             _ -> panic as "crashed"
           }
         })
-        |> saga.compensate(max_attempts: 3, with: fn(_i, _f, _a) { saga.Retry }),
+        |> saga.compensate(max_attempts: 3, with: fn(_failed) { saga.Retry }),
       )
     })
 
@@ -284,7 +290,7 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           panic as "decider crashed"
         }),
       )
@@ -300,7 +306,7 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           probe.enter(gate)
           saga.Abort(Boom)
         }),
@@ -323,19 +329,19 @@ pub fn undo_crash_and_timeout_are_unknown_effects_test() {
         input
         |> saga.perform(
           saga.step("refused", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_i, _o) { Error(UndoBoom) }),
+          |> saga.undo(fn(_undo) { Error(UndoBoom) }),
         )
       let crashing =
         refused
         |> saga.perform(
           saga.step("crashing", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_i, _o) { panic as "undo crashed" }),
+          |> saga.undo(fn(_undo) { panic as "undo crashed" }),
         )
       let hanging =
         crashing
         |> saga.perform(
           saga.step("hanging", fn(x: Int) { Ok(x) })
-          |> saga.undo(fn(_i, _o) {
+          |> saga.undo(fn(_undo) {
             probe.enter(gate)
             Ok(Nil)
           }),
@@ -369,7 +375,7 @@ pub fn cancel_interrupting_an_attempt_is_an_unknown_effect_test() {
       input
       |> saga.perform(
         saga.step("first", fn(x: Int) { Ok(x) })
-        |> saga.undo(fn(_i, _o) { Ok(Nil) }),
+        |> saga.undo(fn(_undo) { Ok(Nil) }),
       )
       |> saga.perform(
         saga.step("blocked", fn(x: Int) {
@@ -402,7 +408,7 @@ pub fn cancel_interrupting_a_compensation_is_an_unknown_effect_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           probe.enter(gate)
           saga.Abort(Boom)
         }),
@@ -434,7 +440,7 @@ pub fn crash_held_is_an_unknown_effect_test() {
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) {
           panic as "crashed"
         })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Hold(Boom)
         }),
       )
@@ -454,7 +460,7 @@ pub fn typed_error_held_has_known_effects_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_i, _f, _a) {
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Hold(Boom)
         }),
       )
@@ -463,4 +469,119 @@ pub fn typed_error_held_has_known_effects_test() {
   let assert Ok(outcome) = execution.run(workflow, 0, execution.config())
   let assert execution.Unresolved(_, Boom, _) = outcome
   execution.unknown_effects(outcome) |> should.equal([])
+}
+
+// ---------------------------------------------------------------------------
+// unknown_when: returned "maybe sent" errors
+// ---------------------------------------------------------------------------
+
+fn maybe_sent(error: DemoError) -> Bool {
+  error == MaybeSent
+}
+
+/// CHK-3: a payment returns "maybe sent", its decider retries under the same
+/// idempotency key, and the retry succeeds. The first attempt's effect is
+/// unknown, so the run completes with unknown effects, not plainly.
+pub fn retried_maybe_sent_error_completes_with_unknown_effects_test() {
+  let keys = process.new_subject()
+  let counter = probe.new_counter()
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.effect("charge", fn(x: Int, key) {
+          process.send(keys, key)
+          probe.counter_enter(counter)
+          case probe.total_entries(counter) {
+            1 -> Error(MaybeSent)
+            _ -> Ok(x)
+          }
+        })
+        |> saga.unknown_when(maybe_sent)
+        |> saga.compensate(max_attempts: 2, with: fn(failed) {
+          // The decider still sees the typed error.
+          case failed.failure {
+            saga.Returned(MaybeSent) -> saga.Retry
+            _ -> saga.Abort(Boom)
+          }
+        }),
+      )
+    })
+  let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
+  let assert execution.CompletedWithUnknownEffects(5, _) = outcome
+  effects(outcome)
+  |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
+  // Both attempts share the idempotency key; the attempt keys differ.
+  let assert Ok(first) = process.receive(keys, 1000)
+  let assert Ok(second) = process.receive(keys, 1000)
+  first.idempotency |> should.equal(second.idempotency)
+  first.attempt |> should.equal(1)
+  second.attempt |> should.equal(2)
+  { first.attempt_key != second.attempt_key } |> should.be_true
+}
+
+/// A held order after "maybe sent" names the attempt in its settlement.
+pub fn held_maybe_sent_error_is_named_in_the_settlement_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("charge", fn(_x: Int) { Error(MaybeSent) })
+        |> saga.unknown_when(maybe_sent)
+        |> saga.compensate(max_attempts: 1, with: fn(failed) {
+          case failed.failure {
+            saga.Returned(error) -> saga.Hold(error)
+            _ -> saga.Abort(Boom)
+          }
+        }),
+      )
+    })
+  let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
+  let assert execution.Unresolved(_, MaybeSent, _) = outcome
+  effects(outcome)
+  |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
+}
+
+/// Without a decider, the classified error ends the run like any error and
+/// is still named; an error the classifier rejects is a known result.
+pub fn classified_error_without_decider_is_named_test() {
+  let make = fn(error) {
+    let assert Ok(workflow) =
+      saga.define("wf", fn(input) {
+        input
+        |> saga.perform(
+          saga.step("charge", fn(_x: Int) { Error(error) })
+          |> saga.unknown_when(maybe_sent),
+        )
+      })
+    let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
+    outcome
+  }
+  let unknown = make(MaybeSent)
+  let assert execution.Failed(execution.StepFailed(_, MaybeSent), _) = unknown
+  effects(unknown)
+  |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
+  let known = make(Boom)
+  let assert execution.Failed(execution.StepFailed(_, Boom), _) = known
+  effects(known) |> should.equal([])
+}
+
+/// The classifier applies before `map_step_errors`, in the step's own
+/// vocabulary, and survives the mapping.
+pub fn classifier_survives_error_mapping_test() {
+  let assert Ok(workflow) =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("charge", fn(_x: Int) { Error(MaybeSent) })
+        |> saga.unknown_when(maybe_sent)
+        |> saga.map_step_errors(error: fn(_) { "mapped" }, undo_error: fn(u) {
+          u
+        }),
+      )
+    })
+  let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
+  let assert execution.Failed(execution.StepFailed(_, "mapped"), _) = outcome
+  effects(outcome)
+  |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
 }

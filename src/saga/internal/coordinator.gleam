@@ -126,6 +126,7 @@ pub type UnknownEnding {
   ActionCrashed(crash: node.Crash)
   ActionTimedOut
   ActionInterrupted
+  ActionReturnedUnknown
 }
 
 fn empty_settlement() -> Settlement(e, u) {
@@ -1007,15 +1008,23 @@ fn handle_attempt_done(
           )
         AttemptSucceeded(commit) ->
           commit_success(state, node_id, commit, telemetry.AttemptSucceeded)
-        AttemptFailed(failure, recover) ->
-          case recover {
-            None ->
-              fail_terminal(
+        AttemptFailed(failure, recover, unknown) -> {
+          let state = case unknown {
+            False -> state
+            True ->
+              record_unknown_effect(
                 state,
                 node_id,
-                failure,
-                attempt_result_kind(failure),
+                StepAttempt(attempt_number_for(state, node_id)),
+                ActionReturnedUnknown,
               )
+          }
+          case recover {
+            None ->
+              fail_terminal(state, node_id, failure, case unknown {
+                True -> telemetry.AttemptUnknown
+                False -> attempt_result_kind(failure)
+              })
             Some(prepare_recovery) ->
               start_recovery_from_returned(
                 state,
@@ -1024,6 +1033,7 @@ fn handle_attempt_done(
                 prepare_recovery,
               )
           }
+        }
       }
     }
   }
@@ -1927,7 +1937,7 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
             n.persistence
           {
             True, Some(p) ->
-              p.resume_undo(state.store, action_key(state, node_id, "undo"))
+              p.resume_undo(state.store, step_base(state, node_id))
             _, _ -> fn() { Ok(undo_fn()) }
           }
           let #(pid, permits) =
@@ -2407,7 +2417,9 @@ pub fn execute_saved(
   Nil
 }
 
-fn action_key(state: RunState(o, e, u), id: Int, action: String) -> String {
+/// The stable key base of node `id` in this run: the durable execution id,
+/// or the local run id, and the node's position in the checked definition.
+fn step_base(state: RunState(o, e, u), id: Int) -> String {
   let execution = case state.persistence {
     Some(session) -> session.execution_id
     None -> int.to_string(state.run_id)
@@ -2418,8 +2430,6 @@ fn action_key(state: RunState(o, e, u), id: Int, action: String) -> String {
   <> execution
   <> ":"
   <> int.to_string(position)
-  <> ":"
-  <> action
 }
 
 fn checkpoint(state: RunState(o, e, u)) -> Result(Nil, checkpoint.Failure) {
@@ -2444,7 +2454,7 @@ fn freeze(state: RunState(o, e, u)) -> Result(Snapshot(e, u), String) {
       let values = case progress.state {
         Succeeded | Undoing | Undone | UndoFailedStep ->
           case n.persistence {
-            Some(p) -> p.freeze(state.store, action_key(state, id, "undo"))
+            Some(p) -> p.freeze(state.store, step_base(state, id))
             None -> Error("step has no persistence capability")
           }
         Attempting(_) | Compensating(_) ->
@@ -2536,7 +2546,7 @@ fn restore(
               Error(checkpoint.InvalidState("missing persistence capability"))
           })
           use commit <- result.try(
-            p.thaw(values, acc.0, action_key(state, id, "undo"))
+            p.thaw(values, acc.0, step_base(state, id))
             |> result.map_error(checkpoint.CodecFailure),
           )
           let #(store, undo) = commit(acc.0)
@@ -2777,7 +2787,7 @@ fn attempt_context(
   Attempt(
     number,
     maximum - number,
-    action_key(state, id, "attempt:" <> int.to_string(number)),
+    step_base(state, id),
     case state.persistence {
       Some(Session(cancelled: True, ..)) -> True
       _ -> False

@@ -22,16 +22,29 @@ pub type StepAddress {
   StepAddress(scope: List(String), name: String, occurrence: Int)
 }
 
+/// One attempt as the coordinator dispatches it. `base` is the step's stable
+/// key within its execution (`<bytes>:<execution>:<position>`), from which
+/// `saga` derives every public `EffectKey` of the step.
 pub type Attempt {
   Attempt(
     number: Int,
     remaining: Int,
-    key: String,
+    base: String,
     cancelled: Bool,
     persistent: Bool,
     saved_input: Option(String),
     admit: fn(String) -> Result(Nil, String),
   )
+}
+
+/// What a recovery resolver established about an interrupted action:
+/// it completed with a value, failed with an error, provably never
+/// happened, or may have happened.
+pub type Evidence(o, e) {
+  EvidenceCompleted(o)
+  EvidenceFailed(e)
+  EvidenceNotSent
+  EvidenceMaybeSent
 }
 
 pub type AttemptFailure(e) {
@@ -81,6 +94,7 @@ pub type AttemptResult(e, u) {
   AttemptFailed(
     failure: AttemptFailure(e),
     recover: Option(fn(Attempt) -> fn() -> ErasedRecovery(e, u)),
+    unknown: Bool,
   )
 }
 
@@ -218,7 +232,7 @@ fn map_attempt_result(
     AttemptAbsent -> AttemptAbsent
     AttemptSucceeded(commit) ->
       AttemptSucceeded(map_undo_thunk(commit, map_undo_error))
-    AttemptFailed(failure, recover) ->
+    AttemptFailed(failure, recover, unknown) ->
       AttemptFailed(
         failure: map_attempt_failure(failure, map_error),
         recover: option.map(recover, fn(prepare) {
@@ -227,6 +241,7 @@ fn map_attempt_result(
             fn() { map_erased_recovery(body(), map_error, map_undo_error) }
           }
         }),
+        unknown: unknown,
       )
   }
 }
@@ -286,6 +301,8 @@ pub fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
 }
 
 /// Node-specific codecs remain bound to the node's concrete value types.
+/// The `String` that `freeze`, `thaw` and `resume_undo` receive is the step's
+/// stable key base (see `Attempt.base`).
 pub type Persistence(e, u) {
   Persistence(
     version: String,
