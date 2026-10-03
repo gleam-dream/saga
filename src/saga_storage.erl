@@ -53,8 +53,8 @@ file_commit(Dir, {claim, Id, Generation, Token}, {commit, Expected, Observed, Ph
             {ok, {record, V, G, C, _, _, Owner} = _} ->
                 case owns(Owner, G, Generation, Token) of
                     false -> {error, stale_owner};
-                    true when V =/= Expected -> {error, conflict};
                     true when C =/= Observed -> {error, cancellation_changed};
+                    true when V =/= Expected -> {error, conflict};
                     true ->
                         Next = {record, V + 1, G, C, Phase, Data, Owner},
                         case write(Path, Next) of ok -> {ok, stored(Next)}; Error -> Error end

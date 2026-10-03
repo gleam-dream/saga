@@ -233,15 +233,15 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
         }
         Ok(entry) ->
           case
-            commit.expected_revision == entry.revision,
-            commit.observed_cancelled == entry.cancelled
+            commit.observed_cancelled == entry.cancelled,
+            commit.expected_revision == entry.revision
           {
             False, _ -> {
-              process.send(reply, Error(storage.Conflict))
+              process.send(reply, Error(storage.CancellationChanged))
               actor.continue(state)
             }
             True, False -> {
-              process.send(reply, Error(storage.CancellationChanged))
+              process.send(reply, Error(storage.Conflict))
               actor.continue(state)
             }
             True, True -> {

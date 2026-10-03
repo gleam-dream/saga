@@ -13,6 +13,7 @@ import saga/storage/memory
 import saga/telemetry
 import sinal
 import sinal/correlation
+import support/probe
 import support/stores
 
 fn text_step(name: String, run: fn(String) -> Result(String, String)) {
@@ -1306,6 +1307,7 @@ pub fn checkpoint_size_is_bounded_test() {
 /// that finds the claim taken over stops the runner.
 pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
   let renewals = process.new_subject()
+  let renewed = probe.new_counter()
   let entered = process.new_subject()
   let store = start_memory()
   let renewing =
@@ -1313,9 +1315,10 @@ pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
     |> storage.with_renewal(every: 20, renew: fn(claim) {
       process.send(renewals, claim)
       // The third renewal finds the claim taken over.
-      case bump("renewals") {
-        count if count >= 3 -> Error(storage.StaleOwner)
-        _ -> Ok(Nil)
+      probe.counter_enter(renewed)
+      case probe.total_entries(renewed) >= 3 {
+        True -> Error(storage.StaleOwner)
+        False -> Ok(Nil)
       }
     })
   let run = start(prepare(blocking_workflow(entered, False)), renewing, "lease")
@@ -1327,9 +1330,6 @@ pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
   storage.claim_id(first) |> should.equal("lease")
   memory.stop(store)
 }
-
-@external(erlang, "saga_test_files", "bump")
-fn bump(key: String) -> Int
 
 /// `unfinished` lists executions that wait for a driver; finished ones and
 /// ones a live runner owns are left out.
