@@ -5,6 +5,7 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{Some}
+import gleam/time/duration
 import gleeunit/should
 import pog
 import saga/storage.{type Claim, type Storage}
@@ -12,7 +13,11 @@ import saga_postgres
 import saga_postgres/support
 
 fn fresh(connection: pog.Connection, schema: String) -> Storage {
-  saga_postgres.storage(support.migrated(connection, schema, 30_000))
+  saga_postgres.storage(support.migrated(
+    connection,
+    schema,
+    duration.seconds(30),
+  ))
 }
 
 fn commit(
@@ -116,7 +121,12 @@ pub fn commits_store_the_phase_that_unfinished_reads_test() {
 pub fn renewal_keeps_only_the_current_claim_test() {
   use connection <- support.using_pool(2)
   let schema = support.schema()
-  let store = saga_postgres.storage(support.migrated(connection, schema, 500))
+  let store =
+    saga_postgres.storage(support.migrated(
+      connection,
+      schema,
+      duration.milliseconds(500),
+    ))
   let assert Some(#(_, renew)) = storage.renewal(store)
   let id = support.id()
   let assert Ok(_) = storage.do_create(store, id, <<>>)
@@ -179,7 +189,12 @@ pub fn a_blocked_query_times_out_below_the_call_timeout_test() {
 pub fn an_expired_claim_commits_until_it_is_replaced_test() {
   use connection <- support.using_pool(2)
   let schema = support.schema()
-  let store = saga_postgres.storage(support.migrated(connection, schema, 100))
+  let store =
+    saga_postgres.storage(support.migrated(
+      connection,
+      schema,
+      duration.milliseconds(100),
+    ))
   let id = support.id()
   let assert Ok(_) = storage.do_create(store, id, <<>>)
   let assert Ok(#(owner, _)) = storage.do_claim(store, id)

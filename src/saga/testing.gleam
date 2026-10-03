@@ -9,6 +9,7 @@
 ////
 //// ```gleam
 //// import gleam/list
+//// import gleam/time/duration
 //// import saga/execution
 //// import saga/testing
 ////
@@ -22,10 +23,11 @@
 ////   })
 //// }
 //// let assert Ok(_progress) =
-////   testing.wait_until(run, matching: attempting, within: 1000)
+////   testing.wait_until(run, matching: attempting, within: duration.seconds(1))
 //// execution.cancel(run)
 //// ```
 
+import gleam/time/duration.{type Duration}
 import saga/execution.{type Execution, type Progress}
 import saga/internal/ffi
 
@@ -35,7 +37,7 @@ import saga/internal/ffi
 /// restriction — any process holding the `Execution` value may call it — so
 /// there is no `NotOwner` case here to mirror `execution.AwaitError`'s.
 pub type WaitError {
-  /// `matching` never accepted a snapshot before `within` milliseconds
+  /// `matching` never accepted a snapshot before `within`
   /// elapsed overall.
   WaitTimedOut
   /// The run ended (the coordinator exited) before `matching` accepted a
@@ -44,7 +46,7 @@ pub type WaitError {
 }
 
 /// Polls `execution.progress(execution, ..)` until `matching` accepts a
-/// snapshot, or `within` milliseconds elapse overall, whichever comes
+/// snapshot, or `within` elapses overall, whichever comes
 /// first. Each poll is a real (short) message round-trip with the
 /// coordinator — never a fixed `process.sleep` — so this returns as soon as
 /// `matching` is satisfied instead of waiting out a guessed duration. The
@@ -64,9 +66,9 @@ pub type WaitError {
 pub fn wait_until(
   execution: Execution(o, e, u),
   matching matching: fn(Progress) -> Bool,
-  within within: Int,
+  within within: Duration,
 ) -> Result(Progress, WaitError) {
-  let deadline = ffi.monotonic_time() + within
+  let deadline = ffi.monotonic_time() + duration.to_milliseconds(within)
   poll(execution, matching, deadline)
 }
 
@@ -83,7 +85,7 @@ fn poll(
         True -> remaining
         False -> 50
       }
-      case execution.progress(execution, poll_timeout) {
+      case execution.progress(execution, duration.milliseconds(poll_timeout)) {
         Ok(snapshot) ->
           case matching(snapshot) {
             True -> Ok(snapshot)

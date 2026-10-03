@@ -6,6 +6,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import pog
 import saga
@@ -19,7 +20,7 @@ pub fn one_pool_serves_the_application_and_saga_test() {
   // Two connections for five concurrent runs and their steps' queries.
   use connection <- support.using_pool(2)
   let schema = support.schema()
-  let config = support.migrated(connection, schema, 5000)
+  let config = support.migrated(connection, schema, duration.seconds(5))
   let orders = "\"" <> schema <> "\".orders"
   let assert Ok(_) =
     pog.query("CREATE TABLE " <> orders <> " (id text PRIMARY KEY)")
@@ -66,7 +67,10 @@ pub fn one_pool_serves_the_application_and_saga_test() {
           id: "record:" <> order,
           input: order,
         )
-      process.send(results, #(order, durable.drive(run, timeout: 20_000)))
+      process.send(results, #(
+        order,
+        durable.drive(run, timeout: duration.seconds(20)),
+      ))
     })
   })
   list.map(ids, fn(_) {

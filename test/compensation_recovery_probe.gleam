@@ -2,6 +2,7 @@
 import gleam/erlang/process
 import gleam/io
 import gleam/option.{None, Some}
+import gleam/time/duration
 import saga
 import saga/codec
 import saga/durable
@@ -80,7 +81,7 @@ pub fn main() -> Nil {
       id: "vm-compensation-ref",
       input: "order",
     )
-  let result = durable.drive(run, timeout: 60_000)
+  let result = durable.drive(run, timeout: duration.seconds(60))
   case first_vm {
     True -> Nil
     False -> {

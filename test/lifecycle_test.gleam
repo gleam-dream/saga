@@ -1,6 +1,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -49,13 +50,13 @@ pub fn deadline_interrupts_run_test() {
 
   let config =
     execution.config()
-    |> execution.with_deadline(50)
-    |> execution.with_settle_timeout(0)
+    |> execution.with_deadline(execution.After(duration.milliseconds(50)))
+    |> execution.with_settle_timeout(duration.milliseconds(0))
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     cause |> should.equal(execution.DeadlineExceeded)
     settlement.interrupted
     |> list.map(fn(a) { a.name })
@@ -74,15 +75,15 @@ pub fn deadline_during_backoff_test() {
       |> saga.perform(
         saga.step("s", fn(_x: Int) { Error(Boom) })
         |> saga.compensate(max_attempts: 5, with: fn(_failed) {
-          saga.RetryAfter(60_000)
+          saga.RetryAfter(duration.seconds(60))
         }),
       )
     })
 
   let config =
     execution.config()
-    |> execution.with_deadline(50)
-    |> execution.with_settle_timeout(0)
+    |> execution.with_deadline(execution.After(duration.milliseconds(50)))
+    |> execution.with_settle_timeout(duration.milliseconds(0))
 
   let assert Ok(execution.Failed(cause, _settlement)) =
     execution.run(workflow, 0, config)
@@ -102,14 +103,14 @@ pub fn step_timeout_reports_timed_out_test() {
           probe.enter(gate)
           Ok(x)
         })
-        |> saga.timeout(50),
+        |> saga.timeout(duration.milliseconds(50)),
       )
     })
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     case cause {
       execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
       _ -> panic as "expected StepTimedOut(blocked)"
@@ -137,7 +138,7 @@ pub fn step_timeout_recovery_can_retry_test() {
             _ -> Ok(x)
           }
         })
-        |> saga.timeout(50)
+        |> saga.timeout(duration.milliseconds(50))
         |> saga.compensate(max_attempts: 2, with: fn(failed) {
           let saga.FailedAttempt(failure: failure, ..) = failed
 
@@ -179,7 +180,7 @@ pub fn late_result_after_timeout_is_discarded_test() {
           probe.enter(gate)
           Ok(x)
         })
-        |> saga.timeout(50)
+        |> saga.timeout(duration.milliseconds(50))
         |> saga.compensate(max_attempts: 1, with: fn(_failed) {
           saga.Abort(Boom)
         }),
@@ -189,7 +190,7 @@ pub fn late_result_after_timeout_is_discarded_test() {
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
     let assert Ok(pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     cause
     |> should.equal(execution.StepFailed(
       saga.StepAddress(scope: [], name: "blocked", occurrence: 1),
@@ -222,12 +223,14 @@ pub fn undo_timeout_recorded_and_rollback_continues_test() {
       a |> saga.perform(saga.step("b", fn(_x: Int) { Error(Boom) }))
     })
 
-  let config = execution.config() |> execution.with_cleanup_timeout(50)
+  let config =
+    execution.config()
+    |> execution.with_cleanup_timeout(duration.milliseconds(50))
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(_cause, settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     case settlement.undo_failures {
       [execution.UndoTimedOut(step)] -> step.name |> should.equal("a")
       _ -> panic as "expected a single UndoTimedOut(a)"
@@ -253,12 +256,14 @@ pub fn compensation_timeout_recorded_test() {
       )
     })
 
-  let config = execution.config() |> execution.with_cleanup_timeout(50)
+  let config =
+    execution.config()
+    |> execution.with_cleanup_timeout(duration.milliseconds(50))
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     case cause {
       execution.StepTimedOut(step) -> step.name |> should.equal("s")
       _ -> panic as "expected StepTimedOut(s) from the killed compensation"
@@ -314,7 +319,7 @@ pub fn cancel_with_active_siblings_test() {
   // `+S 1:1` run too.
   let config =
     execution.config()
-    |> execution.with_settle_timeout(100)
+    |> execution.with_settle_timeout(duration.milliseconds(100))
     |> execution.with_max_concurrency(2)
 
   probe.with_run(workflow, 0, config, fn(exec) {
@@ -323,13 +328,13 @@ pub fn cancel_with_active_siblings_test() {
 
     execution.cancel(exec)
 
-    let assert Ok(progress) = execution.progress(exec, 10_000)
+    let assert Ok(progress) = execution.progress(exec, duration.seconds(10))
     progress.phase |> should.equal(execution.Settling)
 
     probe.open(releasable_gate)
 
     let assert Ok(execution.Cancelled(reason, settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     reason |> should.equal(execution.CancelRequested)
     settlement.undone
     |> list.map(fn(a) { a.name })
@@ -348,7 +353,8 @@ pub fn cancel_after_completion_is_noop_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
   execution.cancel(exec)
 }
 
@@ -373,7 +379,7 @@ pub fn cancel_is_idempotent_test() {
     execution.cancel(exec)
     probe.open(gate)
     let assert Ok(execution.Cancelled(execution.CancelRequested, _)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     Nil
   })
 }
@@ -395,7 +401,7 @@ pub fn completion_processed_before_cancel_is_undone_test() {
   // No gate: the step is expected to have completed by the time cancel is
   // requested, which is deterministic here because it does no blocking I/O.
   execution.cancel(exec)
-  let assert Ok(outcome) = execution.await(exec, 10_000)
+  let assert Ok(outcome) = execution.await(exec, duration.seconds(10))
   case outcome {
     execution.Completed(0) -> Nil
     execution.Cancelled(_, settlement) ->
@@ -496,7 +502,7 @@ pub fn coordinator_kill_terminates_tasks_test() {
 
   process.kill(execution.pid(exec))
 
-  case execution.await(exec, 10_000) {
+  case execution.await(exec, duration.seconds(10)) {
     Error(execution.Lost(_crash)) -> Nil
     _other -> panic as "expected Lost, got something else"
   }
@@ -528,10 +534,13 @@ pub fn await_not_owner_test() {
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
 
   let reply = process.new_subject()
-  process.spawn(fn() { process.send(reply, execution.await(exec, 10_000)) })
+  process.spawn(fn() {
+    process.send(reply, execution.await(exec, duration.seconds(10)))
+  })
   let assert Ok(Error(execution.NotOwner)) = process.receive(reply, 10_000)
 
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
   Nil
 }
 
@@ -543,8 +552,10 @@ pub fn await_twice_already_awaited_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
-  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
+  let assert Error(execution.AlreadyAwaited) =
+    execution.await(exec, duration.seconds(10))
   Nil
 }
 
@@ -558,9 +569,11 @@ pub fn await_twice_is_prompt_test() {
       input |> saga.perform(saga.step("s", fn(x: Int) { Ok(x) }))
     })
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
   let before = system_time_ms()
-  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
+  let assert Error(execution.AlreadyAwaited) =
+    execution.await(exec, duration.seconds(10))
   let elapsed = system_time_ms() - before
   // A generous bound, well under the 10s timeout: the point is that this
   // resolves from a fresh monitor's immediate `noproc` plus an empty
@@ -591,13 +604,14 @@ pub fn await_after_lost_then_second_await_is_prompt_test() {
   let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
   process.kill(execution.pid(exec))
 
-  case execution.await(exec, 10_000) {
+  case execution.await(exec, duration.seconds(10)) {
     Error(execution.Lost(_crash)) -> Nil
     _other -> panic as "expected Lost, got something else"
   }
 
   let before = system_time_ms()
-  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
+  let assert Error(execution.AlreadyAwaited) =
+    execution.await(exec, duration.seconds(10))
   let elapsed = system_time_ms() - before
   // See `await_twice_is_prompt_test`: a generous bound under the 10s
   // timeout, not a tight one — the property under test is "does not idle
@@ -641,7 +655,7 @@ pub fn coordinator_killed_mid_await_reports_lost_test() {
     // in `selector_receive` rather than strictly before it.
     process.spawn(fn() { process.kill(execution.pid(exec)) })
 
-    case execution.await(exec, 10_000) {
+    case execution.await(exec, duration.seconds(10)) {
       Error(execution.Lost(_crash)) -> Nil
       other ->
         panic as {
@@ -668,8 +682,10 @@ pub fn await_does_not_grow_process_dictionary_test() {
 
   let before = probe.dictionary_size()
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
-  let assert Error(execution.AlreadyAwaited) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
+  let assert Error(execution.AlreadyAwaited) =
+    execution.await(exec, duration.seconds(10))
   probe.dictionary_size() |> should.equal(before)
 }
 
@@ -716,9 +732,11 @@ pub fn await_timeout_then_success_test() {
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
-    let assert Error(execution.AwaitTimedOut) = execution.await(exec, 50)
+    let assert Error(execution.AwaitTimedOut) =
+      execution.await(exec, duration.milliseconds(50))
     probe.open(gate)
-    let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+    let assert Ok(execution.Completed(0)) =
+      execution.await(exec, duration.seconds(10))
     Nil
   })
 }

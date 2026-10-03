@@ -1,6 +1,7 @@
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -33,7 +34,7 @@ pub fn config_defaults_match_the_defaults_table_test() {
   settings.correlation |> should.equal(None)
   let assert Ok(unbounded) =
     execution.settings(
-      execution.config() |> execution.without_step_timeout,
+      execution.config() |> execution.with_step_timeout(execution.Infinity),
       None,
     )
   unbounded.step_timeout |> should.equal(None)
@@ -66,12 +67,14 @@ pub fn default_step_timeout_bounds_a_hung_step_test() {
       )
     })
 
-  let config = execution.config() |> execution.with_step_timeout(50)
+  let config =
+    execution.config()
+    |> execution.with_step_timeout(execution.After(duration.milliseconds(50)))
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     case cause {
       execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
       _ -> panic as "expected StepTimedOut(blocked) from the default timeout"
@@ -92,18 +95,20 @@ pub fn step_timeout_overrides_default_when_shorter_test() {
           probe.enter(gate)
           Ok(x)
         })
-        |> saga.timeout(50),
+        |> saga.timeout(duration.milliseconds(50)),
       )
     })
 
   // A default far longer than the step's own timeout: if the override did
   // not take effect, this test would hang until the default fired instead.
-  let config = execution.config() |> execution.with_step_timeout(10_000)
+  let config =
+    execution.config()
+    |> execution.with_step_timeout(execution.After(duration.seconds(10)))
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 2000)
+      execution.await(exec, duration.seconds(2))
     case cause {
       execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
       _ -> panic as "expected StepTimedOut(blocked) from the step's own timeout"
@@ -124,13 +129,15 @@ pub fn step_timeout_overrides_default_when_longer_test() {
           probe.counter_enter(counter)
           Ok(x)
         })
-        |> saga.timeout(10_000),
+        |> saga.timeout(duration.seconds(10)),
       )
     })
 
   // A default far shorter than the step's own timeout: if the override did
   // not take effect, the default would kill the step before it can finish.
-  let config = execution.config() |> execution.with_step_timeout(1)
+  let config =
+    execution.config()
+    |> execution.with_step_timeout(execution.After(duration.milliseconds(1)))
 
   let assert Ok(execution.Completed(0)) = execution.run(workflow, 0, config)
   probe.total_entries(counter) |> should.equal(1)
@@ -152,7 +159,8 @@ pub fn step_timeout_none_disables_the_default_test() {
       )
     })
 
-  let config = execution.config() |> execution.without_step_timeout()
+  let config =
+    execution.config() |> execution.with_step_timeout(execution.Infinity)
 
   let assert Ok(execution.Completed(0)) = execution.run(workflow, 0, config)
   probe.total_entries(counter) |> should.equal(1)
@@ -182,11 +190,11 @@ pub fn invalid_config_rejected_before_start_test() {
   let c = execution.config()
   let bad_configs = [
     execution.with_max_concurrency(c, 0),
-    execution.with_deadline(c, 0),
-    execution.with_step_timeout(c, 0),
-    execution.with_settle_timeout(c, -1),
-    execution.with_cleanup_timeout(c, 0),
-    execution.with_max_retry_delay(c, -1),
+    execution.with_deadline(c, execution.After(duration.milliseconds(0))),
+    execution.with_step_timeout(c, execution.After(duration.milliseconds(0))),
+    execution.with_settle_timeout(c, duration.milliseconds(-1)),
+    execution.with_cleanup_timeout(c, duration.milliseconds(0)),
+    execution.with_max_retry_delay(c, duration.milliseconds(-1)),
   ]
 
   list.each(bad_configs, fn(config) {
@@ -208,33 +216,35 @@ pub fn every_config_error_variant_is_reachable_test() {
   let config =
     execution.config()
     |> execution.with_max_concurrency(-1)
-    |> execution.with_deadline(-5)
-    |> execution.with_step_timeout(-2)
-    |> execution.with_settle_timeout(-1)
-    |> execution.with_cleanup_timeout(-1)
-    |> execution.with_max_retry_delay(-3)
+    |> execution.with_deadline(execution.After(duration.milliseconds(-5)))
+    |> execution.with_step_timeout(execution.After(duration.milliseconds(-2)))
+    |> execution.with_settle_timeout(duration.milliseconds(-1))
+    |> execution.with_cleanup_timeout(duration.milliseconds(-1))
+    |> execution.with_max_retry_delay(duration.milliseconds(-3))
   let assert Error(execution.InvalidConfig(errors)) =
     execution.run(workflow, 0, config)
   errors
   |> should.equal([
     execution.MaxConcurrencyNotPositive(-1),
-    execution.DeadlineNotPositive(-5),
-    execution.StepTimeoutNotPositive(-2),
-    execution.SettleTimeoutNegative(-1),
-    execution.CleanupTimeoutNotPositive(-1),
-    execution.MaxRetryDelayNegative(-3),
+    execution.DeadlineNotPositive(duration.milliseconds(-5)),
+    execution.StepTimeoutNotPositive(duration.milliseconds(-2)),
+    execution.SettleTimeoutNegative(duration.milliseconds(-1)),
+    execution.CleanupTimeoutNotPositive(duration.milliseconds(-1)),
+    execution.MaxRetryDelayNegative(duration.milliseconds(-3)),
   ])
   list.each(errors, fn(error) {
     { execution.describe_config_error(error) != "" } |> should.be_true
   })
-  execution.describe_config_error(execution.MaxRetryDelayNegative(-3))
+  execution.describe_config_error(
+    execution.MaxRetryDelayNegative(duration.milliseconds(-3)),
+  )
   |> should.equal(
-    "the retry delay cap must not be negative (with_max_retry_delay), got -3",
+    "the retry delay cap must not be negative (with_max_retry_delay), got -3 ms",
   )
 }
 
-/// Every setter is accepted at its boundary value, and `without_step_timeout`
-/// is the explicit opt-out of the default per-attempt timeout.
+/// Every setter is accepted at its boundary value, and `Infinity` is the
+/// explicit opt-out of the default per-attempt timeout and the run deadline.
 pub fn boundary_values_are_accepted_test() {
   let workflow =
     saga.define("wf", fn(input) {
@@ -243,13 +253,41 @@ pub fn boundary_values_are_accepted_test() {
   let config =
     execution.config()
     |> execution.with_max_concurrency(1)
-    |> execution.with_deadline(10_000)
-    |> execution.with_step_timeout(1000)
-    |> execution.without_step_timeout
-    |> execution.with_settle_timeout(0)
-    |> execution.with_cleanup_timeout(1)
-    |> execution.with_max_retry_delay(0)
+    |> execution.with_deadline(execution.After(duration.seconds(10)))
+    |> execution.with_step_timeout(execution.After(duration.seconds(1)))
+    |> execution.with_step_timeout(execution.Infinity)
+    |> execution.with_settle_timeout(duration.milliseconds(0))
+    |> execution.with_cleanup_timeout(duration.milliseconds(1))
+    |> execution.with_max_retry_delay(duration.milliseconds(0))
   let assert Ok(execution.Completed(3)) = execution.run(workflow, 3, config)
+}
+
+/// A bound below one millisecond is refused, not rounded up: a positive
+/// duration that truncates to zero milliseconds is a configuration error,
+/// and `Infinity` always passes.
+pub fn sub_millisecond_bounds_are_refused_test() {
+  let sub = duration.nanoseconds(500_000)
+  let config =
+    execution.config()
+    |> execution.with_deadline(execution.After(sub))
+    |> execution.with_step_timeout(execution.After(sub))
+    |> execution.with_cleanup_timeout(sub)
+  let assert Error(errors) = execution.settings(config, None)
+  errors
+  |> should.equal([
+    execution.DeadlineNotPositive(sub),
+    execution.StepTimeoutNotPositive(sub),
+    execution.CleanupTimeoutNotPositive(sub),
+  ])
+  let assert Ok(_) =
+    execution.settings(
+      execution.config()
+        |> execution.with_deadline(execution.Infinity)
+        |> execution.with_step_timeout(execution.Infinity)
+        |> execution.with_settle_timeout(sub)
+        |> execution.with_max_retry_delay(sub),
+      None,
+    )
 }
 
 /// A `RetryAfter` delay above the cap is shortened to the cap: with a cap of
@@ -268,11 +306,13 @@ pub fn retry_after_delay_is_capped_test() {
           }
         })
         |> saga.compensate(max_attempts: 2, with: fn(_failed) {
-          saga.RetryAfter(3_600_000)
+          saga.RetryAfter(duration.seconds(3600))
         }),
       )
     })
-  let config = execution.config() |> execution.with_max_retry_delay(10)
+  let config =
+    execution.config()
+    |> execution.with_max_retry_delay(duration.milliseconds(10))
   let assert Ok(execution.Completed(7)) = execution.run(workflow, 7, config)
   probe.total_entries(attempts) |> should.equal(2)
 }
@@ -294,7 +334,7 @@ pub fn default_retry_delay_cap_is_five_minutes_test() {
           }
         })
         |> saga.compensate(max_attempts: 2, with: fn(_failed) {
-          saga.RetryAfter(10_000_000)
+          saga.RetryAfter(duration.seconds(10_000))
         }),
       )
     })
@@ -307,9 +347,11 @@ pub fn default_retry_delay_cap_is_five_minutes_test() {
       ]),
       fn() {
         let assert Ok(exec) = execution.start(workflow, 1, execution.config())
-        let assert Ok(#(Some(300_000), True)) = process.receive(delays, 5000)
+        let assert Ok(#(Some(delay), True)) = process.receive(delays, 5000)
+        delay |> should.equal(duration.seconds(300))
         execution.cancel(exec)
-        let assert Ok(execution.Cancelled(..)) = execution.await(exec, 10_000)
+        let assert Ok(execution.Cancelled(..)) =
+          execution.await(exec, duration.seconds(10))
         Nil
       },
     )
@@ -324,8 +366,10 @@ pub fn concurrent_runs_are_isolated_test() {
   let assert Ok(exec_a) = execution.start(workflow, 10, execution.config())
   let assert Ok(exec_b) = execution.start(workflow, 20, execution.config())
 
-  let assert Ok(execution.Completed(a)) = execution.await(exec_a, 10_000)
-  let assert Ok(execution.Completed(b)) = execution.await(exec_b, 10_000)
+  let assert Ok(execution.Completed(a)) =
+    execution.await(exec_a, duration.seconds(10))
+  let assert Ok(execution.Completed(b)) =
+    execution.await(exec_b, duration.seconds(10))
 
   a |> should.equal(20)
   b |> should.equal(40)
@@ -375,7 +419,7 @@ pub fn killed_step_task_is_crash_test() {
     kill_process(task_pid)
 
     let assert Ok(execution.Failed(cause, _settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     case cause {
       execution.StepCrashed(_step, _crash) -> Nil
       _ -> panic as "expected StepCrashed"
@@ -433,7 +477,8 @@ pub fn build_function_runs_exactly_once_test() {
       exec
     })
   list.each(executions, fn(exec) {
-    let assert Ok(execution.Completed(_)) = execution.await(exec, 10_000)
+    let assert Ok(execution.Completed(_)) =
+      execution.await(exec, duration.seconds(10))
   })
 
   let assert 1 = probe.total_entries(call_count)

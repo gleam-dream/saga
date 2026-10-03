@@ -1,6 +1,6 @@
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/time/duration
 import gleeunit
 import gleeunit/should
 import order_consumer/domain.{
@@ -172,7 +172,7 @@ pub fn advanced_config_runs_with_bounded_concurrency_and_deadline_test() {
       undo_fails_for: [],
     )
 
-  let config = workflows.bounded_config(Some(2000))
+  let config = workflows.bounded_config(execution.After(duration.seconds(2)))
   let assert Ok(execution.Completed(checkout)) =
     execution.run(workflow, "ord-1", config)
   checkout.inventory.order_id |> should.equal("ord-1")
@@ -183,19 +183,19 @@ pub fn cancel_while_step_in_flight_rolls_back_and_reports_cancelled_test() {
 
   let workflow = workflows.blocking_workflow(fn() { gate.enter(release_gate) })
 
-  let config = workflows.bounded_config(None)
+  let config = workflows.bounded_config(execution.Infinity)
   let assert Ok(execution) = execution.start(workflow, "ord-1", config)
 
   cleanup.with_execution(execution, fn() {
     // The step has started (announced itself), so `progress` should show
     // it `Attempting` before cancellation.
     let assert Ok(_task_pid) = gate.wait_entered(release_gate, 2000)
-    let assert Ok(progress) = execution.progress(execution, 1000)
+    let assert Ok(progress) = execution.progress(execution, duration.seconds(1))
     progress.phase |> should.equal(execution.Running)
 
     execution.cancel(execution)
 
-    let assert Ok(outcome) = execution.await(execution, 2000)
+    let assert Ok(outcome) = execution.await(execution, duration.seconds(2))
     let assert execution.Cancelled(reason, settlement) = outcome
     reason |> should.equal(execution.CancelRequested)
     // The blocked step was killed by the settle window, not undone: its
@@ -219,7 +219,11 @@ pub fn cancel_is_idempotent_test() {
   let workflow = workflows.blocking_workflow(fn() { gate.enter(release_gate) })
 
   let assert Ok(execution) =
-    execution.start(workflow, "ord-1", workflows.bounded_config(None))
+    execution.start(
+      workflow,
+      "ord-1",
+      workflows.bounded_config(execution.Infinity),
+    )
 
   cleanup.with_execution(execution, fn() {
     let assert Ok(_task_pid) = gate.wait_entered(release_gate, 2000)
@@ -228,7 +232,7 @@ pub fn cancel_is_idempotent_test() {
     execution.cancel(execution)
 
     let assert Ok(execution.Cancelled(_reason, _settlement)) =
-      execution.await(execution, 2000)
+      execution.await(execution, duration.seconds(2))
     Nil
   })
 }
@@ -246,7 +250,7 @@ pub fn a_reported_run_outlives_its_owner_test() {
         execution.start_reporting(
           workflow,
           "ord-1",
-          workflows.bounded_config(None),
+          workflows.bounded_config(execution.Infinity),
           to: report,
         )
       process.sleep_forever()

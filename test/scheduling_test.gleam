@@ -1,5 +1,6 @@
 import gleam/erlang/process
 import gleam/list
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -113,7 +114,8 @@ pub fn max_concurrency_bounds_running_attempts_test() {
       list_range(1, 9)
       |> list_each(fn(_i) { probe.open(gate) })
 
-    let assert Ok(execution.Completed(_)) = execution.await(exec, 10_000)
+    let assert Ok(execution.Completed(_)) =
+      execution.await(exec, duration.seconds(10))
     Nil
   })
 }
@@ -187,7 +189,7 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
           })
           |> saga.compensate(max_attempts: 2, with: fn(failed) {
             case failed.attempt {
-              1 -> saga.RetryAfter(300)
+              1 -> saga.RetryAfter(duration.milliseconds(300))
               _ -> saga.Continue(0, saga.NoUndo)
             }
           }),
@@ -207,6 +209,7 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
   // starve the coordinator's own message loop past a tighter budget, which
   // was observed to flake this specific test under load.
   let generous = 30_000
+  let generous_time = duration.milliseconds(generous)
 
   probe.with_run(wf, 1, cfg, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(dgate, generous)
@@ -237,7 +240,7 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
             }
           })
         },
-        within: generous,
+        within: generous_time,
       )
     probe.open(dgate)
     // Wait until `b` and `c` have both been admitted and are concurrently
@@ -255,13 +258,13 @@ pub fn retry_after_backoff_honors_max_concurrency_test() {
             sp.address.name == "a" && sp.state == execution.RetryScheduled(2)
           })
         },
-        within: generous,
+        within: generous_time,
       )
     probe.high_water(counter) |> should.equal(2)
 
     probe.open(gate)
     probe.open(gate)
-    let assert Ok(execution.Completed(_)) = execution.await(exec, generous)
+    let assert Ok(execution.Completed(_)) = execution.await(exec, generous_time)
     probe.high_water(counter) |> should.equal(2)
     Nil
   })

@@ -6,6 +6,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
 import gleam/option.{None, Some}
+import gleam/time/duration
 import saga
 import saga/codec
 import saga/durable
@@ -144,7 +145,7 @@ pub fn durable_payment_with_caller_types_test() {
       id: "payment:o-1",
       input: Charge("o-1", 4200),
     )
-  let assert Ok(outcome) = durable.drive(run, timeout: 10_000)
+  let assert Ok(outcome) = durable.drive(run, timeout: duration.seconds(10))
   // The "maybe charged" first attempt is reported, and the retry reused the
   // provider idempotency key.
   let assert execution.CompletedWithUnknownEffects(receipt, [unknown]) = outcome
@@ -196,8 +197,11 @@ pub fn durable_errors_are_classified_test() {
       input: "b",
     )
   durable.error_kind(error) |> should_be(durable.Incompatible)
-  let assert Error(durable.InvalidTimeout(0)) = durable.drive(run, timeout: 0)
-  let assert Ok(execution.Completed("a")) = durable.drive(run, timeout: 5000)
+  let assert Error(durable.InvalidTimeout(timeout)) =
+    durable.drive(run, timeout: duration.milliseconds(0))
+  timeout |> should_be(duration.milliseconds(0))
+  let assert Ok(execution.Completed("a")) =
+    durable.drive(run, timeout: duration.seconds(5))
   memory.stop(store)
 }
 
@@ -254,7 +258,7 @@ pub fn public_durable_choice_test() {
       input: "input",
     )
   let assert Ok(execution.Completed("input-right")) =
-    durable.drive(run, timeout: 5000)
+    durable.drive(run, timeout: duration.seconds(5))
   let assert Ok(durable.Finished(execution.Completed("input-right"))) =
     durable.read(run)
   memory.stop(store)
@@ -271,8 +275,8 @@ pub fn public_adapter_contract_test() {
           }),
         )
       },
-      timeout: 5000,
-      owner_loss_within: 200,
+      timeout: duration.seconds(5),
+      owner_loss_within: duration.milliseconds(200),
     )
 }
 
@@ -333,7 +337,8 @@ pub fn public_compensation_configuration_test() {
       id: "compensation",
       input: "x",
     )
-  let assert Ok(execution.Completed("x")) = durable.drive(run, timeout: 5000)
+  let assert Ok(execution.Completed("x")) =
+    durable.drive(run, timeout: duration.seconds(5))
   memory.stop(store)
 }
 

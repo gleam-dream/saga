@@ -1,4 +1,5 @@
 import gleam/list
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -30,7 +31,7 @@ pub fn wait_until_succeeds_when_predicate_is_met_test() {
             sp.address.name == "blocked" && sp.state == execution.Attempting(1)
           })
         },
-        within: 10_000,
+        within: duration.seconds(10),
       )
     progress.phase |> should.equal(execution.Running)
   })
@@ -58,7 +59,11 @@ pub fn wait_until_times_out_test() {
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
     let result =
-      testing.wait_until(exec, matching: fn(_p) { False }, within: 200)
+      testing.wait_until(
+        exec,
+        matching: fn(_p) { False },
+        within: duration.milliseconds(200),
+      )
     result |> should.equal(Error(testing.WaitTimedOut))
   })
 }
@@ -72,9 +77,14 @@ pub fn wait_until_reports_run_ended_test() {
     })
 
   let assert Ok(exec) = execution.start(workflow, 0, execution.config())
-  let assert Ok(execution.Completed(0)) = execution.await(exec, 10_000)
+  let assert Ok(execution.Completed(0)) =
+    execution.await(exec, duration.seconds(10))
 
   let result =
-    testing.wait_until(exec, matching: fn(_p) { False }, within: 10_000)
+    testing.wait_until(
+      exec,
+      matching: fn(_p) { False },
+      within: duration.seconds(10),
+    )
   result |> should.equal(Error(testing.RunEnded))
 }

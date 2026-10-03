@@ -9,6 +9,7 @@ description = "External acceptance consumer for saga's public API: an order-chec
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_json = ">= 3.0.0 and < 4.0.0"
+gleam_time = ">= 1.11.0 and < 2.0.0"
 saga = { path = "../.." }
 sinal = { path = "../../../sinal" }
 

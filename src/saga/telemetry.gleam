@@ -35,7 +35,10 @@
 ////   })
 //// ```
 
+import gleam/dynamic
+import gleam/dynamic/decode
 import gleam/option.{type Option}
+import gleam/time/duration.{type Duration}
 import sinal.{type Event}
 import sinal/correlation.{type Correlation}
 import sinal/fields
@@ -147,9 +150,10 @@ pub type DecisionKind {
   DecisionTimedOut
 }
 
-/// `[saga, step, compensate, stop]` metadata. `retry_delay` is the delay,
-/// in milliseconds, that a `RetryAfter` decision was scheduled with after
-/// the `execution.with_max_retry_delay` cap, and `retry_delay_capped` is
+/// `[saga, step, compensate, stop]` metadata. `retry_delay` is the delay
+/// that a `RetryAfter` decision was scheduled with after the
+/// `execution.with_max_retry_delay` cap (carried as whole milliseconds in
+/// the event's map), and `retry_delay_capped` is
 /// `True` when the cap shortened the requested delay. They are `None` and
 /// `False` for every other decision.
 pub type CompensationMetadata {
@@ -161,7 +165,7 @@ pub type CompensationMetadata {
     step: String,
     attempt: Int,
     decision: DecisionKind,
-    retry_delay: Option(Int),
+    retry_delay: Option(Duration),
     retry_delay_capped: Bool,
   )
 }
@@ -431,7 +435,7 @@ pub fn compensation_stopped() -> Event(
       get: fn(m) { m.decision },
     )
     use retry_delay <- fields.include(
-      fields.optional(fields.int("retry_delay")),
+      fields.optional(retry_delay_field()),
       get: fn(m) { m.retry_delay },
     )
     use retry_delay_capped <- fields.include(
@@ -496,4 +500,12 @@ fn stop_measurements() -> fields.Fields(StepStopMeasurements) {
     m.duration
   })
   fields.success(StepStopMeasurements(duration:))
+}
+
+fn retry_delay_field() -> fields.Fields(Duration) {
+  fields.field(
+    "retry_delay",
+    fn(delay) { dynamic.int(duration.to_milliseconds(delay)) },
+    decode.int |> decode.map(duration.milliseconds),
+  )
 }

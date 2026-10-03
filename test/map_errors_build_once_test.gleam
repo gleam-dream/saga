@@ -5,6 +5,7 @@
 /// from the review's own probes (P3, P3b).
 import gleam/erlang/process
 import gleam/list
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -88,7 +89,8 @@ pub fn map_errors_stale_port_does_not_crash_run_test() {
     saga.map_errors(workflow, error: fn(e) { e }, undo_error: fn(u) { u })
 
   let assert Ok(exec) = execution.start(mapped, 1, execution.config())
-  let assert Ok(execution.Completed(1)) = execution.await(exec, 2000)
+  let assert Ok(execution.Completed(1)) =
+    execution.await(exec, duration.seconds(2))
   let assert 1 = probe.total_entries(calls)
 }
 

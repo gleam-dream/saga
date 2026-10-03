@@ -4,6 +4,7 @@
 /// started `Execution` is always cancelled and awaited, even if the test
 /// body's assertion panics, so a blocked coordinator never leaks between
 /// tests.
+import gleam/time/duration
 import saga/execution.{type Execution}
 
 pub fn with_execution(
@@ -12,7 +13,7 @@ pub fn with_execution(
 ) -> a {
   ensure(use_execution, fn() {
     execution.cancel(execution)
-    let _ = execution.await(execution, 2000)
+    let _ = execution.await(execution, duration.seconds(2))
     Nil
   })
 }

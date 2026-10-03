@@ -1,3 +1,4 @@
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -53,7 +54,7 @@ pub fn failure_with_active_siblings_settles_test() {
     probe.open(slow_gate)
 
     let assert Ok(execution.Failed(cause, settlement)) =
-      execution.await(exec, 10_000)
+      execution.await(exec, duration.seconds(10))
     case cause {
       execution.StepFailed(step, Boom) -> step.name |> should.equal("fast_fail")
       _ -> panic as "expected StepFailed(fast_fail, Boom)"

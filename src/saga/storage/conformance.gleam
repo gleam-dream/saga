@@ -6,7 +6,7 @@
 //// values (any holder may commit; a rebuilt claim with another token is
 //// refused), revision and generation checks, cancellation races, release,
 //// that a live owner keeps its claim, that a lost owner's claim ends within
-//// `owner_loss_within` milliseconds, the `unfinished` listing, and that a
+//// `owner_loss_within`, the `unfinished` listing, and that a
 //// `saga/durable` drive whose runner is killed frees the execution at once
 //// for the next drive, which resumes from the checkpoint. One
 //// fixture may serve several executions, as a database pool does. The
@@ -16,6 +16,7 @@
 //// cross-node fencing, media durability or power-loss behavior.
 ////
 //// ```gleam
+//// import gleam/time/duration
 //// import saga/storage/conformance
 ////
 //// let result =
@@ -26,8 +27,8 @@
 ////         memory.stop(store)
 ////       }))
 ////     },
-////     timeout: 5000,
-////     owner_loss_within: 500,
+////     timeout: duration.seconds(5),
+////     owner_loss_within: duration.milliseconds(500),
 ////   )
 //// ```
 ////
@@ -40,6 +41,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
+import gleam/time/duration.{type Duration}
 import saga
 import saga/codec
 import saga/durable
@@ -67,7 +69,7 @@ pub type Failure {
   AdapterCrashed(String)
   /// A scenario did not finish in time.
   TimedOut
-  /// `timeout` or `owner_loss_within` was below 1.
+  /// `timeout` or `owner_loss_within` was below 1 millisecond.
   InvalidTimeout
 }
 
@@ -78,9 +80,11 @@ pub type Failure {
 /// worker exits, including on failure or timeout.
 pub fn run(
   fresh: fn() -> Result(Fixture, String),
-  timeout timeout: Int,
-  owner_loss_within owner_loss_within: Int,
+  timeout timeout: Duration,
+  owner_loss_within owner_loss_within: Duration,
 ) -> Result(Nil, Failure) {
+  let timeout = duration.to_milliseconds(timeout)
+  let owner_loss_within = duration.to_milliseconds(owner_loss_within)
   use _ <- result.try(case timeout > 0 && owner_loss_within > 0 {
     True -> Ok(Nil)
     False -> Error(InvalidTimeout)
@@ -203,7 +207,8 @@ fn holder(s: Storage, id: String) -> #(process.Pid, Result(Claim, Failure)) {
           process.send(reply, Ok(claim))
           case storage.renewal(s) {
             None -> process.sleep_forever()
-            Some(#(every, renew)) -> renew_forever(claim, every, renew)
+            Some(#(every, renew)) ->
+              renew_forever(claim, duration.to_milliseconds(every), renew)
           }
         }
         Error(_) -> process.send(reply, Error(UnexpectedResult("holder claim")))
@@ -639,7 +644,9 @@ fn killed_runner(s: Storage, _within: Int) -> Result(Nil, Failure) {
       input: "x",
     )
   let lost = process.new_subject()
-  process.spawn(fn() { process.send(lost, durable.drive(run, timeout: 5000)) })
+  process.spawn(fn() {
+    process.send(lost, durable.drive(run, timeout: duration.seconds(5)))
+  })
   use runner <- result.try(
     process.receive(runners, 5000)
     |> result.replace_error(UnexpectedResult("killed-runner claim")),
@@ -659,7 +666,7 @@ fn killed_runner(s: Storage, _within: Int) -> Result(Nil, Failure) {
     |> result.replace_error(UnexpectedResult("killed-runner reconnect")),
   )
   equal(
-    durable.drive(resumed, timeout: 5000),
+    durable.drive(resumed, timeout: duration.seconds(5)),
     Ok(execution.Completed("x recovered")),
     "the next drive after a killed runner claims at once and resumes",
   )
@@ -701,7 +708,9 @@ fn blocking(
     error: text,
     undo_error: text,
   )
-  |> durable.with_config(execution.config() |> execution.without_step_timeout)
+  |> durable.with_config(
+    execution.config() |> execution.with_step_timeout(execution.Infinity),
+  )
 }
 
 /// The storage under test, reporting each process that claims through it

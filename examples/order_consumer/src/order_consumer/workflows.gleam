@@ -3,7 +3,7 @@
 /// records and errors (`order_consumer/domain`). No `saga/internal/*`
 /// import is legal from here — that is what makes this package an external
 /// acceptance test of saga's public facade, not a white-box test.
-import gleam/option.{type Option, None, Some}
+import gleam/time/duration
 import order_consumer/domain.{
   type CheckoutError, type InventoryHold, type Order, type PaymentAuthorization,
   type UndoError, InventoryHold, InventoryUnavailable, PaymentAuthorization,
@@ -172,16 +172,12 @@ pub fn blocking_workflow(
 /// A config with a tight concurrency limit and an optional deadline, for the
 /// advanced-configuration scenario. Demonstrates composing over the public
 /// opaque `Config` with the `execution.with_*` setters.
-pub fn bounded_config(deadline_ms: Option(Int)) -> Config {
-  let config =
-    execution.config()
-    |> execution.with_max_concurrency(1)
-    |> execution.with_settle_timeout(200)
-    |> execution.with_cleanup_timeout(200)
-  case deadline_ms {
-    Some(ms) -> execution.with_deadline(config, ms)
-    None -> config
-  }
+pub fn bounded_config(deadline: execution.Timeout) -> Config {
+  execution.config()
+  |> execution.with_max_concurrency(1)
+  |> execution.with_settle_timeout(duration.milliseconds(200))
+  |> execution.with_cleanup_timeout(duration.milliseconds(200))
+  |> execution.with_deadline(deadline)
 }
 
 // ---------------------------------------------------------------------------

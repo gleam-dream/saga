@@ -3,6 +3,7 @@ import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/codec
@@ -47,7 +48,9 @@ fn prepare(
       undo_error: text,
     )
   persistence
-  |> durable.with_config(execution.config() |> execution.without_step_timeout)
+  |> durable.with_config(
+    execution.config() |> execution.with_step_timeout(execution.Infinity),
+  )
 }
 
 fn start(
@@ -72,7 +75,7 @@ fn reconnect(
 fn drive(
   run: durable.Run(String, String, String, String),
 ) -> Result(execution.Outcome(String, String, String), durable.Error) {
-  durable.drive(run, timeout: 10_000)
+  durable.drive(run, timeout: duration.seconds(10))
 }
 
 fn drive_later(
@@ -189,7 +192,7 @@ pub fn persistent_concurrent_shared_dependency_test() {
     |> durable.with_config(
       execution.config()
       |> execution.with_max_concurrency(2)
-      |> execution.without_step_timeout,
+      |> execution.with_step_timeout(execution.Infinity),
     )
   let result = drive_later(start(persistence, memory.storage(store), "p"))
   let assert Ok(a) = process.receive(ready, 1000)
@@ -454,7 +457,7 @@ pub fn restart_recovers_two_concurrent_admissions_test() {
     |> durable.with_config(
       execution.config()
       |> execution.with_max_concurrency(2)
-      |> execution.without_step_timeout,
+      |> execution.with_step_timeout(execution.Infinity),
     )
   }
   let store = start_memory()
@@ -490,7 +493,7 @@ pub fn retry_and_continue_share_local_semantics_test() {
     })
     |> saga.compensate(max_attempts: 2, with: fn(failed) {
       case failed.attempt {
-        1 -> saga.RetryAfter(1)
+        1 -> saga.RetryAfter(duration.milliseconds(1))
         _ -> saga.Continue(failed.input <> "-continued", saga.NoUndo)
       }
     })
@@ -710,7 +713,7 @@ pub fn parallel_rollback_covers_both_completed_branches_test() {
     |> durable.with_config(
       execution.config()
       |> execution.with_max_concurrency(2)
-      |> execution.without_step_timeout,
+      |> execution.with_step_timeout(execution.Infinity),
     )
   let result = drive_later(start(persistence, memory.storage(store), "order"))
   let assert Ok(first) = process.receive(entered, 1000)
@@ -902,7 +905,7 @@ fn resolve_interrupted(
 pub fn compensation_recovery_retry_test() {
   resolve_interrupted(saga.Retry, 2, False)
   |> should.equal(execution.Completed("x retried"))
-  resolve_interrupted(saga.RetryAfter(5), 2, False)
+  resolve_interrupted(saga.RetryAfter(duration.milliseconds(5)), 2, False)
   |> should.equal(execution.Completed("x retried"))
 }
 
@@ -1190,14 +1193,15 @@ pub fn drive_timeout_stops_the_runner_and_keeps_the_checkpoint_test() {
   let store = start_memory()
   let backend = memory.storage(store)
   let run = start(prepare(blocking_workflow(entered, False)), backend, "slow")
-  durable.drive(run, timeout: 200) |> should.equal(Error(durable.DriveTimedOut))
+  durable.drive(run, timeout: duration.milliseconds(200))
+  |> should.equal(Error(durable.DriveTimedOut))
   let assert Ok(attempt) = process.receive(entered, 1000)
   stops_within(attempt, 1000)
   durable.read(run) |> should.equal(Ok(durable.Pending))
   // The claim was released: the next drive is not Busy.
   durable.drive(
     reconnect(prepare(blocking_workflow(entered, True)), backend, "slow"),
-    timeout: 5000,
+    timeout: duration.seconds(5),
   )
   |> should.equal(Ok(execution.Completed("x recovered")))
   durable.error_kind(durable.DriveTimedOut) |> should.equal(durable.Transient)
@@ -1212,14 +1216,16 @@ pub fn caller_exit_stops_the_runner_test() {
   let backend = memory.storage(store)
   let run = start(prepare(blocking_workflow(entered, False)), backend, "orphan")
   let caller =
-    process.spawn_unlinked(fn() { durable.drive(run, timeout: 60_000) })
+    process.spawn_unlinked(fn() {
+      durable.drive(run, timeout: duration.seconds(60))
+    })
   let assert Ok(attempt) = process.receive(entered, 1000)
   kill_and_wait(caller)
   stops_within(attempt, 1000)
   durable.read(run) |> should.equal(Ok(durable.Pending))
   durable.drive(
     reconnect(prepare(blocking_workflow(entered, True)), backend, "orphan"),
-    timeout: 5000,
+    timeout: duration.seconds(5),
   )
   |> should.equal(Ok(execution.Completed("x recovered")))
   memory.stop(store)
@@ -1228,8 +1234,8 @@ pub fn caller_exit_stops_the_runner_test() {
 pub fn drive_rejects_a_non_positive_timeout_test() {
   let store = start_memory()
   let run = start(prepare(echo_workflow()), memory.storage(store), "zero")
-  durable.drive(run, timeout: 0)
-  |> should.equal(Error(durable.InvalidTimeout(0)))
+  durable.drive(run, timeout: duration.milliseconds(0))
+  |> should.equal(Error(durable.InvalidTimeout(duration.milliseconds(0))))
   memory.stop(store)
 }
 
@@ -1241,7 +1247,7 @@ pub fn drive_reports_an_invalid_config_test() {
       execution.config() |> execution.with_max_concurrency(0),
     )
   let run = start(persistence, memory.storage(store), "config")
-  durable.drive(run, timeout: 1000)
+  durable.drive(run, timeout: duration.seconds(1))
   |> should.equal(
     Error(durable.InvalidConfig([execution.MaxConcurrencyNotPositive(0)])),
   )
@@ -1258,10 +1264,10 @@ pub fn slow_storage_call_times_out_test() {
       process.sleep(60_000)
       Error(storage.Unavailable("never"))
     })
-    |> storage.with_call_timeout(100)
+    |> storage.with_call_timeout(duration.milliseconds(100))
   let persistence = prepare(echo_workflow())
   let run = start(persistence, slow, "slow-store")
-  durable.drive(run, timeout: 5000)
+  durable.drive(run, timeout: duration.seconds(5))
   |> should.equal(Error(durable.StorageFailure(storage.TimedOut)))
   drive(reconnect(persistence, backend, "slow-store"))
   |> should.equal(Ok(execution.Completed("x!")))
@@ -1319,7 +1325,7 @@ pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
   let store = start_memory()
   let renewing =
     memory.storage(store)
-    |> storage.with_renewal(every: 20, renew: fn(claim) {
+    |> storage.with_renewal(every: duration.milliseconds(20), renew: fn(claim) {
       process.send(renewals, claim)
       // The third renewal finds the claim taken over.
       probe.counter_enter(renewed)
@@ -1329,7 +1335,7 @@ pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
       }
     })
   let run = start(prepare(blocking_workflow(entered, False)), renewing, "lease")
-  durable.drive(run, timeout: 5000)
+  durable.drive(run, timeout: duration.seconds(5))
   |> should.equal(Error(durable.StorageFailure(storage.StaleOwner)))
   let assert Ok(attempt) = process.receive(entered, 1000)
   stops_within(attempt, 1000)

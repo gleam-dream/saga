@@ -23,6 +23,7 @@ every codec version; it does not construct a second graph.
 ```gleam
 import gleam/dynamic/decode
 import gleam/json
+import gleam/time/duration
 import saga
 import saga/codec
 import saga/durable
@@ -43,7 +44,7 @@ let persistence =
 let assert Ok(store) = memory.start()
 let assert Ok(run) =
   durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout:123", input: "order-123")
-let outcome = durable.drive(run, timeout: 30_000)
+let outcome = durable.drive(run, timeout: duration.seconds(30))
 let saved = durable.read(run)
 memory.stop(store)
 ```
@@ -151,7 +152,7 @@ suit the deployment's timing requirements.
 ## Driving
 
 `durable.drive(run, timeout:)` runs the execution in a runner process and
-waits at most `timeout` milliseconds.
+waits at most `timeout`, a `gleam/time/duration` `Duration`.
 
 - The runner claims the execution, restores the checkpoint and runs. The
   outcome is returned once it is saved; a finished execution returns its
@@ -166,7 +167,7 @@ waits at most `timeout` milliseconds.
   the runner's VM is lost does the claim wait for the storage to notice, as
   a lease that expires.
 - Every storage call from the runner is bounded by the storage's call
-  timeout (5 s by default, `storage.with_call_timeout`); a slower call stops
+  timeout (5 seconds by default, `storage.with_call_timeout`); a slower call stops
   the runner with `StorageFailure(TimedOut)`.
 - A storage declared `with_renewal` has its claim renewed from a heartbeat
   linked to the runner. A renewal that finds the claim taken over stops the
@@ -221,7 +222,7 @@ process still lives in this VM, and `saga_postgres` uses a lease.
 **Lease renewal.** A lease-based adapter declares `storage.with_renewal`.
 Commit-only refresh is not enough: the gap between two commits is the
 longest action in flight, which a step may extend up to its attempt timeout
-(or without bound with `without_step_timeout`) and a `RetryAfter` backoff
+(or without bound with `with_step_timeout(execution.Infinity)`) and a `RetryAfter` backoff
 up to five minutes. A lease shorter than that gap would expire under a live
 runner and let a second runner start the same step concurrently. With
 renewal, a lease expires only when its runner is gone, so the lease can stay
@@ -249,6 +250,7 @@ An adapter package runs the public suite without depending on saga's tests
 or a particular test framework:
 
 ```gleam
+import gleam/time/duration
 import saga/storage/conformance
 
 let result =
@@ -259,8 +261,8 @@ let result =
         drop_test_store(resource)
       }))
     },
-    timeout: 5000,
-    owner_loss_within: lease + 500,
+    timeout: duration.seconds(5),
+    owner_loss_within: duration.add(lease, duration.milliseconds(500)),
   )
 ```
 

@@ -1,6 +1,7 @@
 import gleam/erlang/process.{type Subject}
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/time/duration
 import gleeunit/should
 import saga
 import saga/execution
@@ -196,7 +197,9 @@ pub fn observation_events_cancelled_test() {
       )
     })
 
-  let config = execution.config() |> execution.with_settle_timeout(0)
+  let config =
+    execution.config()
+    |> execution.with_settle_timeout(duration.milliseconds(0))
 
   let assert Ok(sinal.SubscriptionCompletion(_work_result, [])) =
     sinal.with_subscriptions(all_subscriptions(collector), fn() {
@@ -204,7 +207,7 @@ pub fn observation_events_cancelled_test() {
         let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
         execution.cancel(exec)
         let assert Ok(execution.Cancelled(_reason, _settlement)) =
-          execution.await(exec, 10_000)
+          execution.await(exec, duration.seconds(10))
         Nil
       })
     })
@@ -247,7 +250,7 @@ pub fn step_timeout_with_decider_emits_step_stopped_test() {
             _ -> Ok(x)
           }
         })
-        |> saga.timeout(50)
+        |> saga.timeout(duration.milliseconds(50))
         |> saga.compensate(max_attempts: 2, with: fn(failed) {
           let saga.FailedAttempt(failure: failure, ..) = failed
 
@@ -299,7 +302,7 @@ pub fn step_timeout_without_decider_reports_real_duration_test() {
           probe.enter(gate)
           Ok(x)
         })
-        |> saga.timeout(50),
+        |> saga.timeout(duration.milliseconds(50)),
       )
     })
 
