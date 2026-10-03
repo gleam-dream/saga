@@ -6,6 +6,44 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
+### Step correlation (wave 5)
+
+Every change below has a before and after in
+[docs/migration-wave-5.md](docs/migration-wave-5.md).
+
+#### Added
+
+- **A step reads its run's correlation.** `saga.EffectKey` has a new field,
+  `correlation: Option(Correlation)`: the value set with
+  `execution.with_correlation` or `durable.with_correlation`, which is also
+  the `correlation` of the run's `saga/telemetry` events. `saga.effect`,
+  `saga.undo` (`undo.key`), `saga.compensate` (`failed.key`) and the durable
+  resolvers (`recoverable`, `resolve_undo`, `resolve_compensation`) already
+  receive an `EffectKey`, so a step's own HTTP client can be correlated
+  without threading the value by hand (support_desk, research_agent,
+  checkout). An undo restored from a checkpoint and a resolver that runs
+  after a restart carry the correlation of the handle that drives then.
+  `durable.Required.key`, in `RecoveryRequired`, carries it too.
+  `saga.step` still hands its function the input only; use `saga.effect` for
+  a step that needs the context.
+
+#### Changed
+
+- **A durable execution is always correlated.** A handle without
+  `durable.with_correlation` used to emit `correlation: None` and give its
+  steps nothing, and the value was not saved, so a forgotten call on one
+  handle after a restart left that drive's events unjoined. It now carries
+  `correlation.from_key(id)` of its execution id in its events and in its
+  steps. A handle with `with_correlation` is unchanged. A local run without
+  a correlation still carries `None`.
+
+#### Breaking
+
+- `saga.EffectKey` has a fourth field. A positional construction or pattern
+  (`EffectKey(a, b, c)`) no longer compiles; saga builds this record, so
+  read it by label (`key.idempotency`, `key.correlation`). No dependent in
+  the ecosystem constructs or matches one positionally.
+
 ### Durations (wave 4)
 
 Every breaking change below has a before and after in

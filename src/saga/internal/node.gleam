@@ -15,6 +15,7 @@ import gleam/option.{type Option}
 import saga/internal/checkpoint
 import saga/internal/ffi.{type CrashClass}
 import saga/internal/store.{type Store}
+import sinal/correlation.{type Correlation}
 
 /// A step's recorded location: nested scope (from `embed`), a name, and the
 /// 1-based occurrence rank among nodes sharing the same scope + name.
@@ -34,6 +35,7 @@ pub type Attempt {
     persistent: Bool,
     saved_input: Option(String),
     admit: fn(String) -> Nil,
+    correlation: Option(Correlation),
   )
 }
 
@@ -121,14 +123,14 @@ pub fn map_errors(
         output_version: p.output_version,
         recovery_undo_declared: p.recovery_undo_declared,
         freeze: p.freeze,
-        thaw: fn(saved, run_store, key) {
-          case p.thaw(saved, run_store, key) {
+        thaw: fn(saved, run_store, key, correlation) {
+          case p.thaw(saved, run_store, key, correlation) {
             Ok(commit) -> Ok(map_undo_thunk(commit, map_undo_error))
             Error(reason) -> Error(reason)
           }
         },
-        resume_undo: fn(run_store, key) {
-          let body = p.resume_undo(run_store, key)
+        resume_undo: fn(run_store, key, correlation) {
+          let body = p.resume_undo(run_store, key, correlation)
           fn() {
             case body() {
               Ok(Ok(Nil)) -> Ok(Ok(Nil))
@@ -309,7 +311,8 @@ pub fn build_dependents(nodes: Dict(Int, Node(e, u))) -> Dict(Int, List(Int)) {
 
 /// Node-specific codecs remain bound to the node's concrete value types.
 /// The `String` that `freeze`, `thaw` and `resume_undo` receive is the step's
-/// stable key base (see `Attempt.base`).
+/// stable key base (see `Attempt.base`); `thaw` and `resume_undo` also receive
+/// the run's correlation, which the undo's `EffectKey` carries.
 pub type Persistence(e, u) {
   Persistence(
     version: String,
@@ -318,13 +321,13 @@ pub type Persistence(e, u) {
     output_version: String,
     recovery_undo_declared: Bool,
     freeze: fn(Store, String) -> Result(List(String), checkpoint.Failure),
-    thaw: fn(List(String), Store, String) ->
+    thaw: fn(List(String), Store, String, Option(Correlation)) ->
       Result(
         fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))),
         checkpoint.Failure,
       ),
     resume_compensation: fn(Attempt, Store) -> fn() -> ErasedRecovery(e, u),
-    resume_undo: fn(Store, String) ->
+    resume_undo: fn(Store, String, Option(Correlation)) ->
       fn() -> Result(Result(Nil, u), checkpoint.Failure),
     resume: fn(Attempt, Store) -> fn() -> AttemptResult(e, u),
   )

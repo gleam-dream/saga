@@ -171,7 +171,12 @@ pub fn with_max_retry_delay(config: Config, delay: Duration) -> Config {
 }
 
 /// Carries `correlation` in every `saga/telemetry` event of the run, so the
-/// run can be followed with the caller's other work.
+/// run can be followed with the caller's other work. The run's steps read it
+/// as `correlation` of the `saga.EffectKey` that `saga.effect`, `saga.undo`
+/// and `saga.compensate` receive, and pass it to the clients they call.
+///
+/// A local run without a correlation carries none. A durable execution
+/// without one carries `correlation.from_key` of its execution id.
 pub fn with_correlation(config: Config, correlation: Correlation) -> Config {
   Config(..config, correlation: Some(correlation))
 }
@@ -232,6 +237,22 @@ fn describe_duration(value: Duration) -> String {
   int.to_string(duration.to_milliseconds(value)) <> " ms"
 }
 
+/// The correlation a run carries: the one set on `config`, or, for a durable
+/// execution, `correlation.from_key` of its id, so a durable run is never
+/// uncorrelated and a handle that forgot `with_correlation` still joins its
+/// events by execution id.
+@internal
+pub fn correlation_of(
+  config: Config,
+  execution: Option(String),
+) -> Option(Correlation) {
+  case config.correlation, execution {
+    Some(set), _ -> Some(set)
+    None, Some(id) -> Some(correlation.from_key(id))
+    None, None -> None
+  }
+}
+
 /// Checks `config` and returns the coordinator's settings, labelled with a
 /// durable execution id when there is one. Every violation is collected.
 @internal
@@ -283,7 +304,7 @@ pub fn settings(
         settle_timeout: duration.to_milliseconds(config.settle_timeout),
         cleanup_timeout: duration.to_milliseconds(config.cleanup_timeout),
         max_retry_delay: duration.to_milliseconds(config.max_retry_delay),
-        correlation: config.correlation,
+        correlation: correlation_of(config, execution),
         execution: execution,
       ))
     _ -> Error(errors)

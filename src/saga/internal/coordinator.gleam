@@ -2006,7 +2006,11 @@ fn undo_next(state: RunState(o, e, u)) -> RunState(o, e, u) {
             n.persistence
           {
             True, Some(p) ->
-              p.resume_undo(state.store, step_base(state, node_id))
+              p.resume_undo(
+                state.store,
+                step_base(state, node_id),
+                state.correlation,
+              )
             _, _ -> fn() { Ok(undo_fn()) }
           }
           let #(pid, permits) =
@@ -2645,7 +2649,7 @@ fn restore(
             None -> Error(checkpoint.InvalidState(checkpoint.Malformed))
           })
           use commit <- result.try(
-            p.thaw(values, acc.0, step_base(state, id))
+            p.thaw(values, acc.0, step_base(state, id), state.correlation)
             |> result.map_error(checkpoint.at(_, saved_address(n.address))),
           )
           let #(store, undo) = commit(acc.0)
@@ -2893,6 +2897,7 @@ fn attempt_context(
     option.is_some(state.persistence),
     dict.get(state.inputs, id) |> option.from_result,
     fn(_) { Nil },
+    state.correlation,
   )
 }
 

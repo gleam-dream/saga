@@ -586,7 +586,7 @@ pub fn start_or_reconnect(
   let run = Run(persistence, storage, id, persistence.config)
   let envelope = Envelope(1, id, persistence.stamp, encoded, None, None, None)
   use bytes <- result.try(
-    encode(envelope, persistence) |> result.map_error(from_checkpoint),
+    encode(envelope, persistence) |> result.map_error(from_checkpoint(run, _)),
   )
   case call(storage, fn() { storage.do_create(storage, id, bytes) }) {
     Ok(_) -> Ok(run)
@@ -615,7 +615,10 @@ pub fn reconnect(
 }
 
 /// Carries `correlation` in every `saga/telemetry` event of this handle's
-/// drives. The correlation is not saved: set it on every handle.
+/// drives, and in the `saga.EffectKey` of every step callback and resolver
+/// that runs under it. The correlation is not saved: set it on every handle
+/// that drives. A handle without one carries `correlation.from_key` of its
+/// execution id, so a forgotten call still joins the execution's events.
 pub fn with_correlation(
   run: Run(i, o, e, u),
   correlation: Correlation,
@@ -633,7 +636,7 @@ pub fn read(run: Run(i, o, e, u)) -> Result(Status(o, e, u), Error) {
   use envelope <- result.try(load(run))
   Ok(case envelope.outcome, envelope.issue {
     Some(outcome), _ -> Finished(execution.from_coordinator(outcome))
-    None, Some(reason) -> Suspended(from_checkpoint(reason))
+    None, Some(reason) -> Suspended(from_checkpoint(run, reason))
     None, None -> Pending
   })
 }
@@ -940,12 +943,13 @@ fn drive_claimed(
                 storage.Suspended,
               )
             {
-              Ok(Nil) -> from_checkpoint(reason)
-              Error(recording) if recording == reason -> from_checkpoint(reason)
+              Ok(Nil) -> from_checkpoint(run, reason)
+              Error(recording) if recording == reason ->
+                from_checkpoint(run, reason)
               Error(recording) ->
                 SuspensionNotSaved(
-                  from_checkpoint(reason),
-                  from_checkpoint(recording),
+                  from_checkpoint(run, reason),
+                  from_checkpoint(run, recording),
                 )
             }
             process.send(result_out, Error(failure))
@@ -970,7 +974,7 @@ fn drive_claimed(
             result_out,
             saved
               |> result.map(fn(_) { execution.from_coordinator(outcome) })
-              |> result.map_error(from_checkpoint),
+              |> result.map_error(from_checkpoint(run, _)),
           )
         },
       )
@@ -1167,7 +1171,7 @@ fn open(
     fn(value) { codec.decode(persistence.error, value) },
     fn(value) { codec.decode(persistence.undo_error, value) },
   )
-  |> result.map_error(from_checkpoint)
+  |> result.map_error(from_checkpoint(run, _))
 }
 
 fn encode(
@@ -1227,7 +1231,7 @@ fn frame(parts: List(String)) -> String {
 // Internal to public vocabulary
 // ---------------------------------------------------------------------------
 
-fn from_checkpoint(failure: checkpoint.Failure) -> Error {
+fn from_checkpoint(run: Run(i, o, e, u), failure: checkpoint.Failure) -> Error {
   case failure {
     checkpoint.StorageFailure(error) -> StorageFailure(error)
     checkpoint.CodecFailure(boundary, error) ->
@@ -1242,7 +1246,10 @@ fn from_checkpoint(failure: checkpoint.Failure) -> Error {
           checkpoint.CompensationAction(n) -> execution.StepCompensation(n)
           checkpoint.UndoAction -> execution.StepUndo
         },
-        key: saga.key_from_saved(key),
+        key: saga.key_from_saved(
+          key,
+          execution.correlation_of(run.config, Some(run.id)),
+        ),
       ))
     checkpoint.TooLarge(bytes, limit) -> CheckpointTooLarge(bytes, limit)
   }
