@@ -1,0 +1,30 @@
+# Saga's PostgreSQL storage: one table of executions, with leased claims,
+# for runners on several nodes that share one database. A separate package,
+# so that saga itself does not depend on pog.
+name = "saga_postgres"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+internal_modules = ["saga_postgres/internal", "saga_postgres/internal/*"]
+licenses = ["Apache-2.0"]
+description = "A PostgreSQL storage adapter for saga's durable runs."
+repository = { type = "github", user = "gleam-dream", repo = "saga" }
+
+[dependencies]
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+# A path dependency until saga is published. Saga's own path dependency on
+# sinal must resolve from here too.
+saga = { path = "../.." }
+sinal = { path = "../../../sinal" }
+# Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`: an application that
+# uses both saga_postgres and grind shares one pog/pgo pool (the app's own
+# `pog.Connection` serves the app, grind and saga), and grind pins these exact
+# minor ranges because its FFI matches pog's and pgo's private connection
+# shapes. Keep both ranges aligned with grind's gleam.toml, or the
+# application cannot resolve one version of each.
+pog = ">= 4.1.0 and < 4.2.0"
+pgo = ">= 0.20.0 and < 0.21.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
