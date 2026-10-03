@@ -344,6 +344,16 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
     "unobserved cancellation",
   ))
   use _ <- result.try(equal(
+    commit(s, owner, 99, False, <<>>),
+    Error(storage.CancellationChanged),
+    "an unobserved cancellation takes precedence over a wrong revision",
+  ))
+  use _ <- result.try(equal(
+    commit(s, forged, 99, False, <<>>),
+    Error(storage.StaleOwner),
+    "a stale claim takes precedence over every other refusal",
+  ))
+  use _ <- result.try(equal(
     commit(s, owner, 1, True, <<"cancelled":utf8>>),
     Ok(#(2, generation, True, <<"cancelled":utf8>>)),
     "commit observed cancellation",

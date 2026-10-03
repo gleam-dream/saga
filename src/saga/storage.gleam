@@ -186,12 +186,13 @@ pub opaque type Storage {
 ///   execution, and otherwise advances the generation;
 /// - `commit` succeeds only for the current claim, the current revision
 ///   and the current cancellation flag, increments the revision and keeps
-///   ownership; it fails with `StaleOwner`, `Conflict` or
-///   `CancellationChanged`, in that order of precedence;
+///   ownership; it fails with `StaleOwner`, `CancellationChanged` or
+///   `Conflict`, in that order of precedence;
 /// - `release` fails with `StaleOwner` unless `claim` is the current owner;
 /// - `cancel` sets the flag idempotently, keeping revision and bytes;
 /// - `unfinished(limit)` returns up to `limit` ids whose phase is `Pending`
-///   or `Suspended` and that no live claim holds.
+///   or `Suspended` and that no live claim holds, oldest first where the
+///   store can tell.
 ///
 /// Each operation must finish within the call timeout (5 000 ms by
 /// default, `with_call_timeout`); saga gives up on a slower one with
@@ -223,7 +224,11 @@ pub fn new(
 /// process linked to the runner, so a live runner keeps its claim however
 /// long a step takes, and a lost one stops renewing. `renew` fails with
 /// `StaleOwner` once the claim was taken over, which stops the runner.
-/// Choose `every` well inside the lease, a third of it for example.
+/// Choose `every` well inside the lease, a third of it for example. A renewal
+/// that fails with `Unavailable` or `TimedOut` is tried again at the next
+/// interval; writes stay fenced by the claim if the lease expires meanwhile.
+/// `new` starts without renewal, so a wrapper that rebuilds an adapter's
+/// storage with `new` must declare the adapter's renewal again.
 pub fn with_renewal(
   storage: Storage,
   every every: Int,

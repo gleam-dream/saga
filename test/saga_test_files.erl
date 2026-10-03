@@ -1,6 +1,6 @@
 -module(saga_test_files).
 -export([fresh_directory/1, remove_directory/1, claim_from_immortal/2,
-         remember_claim/2, genuine_claim/1, bump/1]).
+         remember_claim/2, genuine_claim/1]).
 
 fresh_directory(Path) ->
     _ = file:del_dir_r(Path),
@@ -28,8 +28,3 @@ genuine_claim(Id) ->
         Claim -> {ok, Claim}
     end.
 
-%% Counts calls in the calling process.
-bump(Key) ->
-    Count = case get({?MODULE, Key}) of undefined -> 1; N -> N + 1 end,
-    put({?MODULE, Key}, Count),
-    Count.

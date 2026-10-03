@@ -2,6 +2,7 @@
 //// and changes one operation.
 
 import gleam/erlang/process
+import gleam/option.{None, Some}
 import saga/storage.{type Claim, type Commit, type Storage, type Stored}
 
 pub fn with_claim(
@@ -36,6 +37,21 @@ pub fn watched(
 }
 
 fn rebuild(
+  backend: Storage,
+  claim: fn(String) -> Result(#(Claim, Stored), storage.Error),
+  commit: fn(Claim, Commit) -> Result(Stored, storage.Error),
+) -> Storage {
+  let rebuilt = rebuild_operations(backend, claim, commit)
+  let rebuilt =
+    storage.with_call_timeout(rebuilt, storage.call_timeout(backend))
+  case storage.renewal(backend) {
+    Some(#(every, renew)) ->
+      storage.with_renewal(rebuilt, every: every, renew: renew)
+    None -> rebuilt
+  }
+}
+
+fn rebuild_operations(
   backend: Storage,
   claim: fn(String) -> Result(#(Claim, Stored), storage.Error),
   commit: fn(Claim, Commit) -> Result(Stored, storage.Error),

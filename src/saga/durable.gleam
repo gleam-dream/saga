@@ -763,7 +763,7 @@ fn drive_owned(
     None -> None
     Some(#(every, renew)) ->
       Some(
-        start_heartbeat(process.self(), every, claim, renew, fn() {
+        start_heartbeat(store, process.self(), every, claim, renew, fn() {
           process.send(
             reply,
             RunnerFinished(Error(StorageFailure(storage.StaleOwner))),
@@ -1011,16 +1011,18 @@ fn guarded(
 /// Renews a claim every `every` milliseconds while the runner lives; when
 /// the claim was taken over, reports it and stops the runner.
 fn start_heartbeat(
+  store: Storage,
   runner: Pid,
   every: Int,
   claim: storage.Claim,
   renew: fn(storage.Claim) -> Result(Nil, storage.Error),
   on_lost: fn() -> Nil,
 ) -> Pid {
-  process.spawn(fn() { heartbeat(runner, every, claim, renew, on_lost) })
+  process.spawn(fn() { heartbeat(store, runner, every, claim, renew, on_lost) })
 }
 
 fn heartbeat(
+  store: Storage,
   runner: Pid,
   every: Int,
   claim: storage.Claim,
@@ -1028,12 +1030,15 @@ fn heartbeat(
   on_lost: fn() -> Nil,
 ) -> Nil {
   process.sleep(int.max(1, every))
-  case rescued(fn() { renew(claim) }) {
+  // The storage's call timeout bounds a renewal too. A renewal that fails
+  // with `Unavailable` or `TimedOut` is tried again; commits stay fenced by
+  // the claim if the lease expires meanwhile.
+  case call(store, fn() { renew(claim) }) {
     Error(storage.StaleOwner) | Error(storage.NotFound) -> {
       on_lost()
       process.kill(runner)
     }
-    _ -> heartbeat(runner, every, claim, renew, on_lost)
+    _ -> heartbeat(store, runner, every, claim, renew, on_lost)
   }
 }
 
