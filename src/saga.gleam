@@ -63,7 +63,6 @@ import saga/internal/node.{
   EvidenceCompleted, EvidenceFailed, EvidenceMaybeSent, EvidenceNotSent, Node,
 }
 import saga/internal/store.{type Store}
-import saga/reconciliation
 
 /// A step's recorded location: nested scope (from `embed` and `choose`), a
 /// name, and the 1-based occurrence rank among steps sharing the same scope
@@ -740,6 +739,16 @@ fn undo_key(base: String) -> EffectKey {
   effect_key(base <> ":undo", 1)
 }
 
+fn saved_key(key: EffectKey) -> checkpoint.Key {
+  checkpoint.Key(key.idempotency, key.attempt, key.attempt_key)
+}
+
+/// Converts a saved key back to the public vocabulary.
+@internal
+pub fn key_from_saved(key: checkpoint.Key) -> EffectKey {
+  EffectKey(key.idempotency, key.attempt, key.attempt_key)
+}
+
 fn context_from_node(attempt: node.Attempt) -> Context {
   Context(
     number: attempt.number,
@@ -1022,6 +1031,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
     StepAddress(scope: input.scope.path, name: step.name, occurrence: 1)
   let deps = set.to_list(input.deps)
   let capture_input = input.fetch()
+  let saved_address =
+    checkpoint.Address(address.scope, address.name, address.occurrence)
+  let input_failure = fn(error) {
+    checkpoint.CodecFailure(checkpoint.StepInput(saved_address), error)
+  }
+  let output_failure = fn(error) {
+    checkpoint.CodecFailure(checkpoint.StepOutput(saved_address), error)
+  }
 
   let to_erased_recovery = fn(recovery: Recovery(o, e, u), input: i) -> ErasedRecovery(
     e,
@@ -1085,13 +1102,13 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             None -> Ok(produce_value())
           })
           use encoded <- result.try(codec.encode(p.input, value))
-          use _ <- result.try(node_attempt.admit(encoded))
+          node_attempt.admit(encoded)
           Ok(value)
         }
         _, _ -> Ok(produce_value())
       }
       case prepared {
-        Error(reason) -> node.AttemptBlocked(checkpoint.CodecFailure(reason))
+        Error(error) -> node.AttemptBlocked(input_failure(error))
         Ok(value) ->
           case
             step.attempt(
@@ -1136,12 +1153,18 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             step.persistence,
             node_attempt.saved_input
           {
-            True, Some(p), Some(encoded) -> codec.decode(p.input, encoded)
-            True, _, None -> Error("compensation has no admitted input")
+            True, Some(p), Some(encoded) ->
+              codec.decode(p.input, encoded) |> result.map_error(input_failure)
+            True, _, None ->
+              Error(
+                checkpoint.InvalidState(checkpoint.CompensationInputMissing(
+                  saved_address,
+                )),
+              )
             _, _, _ -> Ok(produce_value())
           }
           case input {
-            Error(reason) -> node.EBlocked(checkpoint.CodecFailure(reason))
+            Error(failure) -> node.EBlocked(failure)
             Ok(input) ->
               to_erased_recovery(
                 decide_fn(FailedAttempt(
@@ -1171,15 +1194,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             codec.version(p.input),
             codec.version(p.output),
           ]),
+          step_version: p.version,
+          input_version: codec.version(p.input),
+          output_version: codec.version(p.output),
           recovery_undo_declared: step.recovery_undo_declared,
-          valid: !list.contains(
-            [p.version, codec.version(p.input), codec.version(p.output)],
-            "",
-          ),
           freeze: fn(run_store, base) {
             use pair <- result.try(case store.get_record(run_store, id) {
               Ok(pair) -> Ok(pair)
-              Error(Nil) -> Error("missing checkpoint value")
+              Error(Nil) -> Error(checkpoint.InvalidState(checkpoint.Malformed))
             })
             let #(input, output, undoable) = pair
             let request = UndoRequest(input, output, undo_key(base))
@@ -1187,14 +1209,19 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               case undoable && !has_undo(step.undo_for(request)) {
                 True ->
                   Error(
-                    "undo reconstruction contract returned NoUndo: "
-                    <> step.name,
+                    checkpoint.InvalidState(checkpoint.UndoNotRestorable(
+                      saved_address,
+                    )),
                   )
                 False -> Ok(Nil)
               },
             )
-            use input <- result.try(codec.encode(p.input, input))
-            use output <- result.try(codec.encode(p.output, output))
+            use input <- result.try(
+              codec.encode(p.input, input) |> result.map_error(input_failure),
+            )
+            use output <- result.try(
+              codec.encode(p.output, output) |> result.map_error(output_failure),
+            )
             Ok([
               input,
               output,
@@ -1207,8 +1234,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
           thaw: fn(saved, _run_store, base) {
             case saved {
               [input, output, undo_kind] -> {
-                use input <- result.try(codec.decode(p.input, input))
-                use output <- result.try(codec.decode(p.output, output))
+                use input <- result.try(
+                  codec.decode(p.input, input)
+                  |> result.map_error(input_failure),
+                )
+                use output <- result.try(
+                  codec.decode(p.output, output)
+                  |> result.map_error(output_failure),
+                )
                 use undo <- result.try(case undo_kind {
                   "none" -> Ok(None)
                   "undo" ->
@@ -1216,10 +1249,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                       step.undo_for(UndoRequest(input, output, undo_key(base)))
                     {
                       NoUndo ->
-                        Error("saved undo requires restore_undo: " <> step.name)
+                        Error(
+                          checkpoint.InvalidState(checkpoint.UndoNotRestorable(
+                            saved_address,
+                          )),
+                        )
                       UndoWith(run) -> Ok(Some(run))
                     }
-                  _ -> Error("invalid undo capability")
+                  _ -> Error(checkpoint.InvalidState(checkpoint.Malformed))
                 })
                 Ok(fn(run_store) {
                   #(
@@ -1234,7 +1271,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                   )
                 })
               }
-              _ -> Error("invalid saved step")
+              _ -> Error(checkpoint.InvalidState(checkpoint.Malformed))
             }
           },
           resume_compensation: fn(attempt, _run_store) {
@@ -1242,21 +1279,22 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               let key = effect_key(attempt.base, attempt.number)
               case attempt.saved_input {
                 None ->
-                  node.EBlocked(checkpoint.InvalidState(
-                    "compensation has no admitted input",
-                  ))
+                  node.EBlocked(
+                    checkpoint.InvalidState(checkpoint.CompensationInputMissing(
+                      saved_address,
+                    )),
+                  )
                 Some(encoded) ->
                   case codec.decode(p.input, encoded) {
-                    Error(reason) ->
-                      node.EBlocked(checkpoint.CodecFailure(reason))
+                    Error(error) -> node.EBlocked(input_failure(error))
                     Ok(input) ->
                       case step.resolve_compensation(input, key) {
                         None ->
                           node.EBlocked(
-                            checkpoint.Uncertain(reconciliation.Required(
-                              step.name,
-                              reconciliation.Compensation,
-                              key.attempt_key,
+                            checkpoint.Uncertain(checkpoint.Required(
+                              saved_address,
+                              checkpoint.CompensationAction(attempt.number),
+                              saved_key(key),
                             )),
                           )
                         Some(recovery) -> to_erased_recovery(recovery, input)
@@ -1270,7 +1308,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               use pair <- result.try(case store.get_record(run_store, id) {
                 Ok(pair) -> Ok(pair)
                 Error(Nil) ->
-                  Error(checkpoint.InvalidState("missing undo values"))
+                  Error(checkpoint.InvalidState(checkpoint.Malformed))
               })
               let #(input, output, _) = pair
               let request = UndoRequest(input, output, undo_key(base))
@@ -1279,16 +1317,20 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                 EvidenceFailed(error) -> Ok(Error(error))
                 EvidenceMaybeSent ->
                   Error(
-                    checkpoint.Uncertain(reconciliation.Required(
-                      step.name,
-                      reconciliation.Undo,
-                      request.key.attempt_key,
+                    checkpoint.Uncertain(checkpoint.Required(
+                      saved_address,
+                      checkpoint.UndoAction,
+                      saved_key(request.key),
                     )),
                   )
                 EvidenceNotSent ->
                   case step.undo_for(request) {
                     NoUndo ->
-                      Error(checkpoint.InvalidState("missing restored undo"))
+                      Error(
+                        checkpoint.InvalidState(checkpoint.UndoNotRestorable(
+                          saved_address,
+                        )),
+                      )
                     UndoWith(run) -> Ok(run())
                   }
               }
@@ -1300,15 +1342,16 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
               let key = effect_key(attempt.base, attempt.number)
               let input = case attempt.saved_input {
                 None -> Ok(produce())
-                Some(encoded) -> codec.decode(p.input, encoded)
+                Some(encoded) ->
+                  codec.decode(p.input, encoded)
+                  |> result.map_error(input_failure)
               }
               let resumed = case step.resolve {
                 Some(resolve) -> resolve
                 None -> fn(_, _) { ResumedMaybeSent }
               }
               case input {
-                Error(reason) ->
-                  node.AttemptBlocked(checkpoint.CodecFailure(reason))
+                Error(failure) -> node.AttemptBlocked(failure)
                 Ok(input) ->
                   case attempt.saved_input {
                     None ->
@@ -1320,10 +1363,10 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                       case resumed(input, key) {
                         ResumedMaybeSent ->
                           node.AttemptBlocked(
-                            checkpoint.Uncertain(reconciliation.Required(
-                              step.name,
-                              reconciliation.Activity,
-                              key.attempt_key,
+                            checkpoint.Uncertain(checkpoint.Required(
+                              saved_address,
+                              checkpoint.AttemptAction(attempt.number),
+                              saved_key(key),
                             )),
                           )
                         ResumedNotSent ->
@@ -1344,9 +1387,13 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                         ResumedFailed(error, recover_returned, unknown) ->
                           case recover_returned, step.compensates {
                             None, True ->
-                              node.AttemptBlocked(checkpoint.InvalidState(
-                                "mapped recovery requires a decider after error mapping",
-                              ))
+                              node.AttemptBlocked(
+                                checkpoint.InvalidState(
+                                  checkpoint.DeciderMissingAfterMapping(
+                                    saved_address,
+                                  ),
+                                ),
+                              )
                             _, _ ->
                               node.AttemptFailed(
                                 node.Returned(error),
@@ -1951,84 +1998,116 @@ fn undo_option(undo: Undo(u)) -> Option(fn() -> Result(Nil, u)) {
 }
 
 /// Checks that every node can be restored and fingerprints its structural
-/// dependencies. Runtime node identifiers never enter the fingerprint.
+/// dependencies, or lists every problem. Runtime node identifiers never
+/// enter the fingerprint.
 @internal
 pub fn persistence_stamp(
   workflow: Workflow(i, o, e, u),
   version: String,
-) -> Result(String, String) {
-  use _ <- result.try(case version {
-    "" -> Error("empty workflow version")
-    _ -> Ok(Nil)
-  })
-  use nodes <- result.try(
-    list.try_map(workflow.order, fn(id) {
-      let assert Ok(n) = dict.get(workflow.nodes, id)
-      use p <- result.try(case n.persistence {
-        Some(p) -> Ok(p)
-        None ->
-          Error(
-            "step requires persistence codecs: "
-            <> address_to_string(address_from_node(n.address)),
-          )
-      })
-      use _ <- result.try(case p.valid {
-        True -> Ok(Nil)
-        False -> Error("empty step or codec version")
-      })
-      use _ <- result.try(case n.compensates && !p.recovery_undo_declared {
-        True ->
-          Error(
-            "persistent compensation requires restore_undo: "
-            <> address_to_string(address_from_node(n.address)),
-          )
-        False -> Ok(Nil)
-      })
-      let position = fn(id) {
-        list.index_fold(workflow.order, -1, fn(found, candidate, index) {
-          case candidate == id {
-            True -> index
-            False -> found
-          }
-        })
-        |> int.to_string
+) -> Result(String, List(checkpoint.DefinitionProblem)) {
+  let position = fn(id) {
+    list.index_fold(workflow.order, -1, fn(found, candidate, index) {
+      case candidate == id {
+        True -> index
+        False -> found
       }
-      Ok(
-        frame([
-          frame([
-            frame(n.address.scope),
-            n.address.name,
-            int.to_string(n.address.occurrence),
-          ]),
-          p.version,
-          case n.compensates {
-            True -> "compensates"
-            False -> "no-compensation"
-          },
-          int.to_string(n.max_attempts),
-          case n.timeout {
-            None -> "none"
-            Some(ms) -> int.to_string(ms)
-          },
-          case n.undoable {
-            True -> "undo"
-            False -> "no-undo"
-          },
-          frame(list.map(list.sort(n.deps, int.compare), position)),
-          frame(
-            list.map(n.conditions, fn(c) {
-              position(c.0)
-              <> case c.1 {
-                True -> "true"
-                False -> "false"
-              }
-            }),
-          ),
-        ]),
-      )
-    }),
-  )
-  Ok(frame([workflow.name, version, ..nodes]))
+    })
+    |> int.to_string
+  }
+  let checked =
+    list.map(workflow.order, fn(id) {
+      let assert Ok(n) = dict.get(workflow.nodes, id)
+      let address =
+        checkpoint.Address(
+          n.address.scope,
+          n.address.name,
+          n.address.occurrence,
+        )
+      case n.persistence {
+        None -> Error([checkpoint.MissingRecoverable(address)])
+        Some(p) -> {
+          let problems =
+            list.flatten([
+              case p.step_version {
+                "" -> [checkpoint.EmptyStepVersion(address)]
+                _ -> []
+              },
+              case p.input_version {
+                "" -> [
+                  checkpoint.EmptyStepCodecVersion(checkpoint.StepInput(address)),
+                ]
+                _ -> []
+              },
+              case p.output_version {
+                "" -> [
+                  checkpoint.EmptyStepCodecVersion(checkpoint.StepOutput(
+                    address,
+                  )),
+                ]
+                _ -> []
+              },
+              case n.compensates && !p.recovery_undo_declared {
+                True -> [checkpoint.MissingRestoreUndo(address)]
+                False -> []
+              },
+            ])
+          case problems {
+            [_, ..] -> Error(problems)
+            [] ->
+              Ok(
+                frame([
+                  frame([
+                    frame(n.address.scope),
+                    n.address.name,
+                    int.to_string(n.address.occurrence),
+                  ]),
+                  p.version,
+                  case n.compensates {
+                    True -> "compensates"
+                    False -> "no-compensation"
+                  },
+                  int.to_string(n.max_attempts),
+                  case n.timeout {
+                    None -> "none"
+                    Some(ms) -> int.to_string(ms)
+                  },
+                  case n.undoable {
+                    True -> "undo"
+                    False -> "no-undo"
+                  },
+                  frame(list.map(list.sort(n.deps, int.compare), position)),
+                  frame(
+                    list.map(n.conditions, fn(c) {
+                      position(c.0)
+                      <> case c.1 {
+                        True -> "true"
+                        False -> "false"
+                      }
+                    }),
+                  ),
+                ]),
+              )
+          }
+        }
+      }
+    })
+  let problems =
+    list.flatten([
+      case version {
+        "" -> [checkpoint.EmptyWorkflowVersion]
+        _ -> []
+      },
+      list.flat_map(checked, fn(node_check) {
+        case node_check {
+          Ok(_) -> []
+          Error(problems) -> problems
+        }
+      }),
+    ])
+  case problems {
+    [] -> Ok(frame([workflow.name, version, ..result.values(checked)]))
+    _ -> Error(problems)
+  }
 }
 
 fn frame(parts: List(String)) -> String {

@@ -10,6 +10,8 @@ repository = { type = "github", user = "gleam-dream", repo = "saga" }
 [dependencies]
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+gleam_json = ">= 3.0.0 and < 4.0.0"
 sinal = { path = "../sinal" }
 
 [dev-dependencies]

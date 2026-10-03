@@ -1,44 +1,67 @@
 //// Runs a `saga.Workflow` with saved checkpoints, so that a run survives
-//// the loss of its runner and can be recovered, read or cancelled later.
+//// the loss of its runner, its caller or its VM, and can be recovered, read
+//// or cancelled later.
 ////
 //// Use this module when a run must outlive the process or VM that started
 //// it. It runs the same workflow and the same runner as `saga/execution`
 //// and returns the same `execution.Outcome`; local runs need none of it.
-//// `prepare` attaches `saga/codec` codecs and a compatibility stamp to an
-//// existing workflow. A `saga/storage.Storage` value saves one execution's
-//// checkpoint: `saga/storage/memory` and `saga/storage/file` are the
-//// included adapters, and `saga/storage/conformance` checks a third-party
-//// one. Waking or scheduling a runner after a restart is left to the
-//// caller. A step that may leave an unknown effect is made recoverable with
-//// `saga.recoverable`; recovery that cannot decide its effect suspends the
-//// run with `RecoveryRequired(saga/reconciliation.Required)`.
+////
+//// 1. Make every step recoverable: `recoverable` gives a step its codecs
+////    and the resolver that establishes an interrupted attempt's effect;
+////    `restore_undo`, `resolve_undo` and `resolve_compensation` cover undo
+////    and compensation.
+//// 2. `new` checks the workflow once and attaches root codecs and a
+////    compatibility stamp; `with_config` sets the run configuration.
+//// 3. `start_or_reconnect` saves an execution under a caller-chosen id, or
+////    reconnects to the one saved there, and returns its `Run` handle.
+//// 4. `drive` runs it until it finishes or suspends, within a timeout;
+////    `read` and `cancel` act on it without a runner.
+////
+//// One `saga/storage.Storage` serves every execution of a store:
+//// `saga/storage/memory`, `saga/storage/file` and the `saga_postgres`
+//// package are adapters, and `saga/storage/conformance` checks another.
 ////
 //// ```gleam
+//// import gleam/dynamic/decode
+//// import gleam/json
+//// import saga
 //// import saga/codec
 //// import saga/durable
-//// import saga/execution
 //// import saga/storage/memory
 ////
+//// let order = codec.json("order-1", fn(id) { Ok(json.string(id)) }, decode.string)
 //// let text = codec.text()
+//// let charge =
+////   saga.effect("charge", fn(order, key) { charge(order, key.idempotency) })
+////   |> saga.undo(fn(undo) { refund(undo.output, undo.key.idempotency) })
+////   |> durable.recoverable(version: "1", input: order, output: text, resolve: lookup_charge)
+////   |> durable.resolve_undo(lookup_refund)
+//// let assert Ok(workflow) = saga.define("checkout", saga.perform(_, charge))
 //// let assert Ok(persistence) =
-////   durable.prepare(workflow, "1", text, text, text, text)
-//// let memory = memory.new()
-//// let storage = memory.storage(memory)
-//// let assert Ok(reference) =
-////   durable.start_or_reconnect(storage, "checkout-123", persistence, "order-123")
-//// let outcome = durable.drive(storage, reference, persistence, execution.config())
-//// let status = durable.read(storage, reference, persistence)
-//// memory.close(memory)
+////   durable.new(workflow, version: "1", input: order, output: text, error: text, undo_error: text)
+//// let assert Ok(store) = memory.start()
+//// let assert Ok(run) =
+////   durable.start_or_reconnect(persistence, memory.storage(store), id: "checkout-123", input: "order-123")
+//// let outcome = durable.drive(run, timeout: 30_000)
 //// ```
 ////
-//// `drive` waits until the run ends or suspends, with no timeout. The
-//// caller's exit does not cancel the run; only `cancel` does. See
-//// DURABILITY.md for the storage contract and recovery rules.
+//// **Who stops what.** `drive` runs the execution in a runner process and
+//// waits at most `timeout` milliseconds. On timeout, and when the process
+//// that called `drive` exits, the runner stops: in-flight attempts are
+//// killed, the claim is released, and the last checkpoint stays the
+//// recovery authority, so the next `drive` resumes. Only `cancel` cancels.
+//// Waking a runner after a restart is the caller's job: `unfinished` lists
+//// the executions that wait for one.
+////
+//// See DURABILITY.md for the storage contract and recovery rules.
 
-import gleam/erlang/process
+import gleam/bit_array
+import gleam/erlang/process.{type Pid, type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import saga.{type Workflow}
 import saga/codec.{type Codec}
 import saga/execution
@@ -46,23 +69,253 @@ import saga/internal/checkpoint
 import saga/internal/coordinator
 import saga/internal/ffi
 import saga/internal/node
-import saga/reconciliation
 import saga/storage.{type Storage}
+import sinal/correlation.{type Correlation}
 
-/// Why a durable operation failed or a run suspended.
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Why a durable operation failed or an execution suspended. Later releases
+/// may add variants: branch on `error_kind` and log `describe_error`.
 pub type Error {
-  StorageError(storage.Error)
-  InvalidDefinition(String)
+  /// The storage refused or failed an operation.
+  StorageFailure(error: storage.Error)
+  /// `new` found steps or codecs that cannot be saved.
+  NotPersistable(problems: List(PersistenceProblem))
+  /// The saved execution belongs to another workflow, version or codec set.
   IncompatibleDefinition
-  ReferenceMismatch
+  /// `start_or_reconnect` found the id saved with a different input.
   InputMismatch
-  CodecFailure(String)
-  RecoveryRequired(reconciliation.Required)
-  InvalidCheckpoint(String)
+  /// A codec could not save or restore a value at `boundary`.
+  CodecFailure(boundary: Boundary, error: codec.CodecError)
+  /// A resolver could not establish an interrupted action's effect: find
+  /// out what happened to `required.key`, then `drive` again.
+  RecoveryRequired(required: Required)
+  /// The saved checkpoint cannot be restored by this definition.
+  InvalidCheckpoint(problem: CheckpointProblem)
+  /// A checkpoint grew past the limit (`with_max_checkpoint_bytes`).
+  CheckpointTooLarge(bytes: Int, limit: Int)
+  /// The execution suspended with `cause`, and saving that suspension
+  /// failed with `recording`; the previous checkpoint stays.
   SuspensionNotSaved(cause: Error, recording: Error)
-  InvalidConfig(List(execution.ConfigError))
+  /// The run configuration is invalid.
+  InvalidConfig(errors: List(execution.ConfigError))
+  /// `drive` was given a timeout below 1 millisecond.
+  InvalidTimeout(milliseconds: Int)
+  /// The runner process died before reporting.
   RunnerLost
+  /// `drive` reached its timeout; the runner stopped and the execution
+  /// resumes from its last checkpoint at the next `drive`.
+  DriveTimedOut
 }
+
+/// The closed classification of an `Error`, for deciding what to do:
+///
+/// - `Busy`: another runner owns the execution; try again later.
+/// - `Transient`: the runner or the store failed; `drive` again.
+/// - `NeedsReconciliation`: an effect is unknown; resolve it first.
+/// - `Incompatible`: the saved execution belongs to another definition or
+///   input.
+/// - `Defect`: a bug in the definition, configuration, codecs or adapter.
+pub type ErrorKind {
+  Busy
+  Transient
+  NeedsReconciliation
+  Incompatible
+  Defect
+}
+
+/// Why `new` refused a workflow. The union is closed.
+pub type PersistenceProblem {
+  /// `new` was given an empty version.
+  EmptyWorkflowVersion
+  /// A codec has an empty version.
+  EmptyCodecVersion(boundary: Boundary)
+  /// A step has no `recoverable`.
+  MissingRecoverable(step: saga.StepAddress)
+  /// A step's `recoverable` has an empty version.
+  EmptyStepVersion(step: saga.StepAddress)
+  /// A step with `saga.compensate` has no `restore_undo`.
+  MissingRestoreUndo(step: saga.StepAddress)
+}
+
+/// Which saved value a codec failed on. The union is closed.
+pub type Boundary {
+  RunInput
+  RunOutput
+  RunError
+  RunUndoError
+  StepInput(step: saga.StepAddress)
+  StepOutput(step: saga.StepAddress)
+}
+
+/// Why a saved checkpoint cannot be restored. Later releases may add
+/// variants.
+pub type CheckpointProblem {
+  /// The bytes are not a checkpoint this version of saga wrote.
+  Malformed
+  /// The storage returned the checkpoint of execution `saved`.
+  ForeignExecution(saved: String)
+  /// The saved graph has a different number of steps.
+  GraphMismatch
+  /// More attempts were in flight when it was saved than the configured
+  /// `max_concurrency` allows now.
+  ConcurrencyBelowInFlight(in_flight: Int, max_concurrency: Int)
+  /// A saved undo cannot be rebuilt: `restore_undo` returned `NoUndo`.
+  UndoNotRestorable(step: saga.StepAddress)
+  /// A compensation decision was saved before its input was.
+  CompensationInputMissing(step: saga.StepAddress)
+  /// A resolver added after `saga.map_step_errors` answered `Failed`, and
+  /// the step has no `compensate` decider in the mapped vocabulary.
+  DeciderMissingAfterMapping(step: saga.StepAddress)
+}
+
+/// The action whose effect must be established before the execution can
+/// continue: its step, which action (`StepAttempt(n)`,
+/// `StepCompensation(n)` or `StepUndo`), and its `EffectKey`.
+pub type Required {
+  Required(
+    step: saga.StepAddress,
+    action: execution.Action,
+    key: saga.EffectKey,
+  )
+}
+
+/// Classifies an error; see `ErrorKind`.
+pub fn error_kind(error: Error) -> ErrorKind {
+  case error {
+    StorageFailure(storage.Busy) | StorageFailure(storage.StaleOwner) -> Busy
+    StorageFailure(storage.Conflict)
+    | StorageFailure(storage.CancellationChanged)
+    | StorageFailure(storage.Unavailable(_))
+    | StorageFailure(storage.TimedOut)
+    | RunnerLost
+    | DriveTimedOut -> Transient
+    StorageFailure(storage.NotFound)
+    | StorageFailure(storage.AlreadyExists)
+    | StorageFailure(storage.Corrupt) -> Defect
+    RecoveryRequired(_) -> NeedsReconciliation
+    IncompatibleDefinition | InputMismatch -> Incompatible
+    NotPersistable(_)
+    | CodecFailure(..)
+    | InvalidCheckpoint(_)
+    | CheckpointTooLarge(..)
+    | InvalidConfig(_)
+    | InvalidTimeout(_) -> Defect
+    SuspensionNotSaved(cause, _) -> error_kind(cause)
+  }
+}
+
+/// Describes an error for logs.
+pub fn describe_error(error: Error) -> String {
+  case error {
+    StorageFailure(error) -> "storage: " <> storage.describe_error(error)
+    NotPersistable(problems) ->
+      "the workflow cannot be persisted: "
+      <> string.join(list.map(problems, describe_problem), "; ")
+    IncompatibleDefinition ->
+      "the execution was saved by another workflow definition or version"
+    InputMismatch -> "the execution was saved with a different input"
+    CodecFailure(boundary, error) ->
+      "the codec of "
+      <> describe_boundary(boundary)
+      <> " failed: "
+      <> codec.describe_error(error)
+    RecoveryRequired(Required(step, action, key)) ->
+      "the effect of "
+      <> describe_action(action)
+      <> " of step "
+      <> saga.address_to_string(step)
+      <> " is unknown; establish it for key "
+      <> key.attempt_key
+    InvalidCheckpoint(problem) ->
+      "the checkpoint cannot be restored: " <> describe_checkpoint(problem)
+    CheckpointTooLarge(bytes, limit) ->
+      "the checkpoint has "
+      <> int.to_string(bytes)
+      <> " bytes, more than the limit of "
+      <> int.to_string(limit)
+      <> " (with_max_checkpoint_bytes)"
+    SuspensionNotSaved(cause, recording) ->
+      describe_error(cause)
+      <> "; saving the suspension failed: "
+      <> describe_error(recording)
+    InvalidConfig(errors) ->
+      "invalid configuration: "
+      <> string.join(list.map(errors, execution.describe_config_error), "; ")
+    InvalidTimeout(milliseconds) ->
+      "the drive timeout must be at least 1 ms, got "
+      <> int.to_string(milliseconds)
+    RunnerLost -> "the runner process died"
+    DriveTimedOut ->
+      "drive reached its timeout; the execution resumes at the next drive"
+  }
+}
+
+fn describe_problem(problem: PersistenceProblem) -> String {
+  case problem {
+    EmptyWorkflowVersion -> "the workflow version is empty"
+    EmptyCodecVersion(boundary) ->
+      "the codec of " <> describe_boundary(boundary) <> " has an empty version"
+    MissingRecoverable(step) ->
+      "step " <> saga.address_to_string(step) <> " has no durable.recoverable"
+    EmptyStepVersion(step) ->
+      "step " <> saga.address_to_string(step) <> " has an empty version"
+    MissingRestoreUndo(step) ->
+      "step "
+      <> saga.address_to_string(step)
+      <> " compensates but has no durable.restore_undo"
+  }
+}
+
+fn describe_boundary(boundary: Boundary) -> String {
+  case boundary {
+    RunInput -> "the workflow input"
+    RunOutput -> "the workflow output"
+    RunError -> "the workflow error"
+    RunUndoError -> "the workflow undo error"
+    StepInput(step) -> "the input of step " <> saga.address_to_string(step)
+    StepOutput(step) -> "the output of step " <> saga.address_to_string(step)
+  }
+}
+
+fn describe_checkpoint(problem: CheckpointProblem) -> String {
+  case problem {
+    Malformed -> "it is malformed"
+    ForeignExecution(saved) -> "it belongs to execution " <> saved
+    GraphMismatch -> "it has a different number of steps"
+    ConcurrencyBelowInFlight(in_flight, max_concurrency) ->
+      int.to_string(in_flight)
+      <> " actions were in flight, more than max_concurrency "
+      <> int.to_string(max_concurrency)
+    UndoNotRestorable(step) ->
+      "the undo of step "
+      <> saga.address_to_string(step)
+      <> " cannot be rebuilt"
+    CompensationInputMissing(step) ->
+      "the compensation of step "
+      <> saga.address_to_string(step)
+      <> " has no saved input"
+    DeciderMissingAfterMapping(step) ->
+      "step "
+      <> saga.address_to_string(step)
+      <> " needs a compensate decider after map_step_errors"
+  }
+}
+
+fn describe_action(action: execution.Action) -> String {
+  case action {
+    execution.StepAttempt(n) -> "attempt " <> int.to_string(n)
+    execution.StepCompensation(n) ->
+      "the compensation decision about attempt " <> int.to_string(n)
+    execution.StepUndo -> "the undo"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence modifiers
+// ---------------------------------------------------------------------------
 
 /// What a recovery resolver established about an action that was
 /// interrupted before saga saved its result:
@@ -92,17 +345,17 @@ fn evidence_to_node(evidence: Evidence(o, e)) -> node.Evidence(o, e) {
 }
 
 /// Makes a step recoverable after a restart: `version` names the step's
-/// behavior (change it when the step's callbacks change meaning),
-/// `input` and `output` save its values, and `resolve` establishes the
-/// effect of an attempt that was admitted but whose result was not saved.
-/// `resolve` receives the attempt's input and `EffectKey`, must be safe to
-/// call repeatedly, and is called instead of repeating the attempt. Every
-/// step of a durable workflow needs this capability; `new` names each step
-/// that lacks it. The order relative to `saga.compensate`,
-/// `saga.unknown_when` and `saga.map_step_errors` does not matter, except
-/// that a `Failed` answer from a `recoverable` added after
-/// `map_step_errors` needs a `compensate` decider written in the mapped
-/// vocabulary (see `saga.map_step_errors`).
+/// behavior (change it when the step's callbacks change meaning), `input`
+/// and `output` save its values, and `resolve` establishes the effect of an
+/// attempt that was admitted but whose result was not saved. `resolve`
+/// receives the attempt's input and `EffectKey`, must be safe to call
+/// repeatedly, and is called instead of repeating the attempt. Every step
+/// of a durable workflow needs this capability; `new` names each step that
+/// lacks it. The order relative to `saga.compensate`, `saga.unknown_when`
+/// and `saga.map_step_errors` does not matter, except that a `Failed`
+/// answer from a `recoverable` added after `map_step_errors` needs a
+/// `compensate` decider written in the mapped vocabulary (see
+/// `saga.map_step_errors`).
 pub fn recoverable(
   step: saga.Step(i, o, e, u),
   version version: String,
@@ -119,7 +372,7 @@ pub fn recoverable(
 /// and output, after a restart or after a `Continue` decision. Every
 /// persistent step with `saga.compensate` needs it, even when the answer is
 /// `saga.NoUndo`. The factory must be pure: saga may call it while saving a
-/// checkpoint to check that the undo can be rebuilt.
+/// checkpoint, to check that the undo can be rebuilt.
 pub fn restore_undo(
   step: saga.Step(i, o, e, u),
   restore: fn(saga.UndoRequest(i, o)) -> saga.Undo(u),
@@ -141,9 +394,9 @@ pub fn resolve_undo(
 /// Establishes the decision of a `saga.compensate` decider that was
 /// interrupted, from the failed attempt's input and `EffectKey`:
 /// `Some(decision)` applies that decision under the original attempt
-/// budget, and `None` keeps the execution suspended. Saga never repeats
-/// the decider itself after a restart, so a decider with an external
-/// effect records its decision under `key.attempt_key`.
+/// budget, and `None` keeps the execution suspended. Saga never repeats the
+/// decider itself after a restart, so a decider with an external effect
+/// records its decision under `key.attempt_key`.
 pub fn resolve_compensation(
   step: saga.Step(i, o, e, u),
   resolve: fn(i, saga.EffectKey) -> Option(saga.Recovery(o, e, u)),
@@ -151,8 +404,13 @@ pub fn resolve_compensation(
   saga.set_resolve_compensation(step, resolve)
 }
 
-/// A checked persistence capability for an existing workflow. It adds codecs
-/// and compatibility information; it does not construct another graph.
+// ---------------------------------------------------------------------------
+// Persistence and runs
+// ---------------------------------------------------------------------------
+
+/// A checked persistence capability for an existing workflow: root codecs,
+/// a compatibility stamp and the run configuration. It does not construct
+/// another graph.
 pub opaque type Persistence(i, o, e, u) {
   Persistence(
     workflow: Workflow(i, o, e, u),
@@ -161,17 +419,19 @@ pub opaque type Persistence(i, o, e, u) {
     output: Codec(o),
     error: Codec(e),
     undo_error: Codec(u),
+    config: execution.Config,
+    max_checkpoint_bytes: Int,
   )
 }
 
-/// Identifies one saved execution by the id given to `start_or_reconnect`.
-pub opaque type Reference {
-  Reference(id: String)
-}
-
-/// Returns the execution id of a reference.
-pub fn reference_id(reference: Reference) -> String {
-  reference.id
+/// One saved execution: its persistence, its storage and its id.
+pub opaque type Run(i, o, e, u) {
+  Run(
+    persistence: Persistence(i, o, e, u),
+    storage: Storage,
+    id: String,
+    config: execution.Config,
+  )
 }
 
 /// A saved execution's state: not finished, suspended with a saved reason,
@@ -194,76 +454,142 @@ type Envelope(o, e, u) {
   )
 }
 
+/// The default checkpoint size limit: 16 MiB.
+const default_max_checkpoint_bytes = 16_777_216
+
 /// Checks that every step of `workflow` can be restored and attaches the
 /// root codecs and a compatibility stamp built from `version`, the graph
-/// and every codec version. Does not build a second graph.
-pub fn prepare(
+/// and every codec version. Change `version` whenever the workflow's
+/// behavior changes: a saved execution with another stamp is refused with
+/// `IncompatibleDefinition` instead of being misread. Returns
+/// `NotPersistable` with every problem found.
+pub fn new(
   workflow: Workflow(i, o, e, u),
-  version: String,
-  input: Codec(i),
-  output: Codec(o),
-  error: Codec(e),
-  undo_error: Codec(u),
+  version version: String,
+  input input: Codec(i),
+  output output: Codec(o),
+  error error: Codec(e),
+  undo_error undo_error: Codec(u),
 ) -> Result(Persistence(i, o, e, u), Error) {
-  use stamp <- result.try(
-    saga.persistence_stamp(workflow, version)
-    |> result.map_error(InvalidDefinition),
-  )
-  let versions = [
-    codec.version(input),
-    codec.version(output),
-    codec.version(error),
-    codec.version(undo_error),
+  let roots = [
+    #(RunInput, codec.version(input)),
+    #(RunOutput, codec.version(output)),
+    #(RunError, codec.version(error)),
+    #(RunUndoError, codec.version(undo_error)),
   ]
-  use _ <- result.try(case list.contains(versions, "") {
-    True -> Error(InvalidDefinition("empty codec version"))
-    False -> Ok(Nil)
-  })
-  Ok(Persistence(
-    workflow,
-    frame([stamp, ..versions]),
-    input,
-    output,
-    error,
-    undo_error,
-  ))
-}
-
-/// Saves a new execution with `input` under `id`, or reconnects to the one
-/// already saved there. Reconnecting succeeds only for the same id,
-/// compatible definition and encoded input; a different input returns
-/// `InputMismatch`. Does not run anything; call `drive`.
-pub fn start_or_reconnect(
-  storage: Storage,
-  id: String,
-  persistence: Persistence(i, o, e, u),
-  input: i,
-) -> Result(Reference, Error) {
-  use encoded <- result.try(
-    codec.encode(persistence.input, input) |> result.map_error(CodecFailure),
-  )
-  let envelope = Envelope(1, id, persistence.stamp, encoded, None, None, None)
-  use bytes <- result.try(encode(envelope, persistence))
-  case storage.create(bytes) {
-    Ok(_) -> Ok(Reference(id))
-    Error(storage.AlreadyExists) -> {
-      use existing <- result.try(load(storage, Reference(id), persistence))
-      case existing.input == encoded {
-        True -> Ok(Reference(id))
-        False -> Error(InputMismatch)
+  let root_problems =
+    list.filter_map(roots, fn(root) {
+      case root.1 {
+        "" -> Ok(EmptyCodecVersion(root.0))
+        _ -> Error(Nil)
       }
-    }
-    Error(error) -> Error(StorageError(error))
+    })
+  case saga.persistence_stamp(workflow, version), root_problems {
+    Ok(stamp), [] ->
+      Ok(Persistence(
+        workflow:,
+        stamp: frame([stamp, ..list.map(roots, fn(root) { root.1 })]),
+        input:,
+        output:,
+        error:,
+        undo_error:,
+        config: execution.config(),
+        max_checkpoint_bytes: default_max_checkpoint_bytes,
+      ))
+    Ok(_), problems -> Error(NotPersistable(problems))
+    Error(problems), roots ->
+      Error(
+        NotPersistable(list.append(
+          list.map(problems, problem_from_checkpoint),
+          roots,
+        )),
+      )
   }
 }
 
-/// Reads the saved state of an execution without a live runner.
-pub fn read(
-  storage: Storage,
-  reference: Reference,
+/// Sets the configuration every `drive` of this persistence runs with
+/// (default `execution.config()`).
+pub fn with_config(
   persistence: Persistence(i, o, e, u),
-) -> Result(Status(o, e, u), Error) {
-  use envelope <- result.try(load(storage, reference, persistence))
+  config: execution.Config,
+) -> Persistence(i, o, e, u) {
+  Persistence(..persistence, config: config)
+}
+
+/// Bounds the size of one saved checkpoint (default 16 MiB). Every commit
+/// rewrites the whole checkpoint; a larger one suspends the execution with
+/// `CheckpointTooLarge`.
+pub fn with_max_checkpoint_bytes(
+  persistence: Persistence(i, o, e, u),
+  bytes: Int,
+) -> Persistence(i, o, e, u) {
+  Persistence(..persistence, max_checkpoint_bytes: bytes)
+}
+
+/// Saves a new execution with `input` under `id`, or reconnects to the one
+/// already saved there, and returns its handle. Reconnecting succeeds only
+/// for a compatible definition and the same encoded input; a different
+/// input returns `InputMismatch`. Does not run anything; call `drive`.
+/// Choose ids that name the workflow (`"checkout:" <> order_id`) when one
+/// store serves several workflows.
+pub fn start_or_reconnect(
+  persistence: Persistence(i, o, e, u),
+  storage: Storage,
+  id id: String,
+  input input: i,
+) -> Result(Run(i, o, e, u), Error) {
+  use encoded <- result.try(
+    codec.encode(persistence.input, input)
+    |> result.map_error(CodecFailure(RunInput, _)),
+  )
+  let run = Run(persistence, storage, id, persistence.config)
+  let envelope = Envelope(1, id, persistence.stamp, encoded, None, None, None)
+  use bytes <- result.try(
+    encode(envelope, persistence) |> result.map_error(from_checkpoint),
+  )
+  case call(storage, fn() { storage.do_create(storage, id, bytes) }) {
+    Ok(_) -> Ok(run)
+    Error(storage.AlreadyExists) -> {
+      use existing <- result.try(load(run))
+      case existing.input == encoded {
+        True -> Ok(run)
+        False -> Error(InputMismatch)
+      }
+    }
+    Error(error) -> Error(StorageFailure(error))
+  }
+}
+
+/// Reconnects to the execution saved under `id`, for example one that
+/// `unfinished` listed, without knowing its input. Fails with
+/// `StorageFailure(NotFound)` when there is none.
+pub fn reconnect(
+  persistence: Persistence(i, o, e, u),
+  storage: Storage,
+  id id: String,
+) -> Result(Run(i, o, e, u), Error) {
+  let run = Run(persistence, storage, id, persistence.config)
+  use _ <- result.try(load(run))
+  Ok(run)
+}
+
+/// Carries `correlation` in every `saga/telemetry` event of this handle's
+/// drives. The correlation is not saved: set it on every handle.
+pub fn with_correlation(
+  run: Run(i, o, e, u),
+  correlation: Correlation,
+) -> Run(i, o, e, u) {
+  Run(..run, config: execution.with_correlation(run.config, correlation))
+}
+
+/// The execution id given to `start_or_reconnect`.
+pub fn id(run: Run(i, o, e, u)) -> String {
+  run.id
+}
+
+/// Reads the saved state of an execution without a live runner.
+pub fn read(run: Run(i, o, e, u)) -> Result(Status(o, e, u), Error) {
+  use envelope <- result.try(load(run))
   Ok(case envelope.outcome, envelope.issue {
     Some(outcome), _ -> Finished(execution.from_coordinator(outcome))
     None, Some(reason) -> Suspended(from_checkpoint(reason))
@@ -274,268 +600,531 @@ pub fn read(
 /// Records cancellation for an unfinished execution. A running `drive`
 /// observes it at its next checkpoint and rolls back. Does nothing for a
 /// finished execution.
-pub fn cancel(
-  storage: Storage,
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-) -> Result(Nil, Error) {
-  use envelope <- result.try(load(storage, reference, persistence))
+pub fn cancel(run: Run(i, o, e, u)) -> Result(Nil, Error) {
+  use envelope <- result.try(load(run))
   case envelope.outcome {
     Some(_) -> Ok(Nil)
-    None -> storage.cancel() |> result.map_error(StorageError)
+    None ->
+      call(run.storage, fn() { storage.do_cancel(run.storage, run.id) })
+      |> result.map_error(StorageFailure)
   }
 }
 
-/// Blocks until the runner finishes or needs reconciliation. Process loss of
-/// the caller is detachment, never cancellation. Multiple callers contend
-/// through the adapter's execution ownership contract.
-pub fn drive(
+/// The ids of up to `limit` executions that are pending or suspended and
+/// that no live runner owns: the executions that wait for a `drive`.
+/// Reconnect to each with `reconnect`. Saga itself never drives them.
+pub fn unfinished(
   storage: Storage,
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-  config: execution.Config,
+  limit limit: Int,
+) -> Result(List(String), Error) {
+  case limit > 0 {
+    False -> Ok([])
+    True ->
+      call(storage, fn() { storage.do_unfinished(storage, limit) })
+      |> result.map_error(StorageFailure)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// drive
+// ---------------------------------------------------------------------------
+
+type RunnerMessage(o, e, u) {
+  RunnerClaimed(claim: storage.Claim)
+  RunnerFinished(result: Result(execution.Outcome(o, e, u), Error))
+  RunnerDown
+}
+
+/// Runs the execution until it finishes, suspends or `timeout` milliseconds
+/// pass, and returns its outcome once it is saved. A finished execution
+/// returns its saved outcome at once.
+///
+/// The run happens in a runner process. When `timeout` passes, `drive`
+/// stops the runner and returns `DriveTimedOut`; when the calling process
+/// exits, the runner stops by itself. Either way the runner's in-flight
+/// attempts are killed, its claim is released, and the last checkpoint
+/// stays: this is not cancellation, and the next `drive` resumes, asking
+/// each interrupted attempt's resolver what happened. Concurrent `drive`s
+/// of one execution contend through the storage: all but one return
+/// `StorageFailure(Busy)`.
+pub fn drive(
+  run: Run(i, o, e, u),
+  timeout timeout: Int,
 ) -> Result(execution.Outcome(o, e, u), Error) {
+  use _ <- result.try(case timeout > 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidTimeout(timeout))
+  })
   use settings <- result.try(
-    execution.settings(config, Some(reference.id))
+    execution.settings(run.config, Some(run.id))
     |> result.map_error(InvalidConfig),
   )
+  let caller = process.self()
   let reply = process.new_subject()
-  let pid =
+  let runner =
     process.spawn_unlinked(fn() {
-      case
-        ffi.rescue(fn() {
-          drive_owned(storage, reference, persistence, settings)
+      let runner = process.self()
+      let guard =
+        start_guard(runner, storage.call_timeout(run.storage), fn() {
+          process.send(
+            reply,
+            RunnerFinished(Error(StorageFailure(storage.TimedOut))),
+          )
         })
+      let result = case
+        ffi.rescue(fn() { drive_owned(run, settings, caller, guard, reply) })
       {
-        ffi.Rescued(result) -> process.send(reply, result)
-        ffi.Raised(_, _) -> process.send(reply, Error(RunnerLost))
+        ffi.Rescued(result) -> result
+        ffi.Raised(_, _) -> Error(RunnerLost)
       }
+      stop_linked(guard.pid)
+      process.send(reply, RunnerFinished(result))
     })
-  let monitor = process.monitor(pid)
+  let monitor = process.monitor(runner)
   let selector =
     process.new_selector()
     |> process.select(reply)
-    |> process.select_specific_monitor(monitor, fn(_) { Error(RunnerLost) })
-  let result = process.selector_receive_forever(selector)
-  process.demonitor_process(monitor)
-  result
+    |> process.select_specific_monitor(monitor, fn(_) { RunnerDown })
+  let deadline = ffi.monotonic_time() + timeout
+  await_runner(run, runner, monitor, selector, deadline, None)
 }
 
-fn drive_owned(
-  storage: Storage,
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-  config: coordinator.Settings,
+fn await_runner(
+  run: Run(i, o, e, u),
+  runner: Pid,
+  monitor: process.Monitor,
+  selector: process.Selector(RunnerMessage(o, e, u)),
+  deadline: Int,
+  claim: Option(storage.Claim),
 ) -> Result(execution.Outcome(o, e, u), Error) {
-  use record <- result.try(storage.claim() |> result.map_error(StorageError))
-  let result = drive_claimed(storage, record, reference, persistence, config)
-  let released = storage.release(record.generation)
-  case result, released {
-    Ok(_), Error(error) -> Error(StorageError(error))
-    _, _ -> result
-  }
-}
-
-fn drive_claimed(
-  storage: Storage,
-  record: storage.Record,
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-  config: coordinator.Settings,
-) -> Result(execution.Outcome(o, e, u), Error) {
-  use _ <- result.try(check_header(record.data, reference, persistence))
-  use envelope <- result.try(decode(record.data, persistence))
-  use _ <- result.try(check(envelope, reference, persistence))
-  case envelope.outcome {
-    Some(outcome) -> Ok(execution.from_coordinator(outcome))
-    None -> {
-      use input <- result.try(
-        codec.decode(persistence.input, envelope.input)
-        |> result.map_error(CodecFailure),
-      )
-      let result_out = process.new_subject()
-      let session =
-        coordinator.Session(
-          execution_id: reference.id,
-          snapshot: envelope.snapshot,
-          cancelled: record.cancelled,
-          save: fn(snapshot) {
-            save(
-              storage,
-              record.generation,
-              record.cancelled,
-              Envelope(..envelope, snapshot: Some(snapshot), issue: None),
-              persistence,
-            )
-            |> result.map_error(to_checkpoint)
-          },
-          failed: fn(reason) {
-            // Preserve the last committed checkpoint. Uncommitted admissions
-            // were never dispatched and must not become recovery facts.
-            let recorded = {
-              use current <- result.try(load(storage, reference, persistence))
-              save(
-                storage,
-                record.generation,
-                record.cancelled,
-                Envelope(..current, issue: Some(reason)),
-                persistence,
-              )
+  let remaining = int.max(0, deadline - ffi.monotonic_time())
+  case process.selector_receive(selector, remaining) {
+    Ok(RunnerClaimed(claim)) ->
+      await_runner(run, runner, monitor, selector, deadline, Some(claim))
+    Ok(RunnerFinished(result)) -> {
+      // Return once the runner is gone, so its claim is released and its
+      // workers are stopped.
+      let _ = drain_runner(selector, None)
+      process.demonitor_process(monitor)
+      result
+    }
+    Ok(RunnerDown) -> Error(RunnerLost)
+    Error(Nil) -> {
+      // Stop the runner, then prefer a result it reported just before.
+      process.kill(runner)
+      let reported = drain_runner(selector, None)
+      process.demonitor_process(monitor)
+      case reported {
+        Some(result) -> result
+        None -> {
+          case claim {
+            Some(claim) -> {
+              let _ =
+                call(run.storage, fn() {
+                  storage.do_release(run.storage, claim)
+                })
+              Nil
             }
-            let failure = case reason, recorded {
-              _, Ok(Nil) -> from_checkpoint(reason)
-              _, Error(recording) ->
-                case from_checkpoint(reason) == recording {
-                  True -> recording
-                  False ->
-                    SuspensionNotSaved(from_checkpoint(reason), recording)
-                }
-            }
-            process.send(result_out, Error(failure))
-          },
-        )
-      coordinator.execute_saved(
-        saga.name(persistence.workflow),
-        config,
-        fn() { saga.for_run(persistence.workflow, input) },
-        session,
-        fn(outcome) {
-          let saved = {
-            use current <- result.try(load(storage, reference, persistence))
-            save(
-              storage,
-              record.generation,
-              record.cancelled,
-              Envelope(..current, outcome: Some(outcome), issue: None),
-              persistence,
-            )
+            None -> Nil
           }
-          process.send(
-            result_out,
-            result.map(saved, fn(_) { execution.from_coordinator(outcome) }),
-          )
-        },
-      )
-      let outcome = process.receive_forever(result_out)
-      // A cancellation racing a checkpoint wins before dispatch. Restart
-      // from the saved state with the new cancellation observation.
-      case storage.load() {
-        Ok(current) if current.cancelled != record.cancelled ->
-          drive_claimed(storage, current, reference, persistence, config)
-        _ -> outcome
+          Error(DriveTimedOut)
+        }
       }
     }
   }
 }
 
-fn save(
-  storage: Storage,
-  token: Int,
-  cancelled: Bool,
-  envelope: Envelope(o, e, u),
-  persistence: Persistence(i, o, e, u),
-) -> Result(Nil, Error) {
-  use bytes <- result.try(encode(envelope, persistence))
-  use record <- result.try(storage.load() |> result.map_error(StorageError))
-  storage.commit(token, record.revision, cancelled, bytes)
-  |> result.map(fn(_) { Nil })
-  |> result.map_error(StorageError)
-}
-
-fn load(
-  storage: Storage,
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-) -> Result(Envelope(o, e, u), Error) {
-  use record <- result.try(storage.load() |> result.map_error(StorageError))
-  use _ <- result.try(check_header(record.data, reference, persistence))
-  use envelope <- result.try(decode(record.data, persistence))
-  use _ <- result.try(check(envelope, reference, persistence))
-  Ok(envelope)
-}
-
-fn check(
-  envelope: Envelope(o, e, u),
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-) -> Result(Nil, Error) {
-  case envelope.reference == reference.id, envelope.stamp == persistence.stamp {
-    False, _ -> Error(ReferenceMismatch)
-    _, False -> Error(IncompatibleDefinition)
-    True, True -> Ok(Nil)
+/// Reads what the killed runner sent until its `Down` arrives.
+fn drain_runner(
+  selector: process.Selector(RunnerMessage(o, e, u)),
+  reported: Option(Result(execution.Outcome(o, e, u), Error)),
+) -> Option(Result(execution.Outcome(o, e, u), Error)) {
+  case process.selector_receive(selector, 5000) {
+    Ok(RunnerFinished(result)) -> drain_runner(selector, Some(result))
+    Ok(RunnerClaimed(_)) -> drain_runner(selector, reported)
+    Ok(RunnerDown) | Error(Nil) -> reported
   }
+}
+
+fn drive_owned(
+  run: Run(i, o, e, u),
+  settings: coordinator.Settings,
+  caller: Pid,
+  guard: Guard,
+  reply: Subject(RunnerMessage(o, e, u)),
+) -> Result(execution.Outcome(o, e, u), Error) {
+  let store = run.storage
+  use #(claim, stored) <- result.try(
+    guarded(guard, fn() { storage.do_claim(store, run.id) })
+    |> result.map_error(StorageFailure),
+  )
+  process.send(reply, RunnerClaimed(claim))
+  let heartbeat = case storage.renewal(store) {
+    None -> None
+    Some(#(every, renew)) ->
+      Some(
+        start_heartbeat(process.self(), every, claim, renew, fn() {
+          process.send(
+            reply,
+            RunnerFinished(Error(StorageFailure(storage.StaleOwner))),
+          )
+        }),
+      )
+  }
+  let result = drive_claimed(run, settings, caller, guard, claim, stored)
+  option.map(heartbeat, stop_linked)
+  // A finished run's outcome is saved; a failed release only delays the
+  // next claim until the adapter notices this runner is gone.
+  let _ = guarded(guard, fn() { storage.do_release(store, claim) })
+  result
+}
+
+fn drive_claimed(
+  run: Run(i, o, e, u),
+  settings: coordinator.Settings,
+  caller: Pid,
+  guard: Guard,
+  claim: storage.Claim,
+  stored: storage.Stored,
+) -> Result(execution.Outcome(o, e, u), Error) {
+  let persistence = run.persistence
+  use envelope <- result.try(open(run, storage.data(stored)))
+  case envelope.outcome {
+    Some(outcome) -> Ok(execution.from_coordinator(outcome))
+    None -> {
+      use input <- result.try(
+        codec.decode(persistence.input, envelope.input)
+        |> result.map_error(CodecFailure(RunInput, _)),
+      )
+      let cancelled = storage.cancelled(stored)
+      // The last committed revision and envelope, owned by this runner.
+      let committed = process.new_subject()
+      process.send(committed, #(storage.revision(stored), envelope))
+      let commit = fn(
+        change: fn(Envelope(o, e, u)) -> Envelope(o, e, u),
+        phase: storage.Phase,
+      ) {
+        let assert Ok(#(revision, current)) = process.receive(committed, 0)
+        let next = change(current)
+        let written = {
+          // A suspension record may pass the size limit by its reason, so
+          // that `read` can still report why the execution stopped.
+          let limit = case phase {
+            storage.Suspended -> None
+            storage.Pending | storage.Finished ->
+              Some(persistence.max_checkpoint_bytes)
+          }
+          use bytes <- result.try(encode_within(next, persistence, limit))
+          guarded(guard, fn() {
+            storage.do_commit(
+              run.storage,
+              claim,
+              storage.Commit(
+                expected_revision: revision,
+                observed_cancelled: cancelled,
+                phase: phase,
+                data: bytes,
+              ),
+            )
+          })
+          |> result.map_error(checkpoint.StorageFailure)
+        }
+        case written {
+          Ok(saved) -> {
+            process.send(committed, #(storage.revision(saved), next))
+            Ok(Nil)
+          }
+          Error(failure) -> {
+            process.send(committed, #(revision, current))
+            Error(failure)
+          }
+        }
+      }
+      let result_out = process.new_subject()
+      let session =
+        coordinator.Session(
+          execution_id: run.id,
+          snapshot: envelope.snapshot,
+          cancelled: cancelled,
+          save: fn(snapshot) {
+            commit(
+              fn(current) {
+                Envelope(..current, snapshot: Some(snapshot), issue: None)
+              },
+              storage.Pending,
+            )
+          },
+          failed: fn(reason) {
+            // Keep the last committed checkpoint: admissions that were not
+            // committed were never dispatched and are not recovery facts.
+            let failure = case
+              commit(
+                fn(current) { Envelope(..current, issue: Some(reason)) },
+                storage.Suspended,
+              )
+            {
+              Ok(Nil) -> from_checkpoint(reason)
+              Error(recording) if recording == reason -> from_checkpoint(reason)
+              Error(recording) ->
+                SuspensionNotSaved(
+                  from_checkpoint(reason),
+                  from_checkpoint(recording),
+                )
+            }
+            process.send(result_out, Error(failure))
+          },
+          stopped: fn() { process.send(result_out, Error(RunnerLost)) },
+        )
+      coordinator.execute_saved(
+        saga.name(persistence.workflow),
+        caller,
+        settings,
+        fn() { saga.for_run(persistence.workflow, input) },
+        session,
+        fn(outcome) {
+          let saved =
+            commit(
+              fn(current) {
+                Envelope(..current, outcome: Some(outcome), issue: None)
+              },
+              storage.Finished,
+            )
+          process.send(
+            result_out,
+            saved
+              |> result.map(fn(_) { execution.from_coordinator(outcome) })
+              |> result.map_error(from_checkpoint),
+          )
+        },
+      )
+      let outcome = process.receive_forever(result_out)
+      // A cancellation racing a checkpoint wins before dispatch: restart
+      // from the saved state with the new observation.
+      case guarded(guard, fn() { storage.do_load(run.storage, run.id) }) {
+        Ok(current) ->
+          case storage.cancelled(current) == cancelled {
+            True -> outcome
+            False -> drive_claimed(run, settings, caller, guard, claim, current)
+          }
+        Error(_) -> outcome
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Storage calls
+// ---------------------------------------------------------------------------
+
+/// Runs one storage operation from the caller's process in a helper
+/// process, bounded by the storage's call timeout.
+fn call(
+  store: Storage,
+  operation: fn() -> Result(a, storage.Error),
+) -> Result(a, storage.Error) {
+  let reply = process.new_subject()
+  let helper =
+    process.spawn_unlinked(fn() { process.send(reply, rescued(operation)) })
+  let monitor = process.monitor(helper)
+  let selector =
+    process.new_selector()
+    |> process.select(reply)
+    |> process.select_specific_monitor(monitor, fn(_) {
+      Error(storage.Unavailable("the storage operation exited"))
+    })
+  case process.selector_receive(selector, storage.call_timeout(store)) {
+    Ok(result) -> {
+      process.demonitor_process(monitor)
+      result
+    }
+    Error(Nil) -> {
+      process.kill(helper)
+      process.demonitor_process(monitor)
+      Error(storage.TimedOut)
+    }
+  }
+}
+
+fn rescued(
+  operation: fn() -> Result(a, storage.Error),
+) -> Result(a, storage.Error) {
+  case ffi.rescue(operation) {
+    ffi.Rescued(result) -> result
+    ffi.Raised(_, reason) ->
+      Error(storage.Unavailable("the storage operation raised: " <> reason))
+  }
+}
+
+/// A runner's watchdog: runner storage operations run in the runner itself,
+/// so an adapter sees the runner as the claiming process, and the watchdog
+/// stops a runner whose operation outlives the call timeout.
+type Guard {
+  Guard(pid: Pid, subject: Subject(GuardMessage))
+}
+
+type GuardMessage {
+  Begin
+  End
+}
+
+fn start_guard(runner: Pid, timeout: Int, on_timeout: fn() -> Nil) -> Guard {
+  let ready = process.new_subject()
+  let pid =
+    process.spawn(fn() {
+      let subject = process.new_subject()
+      process.send(ready, subject)
+      guard_idle(subject, runner, timeout, on_timeout)
+    })
+  let assert Ok(subject) = process.receive(ready, 5000)
+  Guard(pid, subject)
+}
+
+fn guard_idle(
+  subject: Subject(GuardMessage),
+  runner: Pid,
+  timeout: Int,
+  on_timeout: fn() -> Nil,
+) -> Nil {
+  case process.receive_forever(subject) {
+    Begin ->
+      case process.receive(subject, timeout) {
+        Ok(_) -> guard_idle(subject, runner, timeout, on_timeout)
+        Error(Nil) -> {
+          on_timeout()
+          process.kill(runner)
+        }
+      }
+    End -> guard_idle(subject, runner, timeout, on_timeout)
+  }
+}
+
+fn guarded(
+  guard: Guard,
+  operation: fn() -> Result(a, storage.Error),
+) -> Result(a, storage.Error) {
+  process.send(guard.subject, Begin)
+  let result = rescued(operation)
+  process.send(guard.subject, End)
+  result
+}
+
+/// Renews a claim every `every` milliseconds while the runner lives; when
+/// the claim was taken over, reports it and stops the runner.
+fn start_heartbeat(
+  runner: Pid,
+  every: Int,
+  claim: storage.Claim,
+  renew: fn(storage.Claim) -> Result(Nil, storage.Error),
+  on_lost: fn() -> Nil,
+) -> Pid {
+  process.spawn(fn() { heartbeat(runner, every, claim, renew, on_lost) })
+}
+
+fn heartbeat(
+  runner: Pid,
+  every: Int,
+  claim: storage.Claim,
+  renew: fn(storage.Claim) -> Result(Nil, storage.Error),
+  on_lost: fn() -> Nil,
+) -> Nil {
+  process.sleep(int.max(1, every))
+  case rescued(fn() { renew(claim) }) {
+    Error(storage.StaleOwner) | Error(storage.NotFound) -> {
+      on_lost()
+      process.kill(runner)
+    }
+    _ -> heartbeat(runner, every, claim, renew, on_lost)
+  }
+}
+
+/// Stops a helper linked to the calling process without taking the caller
+/// down.
+fn stop_linked(pid: Pid) -> Nil {
+  process.unlink(pid)
+  process.kill(pid)
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint envelope
+// ---------------------------------------------------------------------------
+
+fn load(run: Run(i, o, e, u)) -> Result(Envelope(o, e, u), Error) {
+  use stored <- result.try(
+    call(run.storage, fn() { storage.do_load(run.storage, run.id) })
+    |> result.map_error(StorageFailure),
+  )
+  open(run, storage.data(stored))
+}
+
+fn open(
+  run: Run(i, o, e, u),
+  bytes: BitArray,
+) -> Result(Envelope(o, e, u), Error) {
+  let persistence = run.persistence
+  use #(saved_id, saved_stamp) <- result.try(
+    header(bytes) |> result.replace_error(InvalidCheckpoint(Malformed)),
+  )
+  use _ <- result.try(
+    case saved_id == run.id, saved_stamp == persistence.stamp {
+      False, _ -> Error(InvalidCheckpoint(ForeignExecution(saved_id)))
+      _, False -> Error(IncompatibleDefinition)
+      True, True -> Ok(Nil)
+    },
+  )
+  decode_envelope(
+    bytes,
+    fn(value) { codec.decode(persistence.output, value) },
+    fn(value) { codec.decode(persistence.error, value) },
+    fn(value) { codec.decode(persistence.undo_error, value) },
+  )
+  |> result.map_error(from_checkpoint)
 }
 
 fn encode(
   envelope: Envelope(o, e, u),
-  p: Persistence(i, o, e, u),
-) -> Result(BitArray, Error) {
-  encode_envelope(
-    envelope,
-    fn(value) { codec.encode(p.output, value) },
-    fn(value) { codec.encode(p.error, value) },
-    fn(value) { codec.encode(p.undo_error, value) },
-  )
-  |> result.map_error(from_checkpoint)
+  persistence: Persistence(i, o, e, u),
+) -> Result(BitArray, checkpoint.Failure) {
+  encode_within(envelope, persistence, Some(persistence.max_checkpoint_bytes))
 }
 
-fn decode(
-  bytes: BitArray,
-  p: Persistence(i, o, e, u),
-) -> Result(Envelope(o, e, u), Error) {
-  decode_envelope(
-    bytes,
-    fn(value) { codec.decode(p.output, value) },
-    fn(value) { codec.decode(p.error, value) },
-    fn(value) { codec.decode(p.undo_error, value) },
+fn encode_within(
+  envelope: Envelope(o, e, u),
+  persistence: Persistence(i, o, e, u),
+  limit: Option(Int),
+) -> Result(BitArray, checkpoint.Failure) {
+  use bytes <- result.try(
+    encode_envelope(
+      envelope,
+      fn(value) { codec.encode(persistence.output, value) },
+      fn(value) { codec.encode(persistence.error, value) },
+      fn(value) { codec.encode(persistence.undo_error, value) },
+    ),
   )
-  |> result.map_error(from_checkpoint)
+  let size = bit_array.byte_size(bytes)
+  case limit {
+    Some(limit) if size > limit -> Error(checkpoint.TooLarge(size, limit))
+    _ -> Ok(bytes)
+  }
 }
 
 @external(erlang, "saga_checkpoint", "encode")
 fn encode_envelope(
   envelope: Envelope(o, e, u),
-  output: fn(o) -> Result(String, String),
-  error: fn(e) -> Result(String, String),
-  undo: fn(u) -> Result(String, String),
+  output: fn(o) -> Result(String, codec.CodecError),
+  error: fn(e) -> Result(String, codec.CodecError),
+  undo: fn(u) -> Result(String, codec.CodecError),
 ) -> Result(BitArray, checkpoint.Failure)
 
 @external(erlang, "saga_checkpoint", "decode")
 fn decode_envelope(
   bytes: BitArray,
-  output: fn(String) -> Result(o, String),
-  error: fn(String) -> Result(e, String),
-  undo: fn(String) -> Result(u, String),
+  output: fn(String) -> Result(o, codec.CodecError),
+  error: fn(String) -> Result(e, codec.CodecError),
+  undo: fn(String) -> Result(u, codec.CodecError),
 ) -> Result(Envelope(o, e, u), checkpoint.Failure)
 
-fn from_checkpoint(failure: checkpoint.Failure) -> Error {
-  case failure {
-    checkpoint.StorageFailure(error) -> StorageError(error)
-    checkpoint.CodecFailure(reason) -> CodecFailure(reason)
-    checkpoint.InvalidState(reason) -> InvalidCheckpoint(reason)
-    checkpoint.Uncertain(required) -> RecoveryRequired(required)
-  }
-}
-
-fn to_checkpoint(error: Error) -> checkpoint.Failure {
-  case error {
-    StorageError(error) -> checkpoint.StorageFailure(error)
-    CodecFailure(reason) -> checkpoint.CodecFailure(reason)
-    InvalidCheckpoint(reason) -> checkpoint.InvalidState(reason)
-    RecoveryRequired(required) -> checkpoint.Uncertain(required)
-    InvalidDefinition(reason) -> checkpoint.InvalidState(reason)
-    IncompatibleDefinition -> checkpoint.InvalidState("incompatible definition")
-    ReferenceMismatch -> checkpoint.InvalidState("reference mismatch")
-    InputMismatch -> checkpoint.InvalidState("input mismatch")
-    InvalidConfig(_) -> checkpoint.InvalidState("invalid runner configuration")
-    RunnerLost -> checkpoint.InvalidState("runner lost")
-    SuspensionNotSaved(_, _) ->
-      checkpoint.InvalidState("suspension recording failed")
-  }
-}
-
-import gleam/int
-import gleam/string
+@external(erlang, "saga_checkpoint", "header")
+fn header(bytes: BitArray) -> Result(#(String, String), Nil)
 
 fn frame(parts: List(String)) -> String {
   list.map(parts, fn(part) {
@@ -544,18 +1133,72 @@ fn frame(parts: List(String)) -> String {
   |> string.concat
 }
 
-fn check_header(
-  bytes: BitArray,
-  reference: Reference,
-  persistence: Persistence(i, o, e, u),
-) -> Result(Nil, Error) {
-  use header <- result.try(header(bytes) |> result.map_error(InvalidCheckpoint))
-  case header.0 == reference.id, header.1 == persistence.stamp {
-    False, _ -> Error(ReferenceMismatch)
-    _, False -> Error(IncompatibleDefinition)
-    True, True -> Ok(Nil)
+// ---------------------------------------------------------------------------
+// Internal to public vocabulary
+// ---------------------------------------------------------------------------
+
+fn from_checkpoint(failure: checkpoint.Failure) -> Error {
+  case failure {
+    checkpoint.StorageFailure(error) -> StorageFailure(error)
+    checkpoint.CodecFailure(boundary, error) ->
+      CodecFailure(boundary_from(boundary), error)
+    checkpoint.InvalidState(problem) ->
+      InvalidCheckpoint(checkpoint_problem_from(problem))
+    checkpoint.Uncertain(checkpoint.Required(step, action, key)) ->
+      RecoveryRequired(Required(
+        step: address_from(step),
+        action: case action {
+          checkpoint.AttemptAction(n) -> execution.StepAttempt(n)
+          checkpoint.CompensationAction(n) -> execution.StepCompensation(n)
+          checkpoint.UndoAction -> execution.StepUndo
+        },
+        key: saga.key_from_saved(key),
+      ))
+    checkpoint.TooLarge(bytes, limit) -> CheckpointTooLarge(bytes, limit)
   }
 }
 
-@external(erlang, "saga_checkpoint", "header")
-fn header(bytes: BitArray) -> Result(#(String, String), String)
+fn address_from(address: checkpoint.Address) -> saga.StepAddress {
+  saga.StepAddress(address.scope, address.name, address.occurrence)
+}
+
+fn boundary_from(boundary: checkpoint.Boundary) -> Boundary {
+  case boundary {
+    checkpoint.RunInput -> RunInput
+    checkpoint.RunOutput -> RunOutput
+    checkpoint.RunError -> RunError
+    checkpoint.RunUndoError -> RunUndoError
+    checkpoint.StepInput(step) -> StepInput(address_from(step))
+    checkpoint.StepOutput(step) -> StepOutput(address_from(step))
+  }
+}
+
+fn checkpoint_problem_from(problem: checkpoint.Problem) -> CheckpointProblem {
+  case problem {
+    checkpoint.Malformed -> Malformed
+    checkpoint.ForeignExecution(saved) -> ForeignExecution(saved)
+    checkpoint.GraphMismatch -> GraphMismatch
+    checkpoint.ConcurrencyBelowInFlight(in_flight, max_concurrency) ->
+      ConcurrencyBelowInFlight(in_flight, max_concurrency)
+    checkpoint.UndoNotRestorable(step) -> UndoNotRestorable(address_from(step))
+    checkpoint.CompensationInputMissing(step) ->
+      CompensationInputMissing(address_from(step))
+    checkpoint.DeciderMissingAfterMapping(step) ->
+      DeciderMissingAfterMapping(address_from(step))
+  }
+}
+
+fn problem_from_checkpoint(
+  problem: checkpoint.DefinitionProblem,
+) -> PersistenceProblem {
+  case problem {
+    checkpoint.EmptyWorkflowVersion -> EmptyWorkflowVersion
+    checkpoint.MissingRecoverable(step) ->
+      MissingRecoverable(address_from(step))
+    checkpoint.EmptyStepVersion(step) -> EmptyStepVersion(address_from(step))
+    checkpoint.EmptyStepCodecVersion(boundary) ->
+      EmptyCodecVersion(boundary_from(boundary))
+    checkpoint.MissingRestoreUndo(step) ->
+      MissingRestoreUndo(address_from(step))
+  }
+}

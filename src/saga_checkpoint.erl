@@ -4,8 +4,8 @@
 header(Bytes) ->
     try binary_to_term(Bytes,[safe]) of
         {envelope,1,Ref,Stamp,_,_,_,_} when is_binary(Ref),is_binary(Stamp) -> {ok,{Ref,Stamp}};
-        _ -> {error,<<"invalid checkpoint header">>}
-    catch _:_ -> {error,<<"invalid checkpoint header">>} end.
+        _ -> {error,nil}
+    catch _:_ -> {error,nil} end.
 
 %% The schema is the full wire contract, including every nested variant.
 %% Only application output/error fields cross the supplied checked codecs.
@@ -13,14 +13,18 @@ header(Bytes) ->
 encode(Value,O,E,U) ->
     try walk(Value,envelope,{encode,O,E,U}) of
         Encoded -> {ok,term_to_binary(Encoded)}
-    catch throw:{codec,Reason} -> {error,{codec_failure,Reason}}; _:_ -> {error,{invalid_state,<<"invalid checkpoint">>}} end.
+    catch throw:{codec,Type,Reason} -> {error,{codec_failure,boundary(Type),Reason}}; _:_ -> {error,{invalid_state,malformed}} end.
 decode(Bytes,O,E,U) ->
     try
         Value=binary_to_term(Bytes,[safe]),
         Decoded=walk(Value,envelope,{decode,O,E,U}),
         validate(Decoded),
         {ok,Decoded}
-    catch throw:{codec,Reason} -> {error,{codec_failure,Reason}}; _:_ -> {error,{invalid_state,<<"invalid checkpoint">>}} end.
+    catch throw:{codec,Type,Reason} -> {error,{codec_failure,boundary(Type),Reason}}; _:_ -> {error,{invalid_state,malformed}} end.
+
+boundary(output) -> run_output;
+boundary(error) -> run_error;
+boundary(undo) -> run_undo_error.
 
 walk(Value,string,_) when is_binary(Value) ->
     Value=unicode:characters_to_binary(Value), Value;
@@ -36,7 +40,7 @@ walk(Value,Type,{Mode,O,E,U}) when Type=:=output;Type=:=error;Type=:=undo ->
     F=case Type of output -> O; error -> E; undo -> U end,
     case F(Value) of
         {ok,Result} -> case Mode of encode -> true=is_binary(Result); decode -> ok end, Result;
-        {error,Reason} when is_binary(Reason) -> throw({codec,Reason})
+        {error,Reason} -> throw({codec,Type,Reason})
     end;
 walk(Value,Type,Codecs) ->
     {Tag,Fields}=case Value of
@@ -50,10 +54,24 @@ walk(Value,Type,Codecs) ->
     case Results of [] -> Tag; _ -> list_to_tuple([Tag|Results]) end.
 
 schema(envelope) -> [{envelope,[int,string,string,string,{option,snapshot},{option,outcome},{option,checkpoint_failure}]}];
-schema(checkpoint_failure) -> [{storage_failure,[storage_error]}, {codec_failure,[string]}, {invalid_state,[string]}, {uncertain,[required]}];
-schema(storage_error) -> [{not_found,[]},{already_exists,[]},{busy,[]},{conflict,[]},{stale_owner,[]},{cancellation_changed,[]},{corrupt,[]},{io,[string]}];
-schema(required) -> [{required,[string,reconciliation_action,string]}];
-schema(reconciliation_action) -> [{activity,[]},{compensation,[]},{undo,[]}];
+schema(checkpoint_failure) -> [{storage_failure,[storage_error]}, {codec_failure,[boundary,codec_error]},
+    {invalid_state,[problem]}, {uncertain,[required]}, {too_large,[natural,natural]}];
+schema(storage_error) -> [{not_found,[]},{already_exists,[]},{busy,[]},{conflict,[]},{stale_owner,[]},
+    {cancellation_changed,[]},{corrupt,[]},{unavailable,[string]},{timed_out,[]}];
+schema(boundary) -> [{run_input,[]},{run_output,[]},{run_error,[]},{run_undo_error,[]},
+    {step_input,[saved_address]},{step_output,[saved_address]}];
+schema(saved_address) -> [{address,[{list,string},string,natural]}];
+schema(codec_error) -> [{encode_failed,[string]},{decode_failed,[string]},{json_decode_failed,[json_error]},
+    {round_trip_failed,[codec_error]},{codec_raised,[string]}];
+schema(json_error) -> [{unexpected_end_of_input,[]},{unexpected_byte,[string]},{unexpected_sequence,[string]},
+    {unable_to_decode,[{list,decode_error}]}];
+schema(decode_error) -> [{decode_error,[string,string,{list,string}]}];
+schema(problem) -> [{malformed,[]},{foreign_execution,[string]},{graph_mismatch,[]},
+    {concurrency_below_in_flight,[natural,natural]},{undo_not_restorable,[saved_address]},
+    {compensation_input_missing,[saved_address]},{decider_missing_after_mapping,[saved_address]}];
+schema(required) -> [{required,[saved_address,required_action,key]}];
+schema(required_action) -> [{attempt_action,[natural]},{compensation_action,[natural]},{undo_action,[]}];
+schema(key) -> [{key,[string,natural,string]}];
 schema(snapshot) -> [{snapshot,[{list,saved_node},{list,natural},phase,{list,{pair,natural,failure}},{list,unknown},{option,int}]}];
 schema(saved_node) -> [{saved_node,[progress,{list,string},int]}];
 schema(progress) -> [{waiting,[]},{attempting,[natural]},{compensating,[natural]},

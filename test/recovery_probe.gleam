@@ -28,7 +28,7 @@ fn definition(
     saga.effect(name, fn(input, key) {
       case first_vm {
         True -> {
-          write_ledger(path <> "." <> name, key.attempt_key)
+          write_ledger(path <> "/" <> name, key.attempt_key)
           process.sleep(60_000)
           Ok(input <> name)
         }
@@ -40,7 +40,7 @@ fn definition(
       input: text,
       output: text,
       resolve: fn(input, key) {
-        case ledger_has(path <> "." <> name, key.attempt_key) {
+        case ledger_has(path <> "/" <> name, key.attempt_key) {
           True -> durable.Completed(input <> name)
           False -> durable.MaybeSent
         }
@@ -72,7 +72,14 @@ fn definition(
       |> saga.map(fn(pair) { pair.0 <> pair.1 })
     })
   let assert Ok(persistence) =
-    durable.prepare(workflow, "1", text, text, text, text)
+    durable.new(
+      workflow,
+      version: "1",
+      input: text,
+      output: text,
+      error: text,
+      undo_error: text,
+    )
   persistence
 }
 
@@ -81,21 +88,23 @@ pub fn main() -> Nil {
   let first_vm = mode() == "prepare"
   let persistence = definition(path, first_vm)
   let storage = file.open(path)
-  let assert Ok(reference) =
-    durable.start_or_reconnect(storage, "vm-ref", persistence, "order")
-  let result =
-    durable.drive(
+  let assert Ok(run) =
+    durable.start_or_reconnect(
+      persistence
+        |> durable.with_config(
+          execution.config() |> execution.with_max_concurrency(2),
+        ),
       storage,
-      reference,
-      persistence,
-      execution.config() |> execution.with_max_concurrency(2),
+      id: "vm-ref",
+      input: "order",
     )
+  let result = durable.drive(run, timeout: 60_000)
   case first_vm {
     True -> Nil
     False -> {
       let assert Ok(execution.Completed("order!aorder!b")) = result
       let assert Ok(durable.Finished(execution.Completed("order!aorder!b"))) =
-        durable.read(storage, reference, persistence)
+        durable.read(run)
       io.println("RECOVERED")
     }
   }
