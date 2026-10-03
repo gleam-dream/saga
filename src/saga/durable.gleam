@@ -33,8 +33,8 @@
 //// let order = codec.json("order-1", fn(id) { Ok(json.string(id)) }, decode.string)
 //// let text = codec.text()
 //// let charge =
-////   saga.effect("charge", fn(order, key) { charge(order, key.idempotency) })
-////   |> saga.undo(fn(undo) { refund(undo.output, undo.key.idempotency) })
+////   saga.effect("charge", fn(order, key) { charge(order, saga.idempotency_key(key)) })
+////   |> saga.undo(fn(undo) { refund(undo.output, saga.idempotency_key(undo.key)) })
 ////   |> durable.recoverable(version: "1", input: order, output: text, resolve: lookup_charge)
 ////   |> durable.resolve_undo(lookup_refund)
 //// let workflow = saga.define("checkout", saga.perform(_, charge))
@@ -162,7 +162,8 @@ pub type CheckpointProblem {
 
 /// The action whose effect must be established before the execution can
 /// continue: its step, which action (`StepAttempt(n)`,
-/// `StepCompensation(n)` or `StepUndo`), and its `EffectKey`.
+/// `StepCompensation(n)` or `StepUndo`), and its `EffectKey`. Read it by
+/// label (`Required(key:, ..)`); a later release may add fields.
 pub type Required {
   Required(
     step: saga.StepAddress,
@@ -213,7 +214,7 @@ pub fn describe_error(error: Error) -> String {
       <> " of step "
       <> saga.address_to_string(step)
       <> " is unknown; establish it for key "
-      <> key.attempt_key
+      <> saga.attempt_key(key)
     InvalidCheckpoint(problem) ->
       "the checkpoint cannot be restored: " <> describe_checkpoint(problem)
     CheckpointTooLarge(bytes, limit) ->
@@ -388,7 +389,7 @@ pub fn resolve_undo(
 /// `Some(decision)` applies that decision under the original attempt
 /// budget, and `None` keeps the execution suspended. Saga never repeats the
 /// decider itself after a restart, so a decider with an external effect
-/// records its decision under `key.attempt_key`.
+/// records its decision under `saga.attempt_key(key)`.
 pub fn resolve_compensation(
   step: saga.Step(i, o, e, u),
   resolve: fn(i, saga.EffectKey) -> Option(saga.Recovery(o, e, u)),
@@ -434,6 +435,10 @@ pub type Status(o, e, u) {
   Finished(outcome: execution.Outcome(o, e, u))
 }
 
+/// The saved record. `format` is 2; format 1 had no `correlation`, and `open`
+/// reads it as `correlation.from_key(id)`. `correlation` is `None` only for
+/// an execution that no drive has claimed yet: the first drive saves the
+/// value it uses, and every later drive reads it back.
 type Envelope(o, e, u) {
   Envelope(
     format: Int,
@@ -443,6 +448,7 @@ type Envelope(o, e, u) {
     snapshot: Option(coordinator.Snapshot(e, u)),
     outcome: Option(coordinator.Outcome(o, e, u)),
     issue: Option(checkpoint.Failure),
+    correlation: Option(String),
   )
 }
 
@@ -584,9 +590,11 @@ pub fn start_or_reconnect(
     |> result.map_error(CodecFailure(RunInput, _)),
   )
   let run = Run(persistence, storage, id, persistence.config)
-  let envelope = Envelope(1, id, persistence.stamp, encoded, None, None, None)
+  let envelope =
+    Envelope(2, id, persistence.stamp, encoded, None, None, None, None)
   use bytes <- result.try(
-    encode(envelope, persistence) |> result.map_error(from_checkpoint(run, _)),
+    encode(envelope, persistence)
+    |> result.map_error(from_checkpoint(unsaved_correlation(run), _)),
   )
   case call(storage, fn() { storage.do_create(storage, id, bytes) }) {
     Ok(_) -> Ok(run)
@@ -616,9 +624,15 @@ pub fn reconnect(
 
 /// Carries `correlation` in every `saga/telemetry` event of this handle's
 /// drives, and in the `saga.EffectKey` of every step callback and resolver
-/// that runs under it. The correlation is not saved: set it on every handle
-/// that drives. A handle without one carries `correlation.from_key` of its
-/// execution id, so a forgotten call still joins the execution's events.
+/// that runs under it.
+///
+/// **The first drive decides, and the execution keeps it.** The first drive
+/// of an execution saves the correlation it uses with the checkpoint: this
+/// handle's, or, without one, `correlation.from_key` of the execution id.
+/// Every later drive, on any handle, reads the saved value back, so the
+/// events and steps of one execution report one correlation. A value set
+/// after the first drive is ignored. An execution saved before the
+/// correlation was recorded reads as `correlation.from_key(id)`.
 pub fn with_correlation(
   run: Run(i, o, e, u),
   correlation: Correlation,
@@ -636,7 +650,8 @@ pub fn read(run: Run(i, o, e, u)) -> Result(Status(o, e, u), Error) {
   use envelope <- result.try(load(run))
   Ok(case envelope.outcome, envelope.issue {
     Some(outcome), _ -> Finished(execution.from_coordinator(outcome))
-    None, Some(reason) -> Suspended(from_checkpoint(run, reason))
+    None, Some(reason) ->
+      Suspended(from_checkpoint(saved_correlation(run, envelope), reason))
     None, None -> Pending
   })
 }
@@ -869,9 +884,51 @@ fn drive_claimed(
 ) -> Result(execution.Outcome(o, e, u), Error) {
   let persistence = run.persistence
   use envelope <- result.try(open(run, storage.data(stored)))
-  case envelope.outcome {
-    Some(outcome) -> Ok(execution.from_coordinator(outcome))
-    None -> {
+  case envelope.outcome, envelope.correlation {
+    Some(outcome), _ -> Ok(execution.from_coordinator(outcome))
+    None, None -> {
+      // The first drive saves the correlation it uses before it dispatches
+      // anything, so that every later drive reports the same one.
+      let saved =
+        Envelope(
+          ..envelope,
+          correlation: option.map(settings.correlation, correlation.to_string),
+        )
+      let written =
+        encode_within(saved, persistence, None)
+        |> result.map_error(from_checkpoint(settings.correlation, _))
+      use bytes <- result.try(written)
+      let commit =
+        guarded(guard, fn() {
+          storage.do_commit(
+            run.storage,
+            claim,
+            storage.Commit(
+              expected_revision: storage.revision(stored),
+              observed_cancelled: storage.cancelled(stored),
+              phase: storage.Pending,
+              data: bytes,
+            ),
+          )
+        })
+      case commit {
+        Ok(written) ->
+          drive_claimed(run, settings, caller, guard, claim, written)
+        Error(storage.CancellationChanged) ->
+          case guarded(guard, fn() { storage.do_load(run.storage, run.id) }) {
+            Ok(current) ->
+              drive_claimed(run, settings, caller, guard, claim, current)
+            Error(error) -> Error(StorageFailure(error))
+          }
+        Error(error) -> Error(StorageFailure(error))
+      }
+    }
+    None, Some(saved) -> {
+      let settings =
+        coordinator.Settings(
+          ..settings,
+          correlation: Some(correlation.from_key(saved)),
+        )
       use input <- result.try(
         codec.decode(persistence.input, envelope.input)
         |> result.map_error(CodecFailure(RunInput, _)),
@@ -943,13 +1000,13 @@ fn drive_claimed(
                 storage.Suspended,
               )
             {
-              Ok(Nil) -> from_checkpoint(run, reason)
+              Ok(Nil) -> from_checkpoint(settings.correlation, reason)
               Error(recording) if recording == reason ->
-                from_checkpoint(run, reason)
+                from_checkpoint(settings.correlation, reason)
               Error(recording) ->
                 SuspensionNotSaved(
-                  from_checkpoint(run, reason),
-                  from_checkpoint(run, recording),
+                  from_checkpoint(settings.correlation, reason),
+                  from_checkpoint(settings.correlation, recording),
                 )
             }
             process.send(result_out, Error(failure))
@@ -974,7 +1031,7 @@ fn drive_claimed(
             result_out,
             saved
               |> result.map(fn(_) { execution.from_coordinator(outcome) })
-              |> result.map_error(from_checkpoint(run, _)),
+              |> result.map_error(from_checkpoint(settings.correlation, _)),
           )
         },
       )
@@ -1165,13 +1222,50 @@ fn open(
       True, True -> Ok(Nil)
     },
   )
-  decode_envelope(
-    bytes,
-    fn(value) { codec.decode(persistence.output, value) },
-    fn(value) { codec.decode(persistence.error, value) },
-    fn(value) { codec.decode(persistence.undo_error, value) },
+  use envelope <- result.try(
+    decode_envelope(
+      bytes,
+      fn(value) { codec.decode(persistence.output, value) },
+      fn(value) { codec.decode(persistence.error, value) },
+      fn(value) { codec.decode(persistence.undo_error, value) },
+    )
+    |> result.map_error(from_checkpoint(unsaved_correlation(run), _)),
   )
-  |> result.map_error(from_checkpoint(run, _))
+  case envelope.format, envelope.correlation {
+    // Format 1 saved no correlation: its executions read as `from_key(id)`,
+    // and the next commit saves it.
+    1, _ ->
+      Ok(
+        Envelope(
+          ..envelope,
+          format: 2,
+          correlation: Some(correlation.to_string(correlation.from_key(run.id))),
+        ),
+      )
+    _, Some(saved) ->
+      case correlation.from_string(saved) {
+        Ok(_) -> Ok(envelope)
+        Error(_) -> Error(InvalidCheckpoint(Malformed))
+      }
+    _, None -> Ok(envelope)
+  }
+}
+
+/// The correlation a drive of `run` would use if the execution had none
+/// saved: the handle's, or `from_key(id)`.
+fn unsaved_correlation(run: Run(i, o, e, u)) -> Option(Correlation) {
+  execution.correlation_of(run.config, Some(run.id))
+}
+
+/// The correlation that `envelope` saved, or the unsaved one.
+fn saved_correlation(
+  run: Run(i, o, e, u),
+  envelope: Envelope(o, e, u),
+) -> Option(Correlation) {
+  case envelope.correlation {
+    Some(saved) -> Some(correlation.from_key(saved))
+    None -> unsaved_correlation(run)
+  }
 }
 
 fn encode(
@@ -1231,7 +1325,10 @@ fn frame(parts: List(String)) -> String {
 // Internal to public vocabulary
 // ---------------------------------------------------------------------------
 
-fn from_checkpoint(run: Run(i, o, e, u), failure: checkpoint.Failure) -> Error {
+fn from_checkpoint(
+  correlation: Option(Correlation),
+  failure: checkpoint.Failure,
+) -> Error {
   case failure {
     checkpoint.StorageFailure(error) -> StorageFailure(error)
     checkpoint.CodecFailure(boundary, error) ->
@@ -1246,10 +1343,7 @@ fn from_checkpoint(run: Run(i, o, e, u), failure: checkpoint.Failure) -> Error {
           checkpoint.CompensationAction(n) -> execution.StepCompensation(n)
           checkpoint.UndoAction -> execution.StepUndo
         },
-        key: saga.key_from_saved(
-          key,
-          execution.correlation_of(run.config, Some(run.id)),
-        ),
+        key: saga.key_from_saved(key, correlation),
       ))
     checkpoint.TooLarge(bytes, limit) -> CheckpointTooLarge(bytes, limit)
   }

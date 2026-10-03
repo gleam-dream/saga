@@ -176,7 +176,9 @@ pub fn with_max_retry_delay(config: Config, delay: Duration) -> Config {
 /// and `saga.compensate` receive, and pass it to the clients they call.
 ///
 /// A local run without a correlation carries none. A durable execution
-/// without one carries `correlation.from_key` of its execution id.
+/// without one carries `correlation.from_key` of its execution id; its first
+/// drive saves the correlation it uses, and later drives read it back (see
+/// `durable.with_correlation`).
 pub fn with_correlation(config: Config, correlation: Correlation) -> Config {
   Config(..config, correlation: Some(correlation))
 }

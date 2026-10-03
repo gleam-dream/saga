@@ -28,7 +28,7 @@ pub fn main() -> Nil {
   let branch = fn(name) {
     saga.step(name, fn(_) { Error("declined") })
     |> saga.compensate(max_attempts: 2, with: fn(failed) {
-      let key = failed.key.attempt_key
+      let key = saga.attempt_key(failed.key)
 
       case first_vm {
         True -> {
@@ -40,8 +40,8 @@ pub fn main() -> Nil {
       }
     })
     |> durable.resolve_compensation(fn(input, key) {
-      let assert 1 = key.attempt
-      case ledger_has(path <> "/" <> name, key.attempt_key) {
+      let assert 1 = saga.attempt_number(key)
+      case ledger_has(path <> "/" <> name, saga.attempt_key(key)) {
         True -> Some(saga.Continue(input <> name, saga.NoUndo))
         False -> None
       }

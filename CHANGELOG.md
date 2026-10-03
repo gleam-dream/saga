@@ -26,23 +26,37 @@ Every change below has a before and after in
   `durable.Required.key`, in `RecoveryRequired`, carries it too.
   `saga.step` still hands its function the input only; use `saga.effect` for
   a step that needs the context.
+- **`EffectKey` accessors:** `saga.idempotency_key(key)`,
+  `saga.attempt_number(key)`, `saga.attempt_key(key)` and
+  `saga.correlation_of(key)`.
+- **A durable execution keeps one correlation.** The first drive saves the
+  correlation it uses (the handle's, or `from_key(id)`) with the checkpoint
+  before it dispatches anything, and every later drive reads it back, so the
+  events and steps of all drives agree. A `durable.with_correlation` after
+  the first drive is ignored. The checkpoint format is now 2; a format 1
+  record, saved before the correlation was recorded, still reads and means
+  `from_key(id)`, and the next commit saves it in format 2. The first drive
+  of an execution makes one extra commit.
 
 #### Changed
 
 - **A durable execution is always correlated.** A handle without
   `durable.with_correlation` used to emit `correlation: None` and give its
-  steps nothing, and the value was not saved, so a forgotten call on one
-  handle after a restart left that drive's events unjoined. It now carries
-  `correlation.from_key(id)` of its execution id in its events and in its
-  steps. A handle with `with_correlation` is unchanged. A local run without
-  a correlation still carries `None`.
+  steps nothing. It now carries `correlation.from_key(id)` of its execution
+  id in its events and in its steps. A local run without a correlation
+  still carries `None`.
 
 #### Breaking
 
-- `saga.EffectKey` has a fourth field. A positional construction or pattern
-  (`EffectKey(a, b, c)`) no longer compiles; saga builds this record, so
-  read it by label (`key.idempotency`, `key.correlation`). No dependent in
-  the ecosystem constructs or matches one positionally.
+- **`saga.EffectKey` is opaque.** Callers only receive it, and a record
+  field broke positional code when `correlation` was added. Read it with
+  `saga.idempotency_key`, `saga.attempt_number`, `saga.attempt_key` and
+  `saga.correlation_of`: `key.idempotency` becomes
+  `saga.idempotency_key(key)`, `key.attempt` `saga.attempt_number(key)`,
+  `key.attempt_key` `saga.attempt_key(key)`. `EffectKey(..)` can no longer be
+  built or matched outside saga. `UndoRequest`, `FailedAttempt`,
+  `durable.Required` and the other records saga hands to callers stay public
+  records, read by label; their docs say so.
 
 ### Durations (wave 4)
 

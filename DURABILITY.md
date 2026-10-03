@@ -32,8 +32,8 @@ import saga/storage/memory
 let order = codec.json("order-1", fn(id) { Ok(json.string(id)) }, decode.string)
 let text = codec.text()
 let action =
-  saga.effect("charge", fn(order, key) { charge(order, key.idempotency) })
-  |> saga.undo(fn(undo) { refund(undo.input, undo.output, undo.key.idempotency) })
+  saga.effect("charge", fn(order, key) { charge(order, saga.idempotency_key(key)) })
+  |> saga.undo(fn(undo) { refund(undo.input, undo.output, saga.idempotency_key(undo.key)) })
   |> durable.recoverable(version: "1", input: order, output: text, resolve: lookup_charge)
   |> durable.resolve_undo(lookup_refund)
 let workflow = saga.define("checkout", saga.perform(_, action))
@@ -66,11 +66,16 @@ or depending on runner internals.
   `recoverable`, every compensating step without `restore_undo`, and every
   empty step or codec version, because each is a bug in the source. Choice
   decisions supply their own codec.
-- `saga.effect` gives each attempt an `EffectKey`. Its `idempotency` is the
-  same for every attempt of the step in one execution and survives restarts;
-  its `attempt_key` is unique per attempt. Send `idempotency` downstream as
-  the provider's idempotency key. A resolver receives the same key the
-  interrupted attempt had. An undo has its own key.
+- `saga.effect` gives each attempt an `EffectKey`. Its `saga.idempotency_key`
+  is the same for every attempt of the step in one execution and survives
+  restarts; its `saga.attempt_key` is unique per attempt. Send the
+  idempotency key downstream as the provider's idempotency key. A resolver
+  receives the same key the interrupted attempt had. An undo has its own key.
+  `saga.correlation_of(key)` is the execution's correlation: the first drive
+  saves the one it uses (the handle's, or `from_key(id)`) in the checkpoint,
+  and every later drive reads it back. A checkpoint saved before the
+  correlation was recorded (format 1) reads as `from_key(id)`, and the next
+  commit saves it in format 2.
 - `saga.undo` keeps undo reconstruction automatically. Every persistent
   compensating step declares `durable.restore_undo`, including an explicit
   `saga.NoUndo` factory when it never returns undo; `durable.new` panics on a

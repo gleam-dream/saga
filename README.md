@@ -37,8 +37,8 @@ pub fn checkout() {
     |> saga.undo(fn(undo) { release(undo.output) })
   let charge =
     saga.effect("charge_payment", fn(reservation, key) {
-      // `key.idempotency` is the same for every attempt of this step.
-      charge(reservation, idempotency_key: key.idempotency)
+      // `saga.idempotency_key(key)` is the same for every attempt of this step.
+      charge(reservation, idempotency_key: saga.idempotency_key(key))
     })
     |> saga.unknown_when(fn(error) { error == MaybeCharged })
     |> saga.compensate(max_attempts: 3, with: fn(failed) {
@@ -98,8 +98,10 @@ saga.effect("charge_payment", charge_with_key)
 Step callbacks receive one record each: `saga.undo` gets
 `UndoRequest(input, output, key)`, `saga.compensate` gets
 `FailedAttempt(input, failure, attempt, attempts_left, key)`, and
-`saga.effect` gets an `EffectKey(idempotency, attempt, attempt_key,
-correlation)`. Read them by label.
+`saga.effect` gets an opaque `EffectKey`. Read the records by label and the
+key with its accessors: `saga.idempotency_key(key)`,
+`saga.attempt_number(key)`, `saga.attempt_key(key)` and
+`saga.correlation_of(key)`.
 
 **A step reads its run's correlation** from the `EffectKey` that `effect`,
 `undo` and `compensate` already receive, so a step's own clients join the
@@ -107,23 +109,29 @@ run's events without threading the value by hand:
 
 ```gleam
 saga.effect("refund", fn(refund, key) {
-  let shop = case key.correlation {
+  let shop = case saga.correlation_of(key) {
     Some(correlation) -> shop.with_correlation(shop, correlation)
     None -> shop
   }
-  shop.refund(shop, refund, idempotency: key.idempotency)
+  shop.refund(shop, refund, idempotency: saga.idempotency_key(key))
 })
 ```
 
-`key.correlation` is the correlation set with `execution.with_correlation` or
-`durable.with_correlation`, the same value that the run's `saga/telemetry`
-events carry. A durable execution that sets none carries
-`correlation.from_key(id)` of its execution id, so a step of a durable run
-always reads `Some`; a local run without one reads `None`. `saga.step` hands
+`saga.correlation_of(key)` is the correlation set with
+`execution.with_correlation` or `durable.with_correlation`, the same value
+that the run's `saga/telemetry` events carry. A durable execution that sets
+none carries `correlation.from_key(id)` of its execution id, so a step of a
+durable run always reads `Some`; a local run without one reads `None`. `saga.step` hands
 its function the input only: use `effect` for a step that needs the context.
 The durable resolvers (`recoverable`, `resolve_undo`, `resolve_compensation`)
-receive the same key, with the correlation of the handle that drives after
-the restart.
+receive the same key.
+
+**A durable execution keeps one correlation.** The first drive saves the
+correlation it uses (the handle's, or `from_key(id)`) with the checkpoint,
+and every later drive, on any handle, reads it back: a `with_correlation`
+call after the first drive is ignored, and an execution saved by an earlier
+release reads as `from_key(id)`. Set `durable.with_correlation` before the
+first `drive`.
 
 ## Configuration
 
@@ -217,10 +225,10 @@ import saga/storage/memory
 let order = codec.json("order-1", fn(id) { Ok(json.string(id)) }, decode.string)
 let text = codec.text()
 let charge =
-  saga.effect("charge", fn(order, key) { charge(order, key.idempotency) })
-  |> saga.undo(fn(undo) { refund(undo.output, undo.key.idempotency) })
+  saga.effect("charge", fn(order, key) { charge(order, saga.idempotency_key(key)) })
+  |> saga.undo(fn(undo) { refund(undo.output, saga.idempotency_key(undo.key)) })
   |> durable.recoverable(version: "1", input: order, output: text, resolve: fn(order, key) {
-    case lookup_charge(order, key.idempotency) {
+    case lookup_charge(order, saga.idempotency_key(key)) {
       Ok(Charged(receipt)) -> durable.Completed(receipt)
       Ok(NoCharge) -> durable.NotSent
       Error(_) -> durable.MaybeSent
@@ -281,8 +289,9 @@ and stop, compensation decisions and undo outcomes. Every event's metadata
 carries `workflow`, `run` (this VM's id for one run), `execution` (the
 durable id, or `None`) and `correlation` (from `execution.with_correlation`
 or `durable.with_correlation`; a durable execution without one carries
-`correlation.from_key(id)`, and a local run `None`). The step and undo
-callbacks read the same value from their `EffectKey`.
+`correlation.from_key(id)`, and a local run `None`; a durable execution
+reports the value its first drive saved). The step and undo callbacks read
+the same value from their `EffectKey`.
 
 ```gleam
 import saga/telemetry
@@ -455,7 +464,7 @@ scenario for it in use alongside `execution.progress`.
   `start_reporting`'s subject receives at most one message, after rollback.
   Monitor `execution.pid(exec)` to detect a killed coordinator: its `Down`
   always arrives after its outcome.
-- **A local `EffectKey` belongs to one run.** Its `idempotency` derives from
+- **A local `EffectKey` belongs to one run.** Its `idempotency_key` derives from
   the run's id, which `execution.run` creates anew each time. A durable
   execution's keys derive from its id and survive restarts.
 

@@ -1,68 +1,86 @@
 # Migrating to the wave 5 saga API
 
 Wave 5 lets a step read its execution's correlation, so the step's own HTTP
-client can be correlated without threading the value by hand, and makes a
-durable execution always correlated. The change is additive for every
-dependent in the ecosystem: one record gains a field, and one default changes
-from "no correlation" to the execution id.
+client can be correlated without threading the value by hand. A durable
+execution is always correlated and keeps one correlation across drives.
+`EffectKey` becomes opaque. The only breaking change is the one that
+`EffectKey` makes: field reads become accessor calls.
 
 ## `saga`
 
-### `EffectKey` gains `correlation`
+### `EffectKey` is opaque, with accessors
 
 ```gleam
 // before
 pub type EffectKey {
   EffectKey(idempotency: String, attempt: Int, attempt_key: String)
 }
+key.idempotency
+key.attempt
+key.attempt_key
 // after
-pub type EffectKey {
-  EffectKey(
-    idempotency: String,
-    attempt: Int,
-    attempt_key: String,
-    correlation: Option(Correlation),
-  )
-}
+pub opaque type EffectKey
+pub fn idempotency_key(key: EffectKey) -> String
+pub fn attempt_number(key: EffectKey) -> Int
+pub fn attempt_key(key: EffectKey) -> String
+pub fn correlation_of(key: EffectKey) -> Option(Correlation)
+
+saga.idempotency_key(key)
+saga.attempt_number(key)
+saga.attempt_key(key)
+saga.correlation_of(key)
 ```
 
-Saga builds an `EffectKey`; callers read it by label. Source that reads
-`key.idempotency`, `key.attempt` or `key.attempt_key` compiles unchanged. A
-positional construction or pattern, `EffectKey(a, b, c)`, no longer compiles.
-No dependent has one (searched `saga`, `fabric`, `oversight/apps`).
+Callers only receive an `EffectKey`, and the next field would have broken
+positional code again, so a later release can now add to it freely. An
+`EffectKey` can still be compared with `==` and stored in a tuple.
+`undo.key` and `failed.key` are `EffectKey`s too:
+`saga.idempotency_key(undo.key)`.
+
+**Other records stay public.** `UndoRequest`, `FailedAttempt`,
+`durable.Required`, `StepAddress`, `Crash`, `StepDescriptor`,
+`execution.Settlement`, `execution.Progress` and the telemetry metadata
+records are read by label in every dependent (`undo.output`,
+`failed.failure`, `UndoRequest(output:, ..)`), and a labelled read or a
+labelled pattern with `..` keeps compiling when a field is added. Only a
+positional construction or pattern breaks, and their docs say not to write
+one. Opaque accessors would turn the common callback `fn(undo) {
+release(undo.output) }` into `saga.undo_output(undo)` in every undo.
+`StepAddress` and `Settlement` are also built by callers, to compare against
+or to fake an outcome in a test, and `StepAddress` is an identity (scope,
+name, occurrence) that does not grow.
+
+Dependents that read the key (searched `saga`, `fabric` including
+`fabric_saga`, experiments and consumers, and `oversight/apps`):
+
+| File                                                 | Before                                    | After                                               |
+| ---------------------------------------------------- | ----------------------------------------- | --------------------------------------------------- |
+| `oversight/apps/research_agent/.../publish.gleam:55` | `[#("idempotency-key", key.idempotency)]` | `[#("idempotency-key", saga.idempotency_key(key))]` |
+| `oversight/apps/research_agent/.../publish.gleam:76` | `"/drafts?key=" <> key.idempotency`       | `"/drafts?key=" <> saga.idempotency_key(key)`       |
+| `oversight/apps/checkout/.../workflow.gleam:6`       | doc comment: `EffectKey.idempotency`      | `saga.idempotency_key`                              |
+
+`fabric`, `fabric_saga`, the experiments and consumers, `support_desk`,
+`saga_postgres` and `bench` bind a key but read no field. In saga itself,
+`test/`, `examples/order_consumer`, README and DURABILITY.md are migrated.
+
+### A step reads its run's correlation
 
 `saga.effect`, `saga.undo` (`undo.key`), `saga.compensate` (`failed.key`) and
 the durable resolvers (`durable.recoverable`, `durable.resolve_undo`,
-`durable.resolve_compensation`) receive an `EffectKey`, so each one reads the
-correlation. `saga.step` receives only the step's input, as before: change it
-to `saga.effect` to read the context.
-
-`correlation` is the value of `execution.with_correlation` or
-`durable.with_correlation`, the same value that the run's `saga/telemetry`
-events carry in `metadata.correlation`.
-
-| Run                                    | `key.correlation`                       |
-| -------------------------------------- | --------------------------------------- |
-| local, `execution.with_correlation(c)` | `Some(c)`                               |
-| local, none set                        | `None`                                  |
-| durable, `durable.with_correlation(c)` | `Some(c)`, on every drive of the handle |
-| durable, none set                      | `Some(correlation.from_key(id))`        |
-
-The correlation is not saved in the checkpoint. A resolver, a restored undo
-and `durable.Required.key` after a restart carry the correlation of the handle
-that drives after the restart.
+`durable.resolve_compensation`) receive an `EffectKey`, and
+`saga.correlation_of(key)` is the correlation of the run. `saga.step`
+receives only the step's input, as before: change it to `saga.effect` to read
+the context.
 
 ```gleam
 // before: the client is correlated when the workflow is built or started
-let workflow = publish.workflow(correlated_client, base)
-
 saga.step("refund_payment", fn(refund: Refund) {
   shop.refund(refund.shop, refund.request)
 })
 
 // after: the step correlates its own client from the run
 saga.effect("refund_payment", fn(refund: Refund, key) {
-  let shop = case key.correlation {
+  let shop = case saga.correlation_of(key) {
     Some(correlation) -> shop.correlated(shop, correlation)
     None -> shop
   }
@@ -70,58 +88,78 @@ saga.effect("refund_payment", fn(refund: Refund, key) {
 })
 ```
 
-### A durable execution without `with_correlation` is correlated by its id
+| Run                                                     | `saga.correlation_of(key)`                       |
+| ------------------------------------------------------- | ------------------------------------------------ |
+| local, `execution.with_correlation(c)`                  | `Some(c)`                                        |
+| local, none set                                         | `None`                                           |
+| durable, first drive with `durable.with_correlation(c)` | `Some(c)`, on every drive of the execution       |
+| durable, first drive with none set                      | `Some(correlation.from_key(id))`, on every drive |
+| durable, saved before this release (format 1)           | `Some(correlation.from_key(id))`                 |
+
+The value is the one the run's `saga/telemetry` events carry in
+`metadata.correlation`.
+
+### A durable execution keeps one correlation
 
 ```gleam
 // before
-let run = durable.start_or_reconnect(persistence, storage, id: "refund-7", input: i)
-// events: correlation: None; steps: no correlation
+durable.start_or_reconnect(persistence, storage, id: "refund-7", input: i)
+// events: correlation None unless the handle called with_correlation, and
+// each drive used whatever its own handle carried
 // after: same call
-// events: correlation: Some(correlation.from_key("refund-7")); steps: the same
+// the first drive saves its correlation (the handle's, or from_key("refund-7"))
+// and every later drive reads it back, whatever its handle carries
 ```
 
-`from_key` is stable, so every drive and every VM that reconnects to the
-execution reports the same value without calling `with_correlation`. A
-handle that calls `durable.with_correlation` is unchanged, and so are local
-runs. A handler that counted durable events with `correlation: None` as
-"uncorrelated" now sees `Some`.
+- **Set `durable.with_correlation` before the first `drive`.** The first
+  drive saves the value it uses with the checkpoint, before it dispatches
+  anything. A `with_correlation` on a later handle is ignored.
+- **Old records.** The checkpoint format is now 2 and holds the correlation.
+  A format 1 record still reads; it means `from_key(id)`, whatever a handle
+  supplies, and its next commit saves it in format 2. A binary that reads
+  format 2 is the only one that can read it back: an older saga cannot read
+  a record that this release has written. Saga is unpublished, so no stored
+  record outside tests and the apps is affected.
+- **One extra commit.** The first drive of an execution commits once to save
+  the correlation, so storage-failure injection that counts commits sees one
+  more on a first drive. Later drives are unchanged.
+- **Handlers.** A handler that counted durable events with `correlation: None`
+  as uncorrelated now sees `Some`.
+
+Dependents that start durable executions (`checkout/jobs.gleam:86`,
+`research_agent/publish.gleam:174`) call `durable.with_correlation` on the
+handle before `drive` and are unchanged.
 
 ## Dependents
 
-Searched `/code/gleam-dream/*/src`, `*/test`, `*/integrations`, `*/consumers`,
-`*/examples` and `/code/gleam-dream/oversight/apps`. No dependent breaks, and
-none needs a change to build.
+No dependent needs more than the accessor change above.
 
-| Dependent                                                         | Use of the changed items                                                                                                                                         | Effect                                                                                                                                                                                       |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fabric/integrations/fabric_saga`                                 | `saga.effect` in tests; runs the saga with `execution.with_correlation(config, call.correlation)`                                                                | A step of a fabric tool's saga reads the fabric run's correlation from its `EffectKey`.                                                                                                      |
-| `fabric/experiments/workflow_composition`, `fabric/consumers/app` | `saga.step`, `saga.effect`                                                                                                                                       | None.                                                                                                                                                                                        |
-| `saga/integrations/saga_postgres`                                 | `saga.step`, `saga.effect` in tests; storage conformance                                                                                                         | None.                                                                                                                                                                                        |
-| `oversight/apps/support_desk`                                     | `refund.gleam`: `Refund(shop, request)` carries a per-ticket `shop.correlated(shop, call.correlation)` because a step has no run context                         | The wrapper can go: build the workflow with one shop and let `refund_payment`, `write_ledger` and `notify_customer` use `saga.effect` and correlate from `key.correlation` (SD-2 residue).   |
-| `oversight/apps/research_agent`                                   | `publish.gleam`: `workflow(client, base)` takes a client that the job correlates by hand (`jobs.handle`); `durable.with_correlation(correlation)` is set already | `create_draft` already uses `saga.effect`; `upload_body` and `publish` become `saga.effect` and call `http_gun.with_correlation(client, c)` from `key.correlation`; the job's one line goes. |
-| `oversight/apps/checkout`                                         | `workflow.gleam`: `Deps.client_for(order_id)` builds a correlated http_gun client per order; `durable.with_correlation` and `execution.with_correlation` are set | Steps can correlate from `key.correlation` instead of `client_for(order_id)`; optional.                                                                                                      |
-| `saga/examples/order_consumer`                                    | `readme_test.readme_step_correlation_test`                                                                                                                       | New example of the step reading its correlation.                                                                                                                                             |
+| Dependent                         | Effect                                                                                                                                                        |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fabric/integrations/fabric_saga` | Runs the saga with `execution.with_correlation(config, call.correlation)`; a step of a fabric tool's saga can now read the run's correlation from its key.    |
+| `oversight/apps/support_desk`     | `Refund(shop, request)` carries a per-ticket correlated shop only because a step had no run context. The wrapper can go: `saga.effect` plus `correlation_of`. |
+| `oversight/apps/research_agent`   | `upload_body` and `publish` can become `saga.effect` and correlate their client from the key; the job's by-hand correlation of the client goes.               |
+| `oversight/apps/checkout`         | Steps can correlate from the key instead of `Deps.client_for(order_id)`; optional.                                                                            |
+| `saga/examples/order_consumer`    | `readme_step_correlation_test` shows the step reading its correlation.                                                                                        |
 
-These app edits are optional simplifications; the apps are migrated after
-this wave by other agents.
+These app edits are optional simplifications; the apps are migrated after this
+wave by other agents.
 
 ## Telemetry completeness
 
 `saga/telemetry` has six events (`run_started`, `run_stopped`,
 `step_started`, `step_stopped`, `compensation_stopped`, `undo_stopped`). Each
-metadata record carries `correlation`, and the coordinator fills it from one
-field of the run state for every event, including the events a restarted
-execution emits for work that it resumes (undo after restart, compensation
-resolution). The gaps found:
+metadata record carries `correlation`, filled from one field of the run state
+for every event, including the events a restarted execution emits for work it
+resumes. The gaps found are fixed:
 
-- A durable handle that forgot `with_correlation` after a restart emitted
-  `None`. Fixed by the default above.
-- A step could not read the value that its own events carry. Fixed by
-  `EffectKey.correlation`.
-- Not changed: the correlation is not saved in the checkpoint, so a drive
-  with `with_correlation` and a later drive without it report different
-  values for the same execution (`c` and `from_key(id)`). Keep one source of
-  truth per application, as research_agent does with the research id.
-- Not changed: the durable layer emits no event of its own (claim, release,
-  lease loss, checkpoint write). If the owner wants them, they are new
-  events, not a correlation gap.
+- A durable handle without `with_correlation` emitted `None`: now `from_key(id)`.
+- A drive on a handle that forgot `with_correlation` after a restart
+  reported a different value than the first drive: now every drive reports
+  the saved one.
+- A step could not read the value that its own events carry: now
+  `saga.correlation_of(key)`.
+
+Not changed: the durable layer emits no event of its own (claim, release,
+lease loss, checkpoint write). Those would be new events, not a correlation
+gap.

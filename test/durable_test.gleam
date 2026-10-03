@@ -253,7 +253,7 @@ pub fn saved_success_and_uncertain_effect_resume_test() {
     key,
   ))) = drive(unrecovered)
   step |> should.equal(at("uncertain"))
-  key.attempt |> should.equal(1)
+  saga.attempt_number(key) |> should.equal(1)
   let assert Ok(durable.Suspended(durable.RecoveryRequired(_))) =
     durable.read(unrecovered)
   drive(reconnect(build(True), backend, "recover"))
@@ -479,8 +479,9 @@ pub fn restart_recovers_two_concurrent_admissions_test() {
   original
   |> should.equal(list.sort([resolved_first, resolved_second], by_name))
   let assert [#("a", a_key), #("b", b_key)] = original
-  { a_key.idempotency != b_key.idempotency } |> should.be_true
-  string.contains(a_key.idempotency, "two") |> should.be_true
+  { saga.idempotency_key(a_key) != saga.idempotency_key(b_key) }
+  |> should.be_true
+  string.contains(saga.idempotency_key(a_key), "two") |> should.be_true
   memory.stop(store)
 }
 
@@ -855,7 +856,7 @@ fn resolve_interrupted(
       })
       |> durable.restore_undo(fn(_undo) { saga.NoUndo })
       |> durable.resolve_compensation(fn(_, key) {
-        key.attempt |> should.equal(1)
+        saga.attempt_number(key) |> should.equal(1)
         Some(decision)
       })
       |> saga.map_step_errors(fn(e) { "mapped " <> e }, fn(u) { "mapped " <> u })
@@ -1420,7 +1421,7 @@ pub fn classified_error_survives_a_restart_in_its_decision_test() {
   let make = fn(recovering) {
     let step =
       saga.effect("charge", fn(value, key: saga.EffectKey) {
-        case key.attempt {
+        case saga.attempt_number(key) {
           1 -> Error("maybe charged")
           _ -> Ok(value <> " charged")
         }

@@ -4,6 +4,7 @@
 header(Bytes) ->
     try binary_to_term(Bytes,[safe]) of
         {envelope,1,Ref,Stamp,_,_,_,_} when is_binary(Ref),is_binary(Stamp) -> {ok,{Ref,Stamp}};
+        {envelope,2,Ref,Stamp,_,_,_,_,_} when is_binary(Ref),is_binary(Stamp) -> {ok,{Ref,Stamp}};
         _ -> {error,nil}
     catch _:_ -> {error,nil} end.
 
@@ -16,11 +17,16 @@ encode(Value,O,E,U) ->
     catch throw:{codec,Type,Reason} -> {error,{codec_failure,boundary(Type),Reason}}; _:_ -> {error,{invalid_state,malformed}} end.
 decode(Bytes,O,E,U) ->
     try
-        Value=binary_to_term(Bytes,[safe]),
+        Value=upgrade(binary_to_term(Bytes,[safe])),
         Decoded=walk(Value,envelope,{decode,O,E,U}),
         validate(Decoded),
         {ok,Decoded}
     catch throw:{codec,Type,Reason} -> {error,{codec_failure,boundary(Type),Reason}}; _:_ -> {error,{invalid_state,malformed}} end.
+
+%% Format 1 had no correlation: it reads as a format 1 envelope with none saved.
+upgrade({envelope,1,Ref,Stamp,Input,Snapshot,Outcome,Issue}) ->
+    {envelope,1,Ref,Stamp,Input,Snapshot,Outcome,Issue,none};
+upgrade(Value) -> Value.
 
 boundary(output) -> run_output;
 boundary(error) -> run_error;
@@ -53,7 +59,7 @@ walk(Value,Type,Codecs) ->
     Results=[walk(V,S,Codecs) || {V,S} <- lists:zip(Fields,Specs)],
     case Results of [] -> Tag; _ -> list_to_tuple([Tag|Results]) end.
 
-schema(envelope) -> [{envelope,[int,string,string,string,{option,snapshot},{option,outcome},{option,checkpoint_failure}]}];
+schema(envelope) -> [{envelope,[int,string,string,string,{option,snapshot},{option,outcome},{option,checkpoint_failure},{option,string}]}];
 schema(checkpoint_failure) -> [{storage_failure,[storage_error]}, {codec_failure,[boundary,codec_error]},
     {invalid_state,[problem]}, {uncertain,[required]}, {too_large,[natural,natural]}];
 schema(storage_error) -> [{not_found,[]},{already_exists,[]},{busy,[]},{conflict,[]},{stale_owner,[]},
@@ -98,8 +104,10 @@ schema(unknown) -> [{unknown_effect,[address,action,ending]}];
 schema(action) -> [{step_attempt,[natural]},{step_compensation,[natural]},{step_undo,[]}];
 schema(ending) -> [{action_crashed,[crash]},{action_timed_out,[]},{action_interrupted,[]},{action_returned_unknown,[]}].
 
-validate({envelope,1,_,_,_,none,none,_}) -> ok;
-validate({envelope,1,_,_,_,{some,{snapshot,Nodes,Journal,Phase,Failures,_,_}},_,_}) ->
+validate({envelope,F,_,_,_,_,_,_,_}=Envelope) when F=:=1;F=:=2 -> validate_body(Envelope).
+
+validate_body({envelope,_,_,_,_,none,none,_,_}) -> ok;
+validate_body({envelope,_,_,_,_,{some,{snapshot,Nodes,Journal,Phase,Failures,_,_}},_,_,_}) ->
     N=length(Nodes),
     true=lists:all(fun(I) -> I<N end,Journal),
     true=length(Journal)=:=length(lists:usort(Journal)),

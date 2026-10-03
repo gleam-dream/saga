@@ -37,7 +37,7 @@
 ////     )
 ////     |> saga.perform(
 ////       saga.effect("charge_payment", fn(reservation, key) {
-////         charge(reservation, idempotency_key: key.idempotency)
+////         charge(reservation, idempotency_key: saga.idempotency_key(key))
 ////       })
 ////       |> saga.unknown_when(is_maybe_sent),
 ////     )
@@ -76,16 +76,17 @@ pub type StepAddress {
 }
 
 /// The context of one action of a step, for external systems: its keys and
-/// the correlation of its run.
+/// the correlation of its run. Read it with the accessors below; the type is
+/// opaque, so a later release can add to it without breaking callers.
 ///
-/// - `idempotency` is the same for every attempt of the step within one run
-///   of a local workflow, or one durable execution across restarts. Send it
-///   as the downstream idempotency key, so a retry after an unknown outcome
-///   cannot repeat the effect.
-/// - `attempt` is the 1-based attempt number.
+/// - `idempotency_key` is the same for every attempt of the step within one
+///   run of a local workflow, or one durable execution across restarts. Send
+///   it as the downstream idempotency key, so a retry after an unknown
+///   outcome cannot repeat the effect.
+/// - `attempt_number` is the 1-based attempt number.
 /// - `attempt_key` is unique to this attempt; use it to record or look up
 ///   one attempt.
-/// - `correlation` is the correlation of the run that performs the action:
+/// - `correlation_of` is the correlation of the run that performs the action:
 ///   the one set with `execution.with_correlation` or
 ///   `durable.with_correlation`, which is also the `correlation` of the run's
 ///   `saga/telemetry` events. A durable execution without one carries
@@ -94,15 +95,14 @@ pub type StepAddress {
 ///   step calls, for example `http_gun.with_correlation`, so their events
 ///   join the run's.
 ///
-/// A local run derives `idempotency` from its run id, which is new for every
-/// `execution.run`; a durable execution derives it from the id given to
-/// `durable.start_or_reconnect`, so it survives restarts. The text of a key
-/// is opaque: compare and store it, never parse it.
+/// A local run derives the idempotency key from its run id, which is new for
+/// every `execution.run`; a durable execution derives it from the id given
+/// to `durable.start_or_reconnect`, so it survives restarts. The text of a
+/// key is opaque: compare and store it, never parse it.
 ///
-/// Saga builds this record; read its fields by label. `saga.step` receives
-/// only the step's input: use `saga.effect` for a step that needs the
-/// context. `undo` and `compensate` receive it as `key`.
-pub type EffectKey {
+/// `saga.step` receives only the step's input: use `saga.effect` for a step
+/// that needs the context. `undo` and `compensate` receive it as `key`.
+pub opaque type EffectKey {
   EffectKey(
     idempotency: String,
     attempt: Int,
@@ -111,8 +111,36 @@ pub type EffectKey {
   )
 }
 
+/// The key to send downstream as an idempotency key. It is the same for
+/// every attempt of the step in one run of a local workflow, or one durable
+/// execution across restarts.
+pub fn idempotency_key(key: EffectKey) -> String {
+  key.idempotency
+}
+
+/// The 1-based number of the attempt.
+pub fn attempt_number(key: EffectKey) -> Int {
+  key.attempt
+}
+
+/// A key unique to this attempt, to record or look up one attempt.
+pub fn attempt_key(key: EffectKey) -> String {
+  key.attempt_key
+}
+
+/// The correlation of the run that performs the action; see `EffectKey`.
+pub fn correlation_of(key: EffectKey) -> Option(Correlation) {
+  key.correlation
+}
+
 /// What an undo action receives: the step's input, the output that
 /// succeeded, and the undo action's own `EffectKey`.
+///
+/// Saga builds this record. Read its fields by label (`undo.output`, or
+/// `UndoRequest(output:, ..)` in a pattern), which keeps compiling when a
+/// later release adds a field; do not build or match it positionally. It
+/// stays a public record so that the common callback stays
+/// `fn(undo) { release(undo.output) }`.
 pub type UndoRequest(i, o) {
   UndoRequest(input: i, output: o, key: EffectKey)
 }
@@ -120,6 +148,11 @@ pub type UndoRequest(i, o) {
 /// What a `compensate` decider receives about a failed attempt: the step's
 /// input, why the attempt failed, its 1-based number, how many further
 /// attempts the budget allows, and the failed attempt's `EffectKey`.
+///
+/// Saga builds this record. Read its fields by label (`failed.failure`, or
+/// `FailedAttempt(failure:, ..)` in a pattern); do not build or match it
+/// positionally. It stays a public record so that a decider reads
+/// `failed.failure` directly.
 pub type FailedAttempt(i, e) {
   FailedAttempt(
     input: i,
@@ -385,9 +418,9 @@ pub fn step(name: String, run: fn(i) -> Result(o, e)) -> Step(i, o, e, u) {
 }
 
 /// Creates a step whose run function also receives the attempt's
-/// `EffectKey`. Send `key.idempotency` to the external system as its
+/// `EffectKey`. Send `saga.idempotency_key(key)` to the external system as its
 /// idempotency key: it stays the same across retries, so a retry after an
-/// unknown outcome cannot repeat the effect. `key.correlation` is the run's
+/// unknown outcome cannot repeat the effect. `saga.correlation_of(key)` is the run's
 /// correlation, for the step's own clients.
 pub fn effect(
   name: String,
