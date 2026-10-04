@@ -80,10 +80,7 @@ saga.step("refund_payment", fn(refund: Refund) {
 
 // after: the step correlates its own client from the run
 saga.effect("refund_payment", fn(refund: Refund, key) {
-  let shop = case saga.correlation_of(key) {
-    Some(correlation) -> shop.correlated(shop, correlation)
-    None -> shop
-  }
+  let shop = shop.correlated(shop, saga.correlation_of(key))
   shop.refund(shop, refund.request)
 })
 ```
