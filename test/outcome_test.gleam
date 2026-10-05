@@ -2,6 +2,7 @@
 //// (`saga/outcome`), one row of the module's table per
 //// test, over reports built the way Saga builds them.
 
+import gleam/list
 import gleam/string
 import gleeunit/should
 import saga
@@ -293,7 +294,7 @@ pub fn an_unresolved_workflow_is_uncertain_test() {
     )
   evidence
   |> should.equal(
-    "the workflow's effects are not known: the workflow held the effects of step charge unresolved: explained hold; held charge (Saga reported unresolved at charge)",
+    "the workflow's effects are not known: the workflow held the effects of step charge unresolved: explained hold; Saga reported unresolved at charge; held charge",
   )
 }
 
@@ -390,4 +391,102 @@ pub fn outcome_kind_and_held_steps_are_actionable_without_rendering_errors_test(
   verdict.describe_failure(error)
   |> string.contains("explained private error")
   |> should.be_true
+}
+
+pub fn every_stopped_outcome_describes_all_settlement_categories_test() {
+  let secret = "PAYLOAD-MUST-NOT-BE-RENDERED"
+  let settlement =
+    execution.Settlement(
+      undone: [at("reserved")],
+      held: [at("held")],
+      not_undoable: [at("no_undo")],
+      interrupted: [at("running")],
+      undo_failures: [
+        execution.UndoFailed(at("undo_error"), secret),
+        execution.UndoCrashed(
+          at("undo_crash"),
+          saga.Crash(saga.ErrorClass, secret),
+        ),
+        execution.UndoTimedOut(at("undo_timeout")),
+      ],
+      compensation_failures: [
+        execution.CleanupFailed(at("cleanup_error"), secret),
+        execution.CompensationCrashed(
+          at("cleanup_crash"),
+          saga.Crash(saga.ErrorClass, secret),
+        ),
+        execution.CompensationTimedOut(at("cleanup_timeout")),
+      ],
+      sibling_failures: [execution.StepFailed(at("sibling"), secret)],
+      unknown_effects: [
+        effect("held", execution.StepAttempt(1), crash(secret)),
+        effect("held", execution.StepAttempt(2), execution.ActionTimedOut),
+        effect(
+          "held",
+          execution.StepCompensation(2),
+          execution.ActionInterrupted,
+        ),
+        effect("held", execution.StepUndo, execution.ActionReturnedUnknown),
+      ],
+    )
+  [
+    execution.Failed(execution.StepFailed(at("cause"), secret), settlement),
+    execution.Cancelled(execution.OwnerExited, settlement),
+    execution.Unresolved(at("held"), secret, settlement),
+  ]
+  |> list.each(fn(report) {
+    let text = verdict.summary(report)
+    [
+      "undone reserved",
+      "held held",
+      "without an undo no_undo",
+      "interrupted running",
+      "undo_error",
+      "undo_crash",
+      "undo_timeout",
+      "cleanup_error",
+      "cleanup_crash",
+      "cleanup_timeout",
+      "sibling",
+      "attempt 1 of step held crashed",
+      "attempt 2 of step held timed out",
+      "recovery decision on attempt 2 of step held was interrupted",
+      "undo of step held returned an error after which its effect is unknown",
+    ]
+    |> list.each(fn(expected) {
+      string.contains(text, expected) |> should.be_true
+    })
+    string.contains(text, secret) |> should.be_false
+    verdict.summary(report) |> should.equal(text)
+    verdict.kind(report) |> should.equal(verdict.Unresolved)
+  })
+}
+
+pub fn safe_summary_preserves_sibling_and_retry_cause_kinds_test() {
+  let settlement =
+    execution.Settlement(..clean(), sibling_failures: [
+      execution.OutputCrashed(saga.Crash(saga.ErrorClass, "PAYLOAD")),
+      execution.DeadlineExceeded,
+      execution.RetryLimitReached(at("retry"), saga.TimedOut),
+    ])
+  let text =
+    verdict.summary(execution.Failed(
+      execution.RetrySuperseded(
+        at("charge"),
+        saga.Crashed(saga.Crash(saga.ErrorClass, "PAYLOAD")),
+      ),
+      settlement,
+    ))
+  [
+    "retry superseded",
+    "crash",
+    "output crash",
+    "deadline exceeded",
+    "retry limit",
+    "timeout",
+  ]
+  |> list.each(fn(expected) {
+    string.contains(text, expected) |> should.be_true
+  })
+  string.contains(text, "PAYLOAD") |> should.be_false
 }

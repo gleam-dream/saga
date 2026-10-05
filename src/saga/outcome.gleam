@@ -36,9 +36,8 @@
 //// `Unresolved` carries the error the step held its effects on (the error
 //// `saga.unknown_when` marked, or a recovery decision's `Hold(evidence)`).
 //// The evidence renders it with `explain`, the application's own wording,
-//// after the held step: `the workflow held the effects of step refund
-//// unresolved: <explain(error)>`, so the person who reconciles the call
-//// reads what the step reported.
+//// after the held step, followed by the complete safe summary. The person
+//// who reconciles the call can associate the error with that step.
 ////
 //// Saga's report (`summary`) names outcome kinds, actions and step
 //// addresses only: never a step's typed error, output, or crash reason,
@@ -64,29 +63,29 @@ pub fn classify(
   outcome: execution.Outcome(output, error, undo_error),
   explain: fn(error) -> String,
 ) -> Result(output, Failure) {
-  let report = summary(outcome)
-  let effects = unknown_effects(execution.unknown_effects(outcome))
+  let facts = evidence(outcome)
+  let report = render(facts)
+  let effects = facts.unknown
+  let remaining = list.any(facts.settlement, fn(fact) { fact.retained_effect })
   case outcome {
     execution.Completed(output) -> Ok(output)
-    execution.CompletedWithUnknownEffects(..) -> Error(unknown(effects, report))
-    execution.Unresolved(step, evidence, settlement) ->
-      Error(unknown(
-        [
-          "the workflow held the effects of step "
-            <> saga.address_to_string(step)
-            <> " unresolved: "
-            <> explain(evidence),
-          ..list.append(effects, left_in_place(settlement))
-        ],
-        report,
+    execution.CompletedWithUnknownEffects(..) -> Error(unknown(report))
+    execution.Unresolved(step, held_error, _) ->
+      Error(Unknown(
+        "the workflow's effects are not known: the workflow held the effects of step "
+        <> saga.address_to_string(step)
+        <> " unresolved: "
+        <> explain(held_error)
+        <> "; Saga reported "
+        <> report,
       ))
-    execution.Failed(cause, settlement) ->
-      stopped(failure(cause, explain), effects, settlement, report)
-    execution.Cancelled(_, settlement) ->
+    execution.Failed(cause, _) ->
+      stopped(failure(cause, explain), effects, remaining, report)
+    execution.Cancelled(_, _) ->
       stopped(
         Ok("the workflow was cancelled; every completed step was undone"),
         effects,
-        settlement,
+        remaining,
         report,
       )
   }
@@ -97,12 +96,12 @@ pub fn classify(
 fn stopped(
   message: Result(String, Nil),
   effects: List(String),
-  settlement: execution.Settlement(error, undo_error),
+  remaining: Bool,
   report: String,
 ) -> Result(output, Failure) {
-  case message, list.append(effects, left_in_place(settlement)) {
-    Ok(message), [] -> Error(Definitely(message))
-    _, reasons -> Error(unknown(reasons, report))
+  case message, effects, remaining {
+    Ok(message), [], False -> Error(Definitely(message))
+    _, _, _ -> Error(unknown(report))
   }
 }
 
@@ -128,26 +127,8 @@ fn failure(
   }
 }
 
-fn unknown(reasons: List(String), report: String) -> Failure {
-  Unknown(
-    "the workflow's effects are not known: "
-    <> string.join(reasons, "; ")
-    <> " (Saga reported "
-    <> report
-    <> ")",
-  )
-}
-
-/// Each action that ended without a result, as one reason; `[]` when every
-/// action returned.
-fn unknown_effects(effects: List(execution.UnknownEffect)) -> List(String) {
-  case effects {
-    [] -> []
-    effects -> [
-      "these actions ended without a result, so their effect is unknown: "
-      <> string.join(list.map(effects, describe_effect), ", "),
-    ]
-  }
+fn unknown(report: String) -> Failure {
+  Unknown("the workflow's effects are not known: Saga reported " <> report)
 }
 
 fn describe_effect(effect: execution.UnknownEffect) -> String {
@@ -172,63 +153,79 @@ fn describe_effect(effect: execution.UnknownEffect) -> String {
   }
 }
 
-/// The known effects the settlement left in place.
-fn left_in_place(
-  settlement: execution.Settlement(error, undo_error),
-) -> List(String) {
-  let not_undone =
-    list.filter_map(settlement.undo_failures, fn(failure) {
-      case failure {
-        execution.UndoFailed(step, _) -> Ok(step)
-        // Unknown effects, named by `unknown_effects`.
-        execution.UndoCrashed(..) | execution.UndoTimedOut(_) -> Error(Nil)
-      }
-    })
-  let not_cleaned_up =
-    list.filter_map(settlement.compensation_failures, fn(failure) {
-      case failure {
-        execution.CleanupFailed(step, _) -> Ok(step)
-        execution.CompensationCrashed(..) | execution.CompensationTimedOut(_) ->
-          Error(Nil)
-      }
-    })
-  [
-    #("not undone", not_undone),
-    #("not cleaned up", not_cleaned_up),
-    #("held", settlement.held),
-    #("without an undo", settlement.not_undoable),
-  ]
-  |> list.filter_map(fn(entry) {
-    case entry.1 {
-      [] -> Error(Nil)
-      steps -> Ok(entry.0 <> " " <> addresses(steps))
-    }
-  })
-}
-
-/// Saga's report without application data: the outcome's kind, its cause's
-/// kind and step, and the settlement's steps.
+/// Saga's report without application data: outcome and cause kinds, step
+/// addresses, every settlement category, and each unknown action and attempt.
+/// Categories have a fixed order; steps and attempts retain report order.
 pub fn summary(
   outcome: execution.Outcome(output, error, undo_error),
 ) -> String {
+  render(evidence(outcome))
+}
+
+// One data-safe projection serves classification and rendering. The original
+// execution report remains the public authority for typed application evidence.
+type Evidence {
+  Evidence(
+    kind: String,
+    unknown: List(String),
+    settlement: List(SettlementFact),
+  )
+}
+
+fn evidence(outcome: execution.Outcome(o, e, u)) -> Evidence {
   case outcome {
-    execution.Completed(_) -> "completed"
+    execution.Completed(_) -> Evidence("completed", [], [])
     execution.CompletedWithUnknownEffects(_, effects) ->
-      "completed with unknown effects: "
-      <> string.join(list.map(effects, describe_effect), ", ")
+      Evidence(
+        "completed with unknown effects",
+        list.map(effects, describe_effect),
+        [],
+      )
     execution.Failed(cause, settlement) ->
-      "failed: " <> describe_cause(cause) <> settled(settlement)
-    execution.Cancelled(reason, settlement) ->
-      "cancelled ("
-      <> case reason {
-        execution.CancelRequested -> "requested"
-        execution.OwnerExited -> "owner exited"
+      stopped_evidence("failed: " <> describe_cause(cause), settlement)
+    execution.Cancelled(reason, settlement) -> {
+      let kind = case reason {
+        execution.CancelRequested -> "cancelled (requested)"
+        execution.OwnerExited -> "cancelled (owner exited)"
       }
-      <> ")"
-      <> settled(settlement)
+      stopped_evidence(kind, settlement)
+    }
     execution.Unresolved(step, _, settlement) ->
-      "unresolved at " <> saga.address_to_string(step) <> settled(settlement)
+      stopped_evidence(
+        "unresolved at " <> saga.address_to_string(step),
+        settlement,
+      )
   }
+}
+
+fn stopped_evidence(
+  kind: String,
+  settlement: execution.Settlement(e, u),
+) -> Evidence {
+  Evidence(
+    kind,
+    list.map(settlement.unknown_effects, describe_effect),
+    settled(settlement),
+  )
+}
+
+fn render(facts: Evidence) -> String {
+  let effects = case facts.unknown {
+    [] -> []
+    effects -> [
+      "unknown effects: " <> string.join(effects, ", "),
+    ]
+  }
+  string.join(
+    [
+      facts.kind,
+      ..list.append(
+        list.map(facts.settlement, fn(fact) { fact.description }),
+        effects,
+      )
+    ],
+    "; ",
+  )
 }
 
 fn describe_cause(cause: execution.Cause(error)) -> String {
@@ -239,39 +236,95 @@ fn describe_cause(cause: execution.Cause(error)) -> String {
       "crash of " <> saga.address_to_string(step)
     execution.StepTimedOut(step) ->
       "timeout of " <> saga.address_to_string(step)
-    execution.RetryLimitReached(step, _) ->
-      "retry limit of " <> saga.address_to_string(step)
-    execution.RetrySuperseded(step, _) ->
-      "retry superseded of " <> saga.address_to_string(step)
+    execution.RetryLimitReached(step, last) ->
+      "retry limit of "
+      <> saga.address_to_string(step)
+      <> " ("
+      <> attempt_kind(last)
+      <> ")"
+    execution.RetrySuperseded(step, last) ->
+      "retry superseded of "
+      <> saga.address_to_string(step)
+      <> " ("
+      <> attempt_kind(last)
+      <> ")"
     execution.OutputCrashed(_) -> "output crash"
     execution.DeadlineExceeded -> "deadline exceeded"
   }
 }
 
-fn settled(settlement: execution.Settlement(error, undo_error)) -> String {
-  [
-    #("undone", settlement.undone),
-    #(
-      "sibling failures",
-      list.filter_map(settlement.sibling_failures, fn(cause) {
-        case cause {
-          execution.StepFailed(step, _)
-          | execution.StepCrashed(step, _)
-          | execution.StepTimedOut(step)
-          | execution.RetryLimitReached(step, _)
-          | execution.RetrySuperseded(step, _) -> Ok(step)
-          execution.OutputCrashed(_) | execution.DeadlineExceeded -> Error(Nil)
-        }
-      }),
-    ),
-  ]
-  |> list.filter_map(fn(entry) {
-    case entry.1 {
-      [] -> Error(Nil)
-      steps -> Ok("; " <> entry.0 <> " " <> addresses(steps))
-    }
-  })
-  |> string.concat
+fn attempt_kind(last: saga.AttemptFailure(e)) -> String {
+  case last {
+    saga.Returned(_) -> "typed error"
+    saga.Crashed(_) -> "crash"
+    saga.TimedOut -> "timeout"
+  }
+}
+
+type SettlementFact {
+  SettlementFact(description: String, retained_effect: Bool)
+}
+
+fn settled(
+  settlement: execution.Settlement(error, undo_error),
+) -> List(SettlementFact) {
+  let steps =
+    [
+      #("undone", settlement.undone, False),
+      #("held", settlement.held, True),
+      #("without an undo", settlement.not_undoable, True),
+      #("interrupted", settlement.interrupted, False),
+    ]
+    |> list.filter_map(fn(entry) {
+      case entry.1 {
+        [] -> Error(Nil)
+        steps -> Ok(SettlementFact(entry.0 <> " " <> addresses(steps), entry.2))
+      }
+    })
+  let undos =
+    list.map(settlement.undo_failures, fn(failure) {
+      case failure {
+        execution.UndoFailed(step, _) ->
+          SettlementFact(
+            "not undone " <> saga.address_to_string(step) <> " (typed error)",
+            True,
+          )
+        execution.UndoCrashed(step, _) ->
+          SettlementFact("undo crashed " <> saga.address_to_string(step), False)
+        execution.UndoTimedOut(step) ->
+          SettlementFact(
+            "undo timed out " <> saga.address_to_string(step),
+            False,
+          )
+      }
+    })
+  let compensations =
+    list.map(settlement.compensation_failures, fn(failure) {
+      case failure {
+        execution.CleanupFailed(step, _) ->
+          SettlementFact(
+            "not cleaned up "
+              <> saga.address_to_string(step)
+              <> " (typed error)",
+            True,
+          )
+        execution.CompensationCrashed(step, _) ->
+          SettlementFact(
+            "compensation crashed " <> saga.address_to_string(step),
+            False,
+          )
+        execution.CompensationTimedOut(step) ->
+          SettlementFact(
+            "compensation timed out " <> saga.address_to_string(step),
+            False,
+          )
+      }
+    })
+  let siblings =
+    list.map(settlement.sibling_failures, fn(cause) {
+      SettlementFact("sibling failure: " <> describe_cause(cause), False)
+    })
+  list.flatten([steps, undos, compensations, siblings])
 }
 
 fn addresses(steps: List(StepAddress)) -> String {

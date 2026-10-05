@@ -1,3 +1,4 @@
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleeunit/should
 import saga/internal/ffi
@@ -16,8 +17,8 @@ pub fn receiver_death_is_a_result_and_preserves_unrelated_messages_test() {
   |> should.equal(Ok(Nil))
   process.demonitor_process(exited)
   let monitor = process.monitor(receiver)
-  startup.await(receiver, monitor, ready, close_ready, 1000)
-  |> should.equal(Error(startup.ReceiverExited))
+  let assert Error(startup.ReceiverExited(_)) =
+    startup.await(receiver, monitor, ready, close_ready, 1000)
   process.receive(unrelated, 0) |> should.equal(Ok("keep"))
   send_ready(42)
   process.receive(ready, 0) |> should.equal(Error(Nil))
@@ -73,4 +74,19 @@ fn no_monitor_message() -> Nil {
   |> process.select_monitors(fn(_) { Nil })
   |> process.selector_receive(0)
   |> should.equal(Error(Nil))
+}
+
+pub fn startup_preserves_the_actual_receiver_exit_reason_test() {
+  let ready = process.new_subject()
+  let #(_, close_ready) = ffi.aliased_sender(ready)
+  let receiver =
+    process.spawn_unlinked(fn() {
+      process.receive_forever(process.new_subject())
+    })
+  let monitor = process.monitor(receiver)
+  process.send_abnormal_exit(receiver, "PRIVATE-EXIT-CAUSE")
+  let assert Error(startup.ReceiverExited(process.Abnormal(reason))) =
+    startup.await(receiver, monitor, ready, close_ready, 1000)
+  decode.run(reason, decode.string) |> should.equal(Ok("PRIVATE-EXIT-CAUSE"))
+  no_monitor_message()
 }

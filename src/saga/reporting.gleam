@@ -1,13 +1,14 @@
 //// Reporting for a short-lived task that owns a workflow execution.
-//// `run_owned` returns its classified outcome while the task lives. If the
+//// `run_owned` returns its full execution report while the task lives. If the
 //// task exits abnormally, the independent receiver waits for compensation and
-//// calls `on_stopped` with the same result and a data-safe summary. The receiver
+//// calls `on_stopped` with the same full-report result. The receiver
 //// monitors the task until it exits, even after returning a result: use this
 //// boundary inside a per-invocation worker, not a long-lived server process.
 //// `rollback_within` bounds waiting when the owner dies before reporting whether
 //// it started a coordinator; normal execution follows `execution.Config`.
 //// Receiver readiness has a five-second bound. A receiver that exits or
-//// misses that deadline produces a definite failure before the workflow starts.
+//// misses that deadline produces a typed error with `NotStarted` effect status
+//// before the workflow starts.
 //// Its startup channel and monitor are discarded without consuming other mail.
 //// The notification callback runs in a guarded worker, bounded by the same
 //// `rollback_within` duration; a crash or timeout leaves delivery unconfirmed.
@@ -22,19 +23,114 @@ import saga
 import saga/execution
 import saga/internal/ffi
 import saga/internal/reporting_startup
-import saga/outcome.{Definitely, Unknown}
 
-/// What the receiver learns about the Saga run.
-type Delivery(o, e, u) {
-  Delivered(execution.Outcome(o, e, u))
-  /// The coordinator exited without an outcome.
-  RunLost
+/// A failure to obtain an execution report. Workflow failures are retained in
+/// `Ok(execution.Outcome)`, including their native business and undo errors.
+pub opaque type Error {
+  InvalidRollbackBound(Duration)
+  StartupExited(process.ExitReason)
+  StartupTimedOut
+  AdmissionFailed(execution.RunError)
+  ReceiverReportLost(process.ExitReason)
+  CoordinatorReportLost(process.ExitReason)
 }
+
+/// Stable operational categories; use the cause accessors for typed evidence.
+pub type ErrorKind {
+  InvalidRollback
+  ReceiverStartupExited
+  ReceiverStartupTimedOut
+  ExecutionAdmission
+  ReceiverLost
+  CoordinatorLost
+}
+
+/// What an operational error proves about workflow effects. Neither status
+/// grants permission to retry; the caller owns its business retry policy.
+pub type EffectStatus {
+  NotStarted
+  Unknown
+}
+
+pub fn error_kind(error: Error) -> ErrorKind {
+  case error {
+    InvalidRollbackBound(_) -> InvalidRollback
+    StartupExited(_) -> ReceiverStartupExited
+    StartupTimedOut -> ReceiverStartupTimedOut
+    AdmissionFailed(_) -> ExecutionAdmission
+    ReceiverReportLost(_) -> ReceiverLost
+    CoordinatorReportLost(_) -> CoordinatorLost
+  }
+}
+
+pub fn effect_status(error: Error) -> EffectStatus {
+  case error {
+    InvalidRollbackBound(_)
+    | StartupExited(_)
+    | StartupTimedOut
+    | AdmissionFailed(execution.InvalidConfig(_)) -> NotStarted
+    // The coordinator can already be running when its startup handshake is lost.
+    AdmissionFailed(execution.ExecutionLost(_))
+    | ReceiverReportLost(_)
+    | CoordinatorReportLost(_) -> Unknown
+  }
+}
+
+/// The original execution-admission cause, including typed configuration
+/// errors or the execution's crash evidence. Crash text can contain private data.
+pub fn run_error(error: Error) -> Option(execution.RunError) {
+  case error {
+    AdmissionFailed(cause) -> Some(cause)
+    _ -> None
+  }
+}
+
+/// Available process exit evidence, unchanged. An abnormal reason may contain
+/// application data; use `describe_error` for a data-safe message.
+pub fn exit_reason(error: Error) -> Option(process.ExitReason) {
+  case error {
+    StartupExited(reason)
+    | ReceiverReportLost(reason)
+    | CoordinatorReportLost(reason) -> Some(reason)
+    _ -> None
+  }
+}
+
+pub fn invalid_rollback_within(error: Error) -> Option(Duration) {
+  case error {
+    InvalidRollbackBound(value) -> Some(value)
+    _ -> None
+  }
+}
+
+/// A safe description, excluding crash and application payloads.
+pub fn describe_error(error: Error) -> String {
+  case error {
+    InvalidRollbackBound(_) ->
+      "rollback_within must be between 1 ms and 2^32 - 1 ms"
+    StartupExited(_) -> "the workflow receiver exited before it became ready"
+    StartupTimedOut ->
+      "the workflow receiver did not become ready within 5 seconds"
+    AdmissionFailed(execution.InvalidConfig(errors)) ->
+      "the workflow is misconfigured: "
+      <> string.join(list.map(errors, execution.describe_config_error), "; ")
+    AdmissionFailed(execution.ExecutionLost(_)) ->
+      "the workflow startup handshake was lost; its effects are unknown"
+    ReceiverReportLost(_) ->
+      "the workflow receiver exited without delivering an outcome; its effects are unknown"
+    CoordinatorReportLost(_) ->
+      "the workflow coordinator exited without an outcome; its effects are unknown"
+  }
+}
+
+type Delivery(o, e, u) =
+  Result(execution.Outcome(o, e, u), Error)
 
 /// What the task tells the receiver after starting the Saga run.
 type Start {
   Started(coordinator: Pid)
-  NotStarted
+  // Admission failed; a lost startup handshake cannot prove no work started.
+  NoHandle
 }
 
 /// Runs the workflow in the calling task, which owns the Saga run, and
@@ -43,20 +139,18 @@ pub fn run_owned(
   workflow: saga.Workflow(input, output, error, undo_error),
   input: input,
   config: execution.Config,
-  explain: fn(error) -> String,
-  on_stopped: fn(Result(output, outcome.Failure), String) -> Nil,
+  on_stopped: fn(Result(execution.Outcome(output, error, undo_error), Error)) ->
+    Nil,
   rollback_within: Duration,
-) -> Result(output, outcome.Failure) {
+) -> Result(execution.Outcome(output, error, undo_error), Error) {
   let milliseconds = duration.to_milliseconds(rollback_within)
   case milliseconds >= 1 && milliseconds <= 4_294_967_295 {
-    False ->
-      Error(Definitely("rollback_within must be between 1 ms and 2^32 - 1 ms"))
-    True -> run(workflow, input, config, explain, on_stopped, milliseconds)
+    False -> Error(InvalidRollbackBound(rollback_within))
+    True -> run(workflow, input, config, on_stopped, milliseconds)
   }
 }
 
-fn run(workflow, input, config, explain, on_stopped, rollback_within) {
-  let judge = fn(delivery) { classify(delivery, explain) }
+fn run(workflow, input, config, on_stopped, rollback_within) {
   let task = process.self()
   let forward = process.new_subject()
   let ready = process.new_subject()
@@ -73,11 +167,7 @@ fn run(workflow, input, config, explain, on_stopped, rollback_within) {
         start:,
         coordinator: None,
         settle: fn(delivery) {
-          let summary = case delivery {
-            Delivered(outcome) -> "Saga reported " <> outcome.summary(outcome)
-            RunLost -> "the workflow run was lost"
-          }
-          notify(rollback_within, fn() { on_stopped(judge(delivery), summary) })
+          notify(rollback_within, fn() { on_stopped(delivery) })
         },
         rollback_within:,
       ))
@@ -92,40 +182,36 @@ fn run(workflow, input, config, explain, on_stopped, rollback_within) {
       5000,
     )
     |> result.map_error(fn(error) {
-      Definitely(case error {
-        reporting_startup.ReceiverExited ->
-          "the workflow receiver exited before it became ready"
-        reporting_startup.TimedOut ->
-          "the workflow receiver did not become ready within 5 seconds"
-      })
+      case error {
+        reporting_startup.ReceiverExited(reason) -> StartupExited(reason)
+        reporting_startup.TimedOut -> StartupTimedOut
+      }
     }),
   )
   case execution.start_reporting(workflow, input, config, to: report) {
-    Error(execution.InvalidConfig(errors)) -> {
-      process.send(start, NotStarted)
-      Error(Definitely(
-        "the workflow is misconfigured: "
-        <> string.join(list.map(errors, execution.describe_config_error), "; "),
-      ))
-    }
-    Error(execution.ExecutionLost(_)) -> {
-      process.send(start, NotStarted)
-      Error(Unknown("the workflow run was lost"))
+    Error(error) -> {
+      process.send(start, NoHandle)
+      process.demonitor_process(receiver_monitor)
+      Error(AdmissionFailed(error))
     }
     Ok(started) -> {
       process.send(start, Started(execution.pid(started)))
       let delivered =
         process.new_selector()
-        |> process.select_map(forward, Ok)
-        |> process.select_specific_monitor(receiver_monitor, fn(_) {
-          Error(Nil)
+        |> process.select_map(forward, fn(delivery) { delivery })
+        |> process.select_specific_monitor(receiver_monitor, fn(down) {
+          Error(ReceiverReportLost(down_reason(down)))
         })
         |> process.selector_receive_forever
-      case delivered {
-        Ok(delivery) -> judge(delivery)
-        Error(Nil) -> Error(Unknown("the workflow's outcome was lost"))
-      }
+      process.demonitor_process(receiver_monitor)
+      delivered
     }
+  }
+}
+
+fn down_reason(down: process.Down) -> process.ExitReason {
+  case down {
+    process.ProcessDown(reason:, ..) | process.PortDown(reason:, ..) -> reason
   }
 }
 
@@ -146,7 +232,7 @@ type Event(o, e, u) {
   Reported(execution.Outcome(o, e, u))
   Starting(Start)
   TaskExited(process.ExitReason)
-  CoordinatorExited
+  CoordinatorExited(process.ExitReason)
 }
 
 /// Owns the report subject. Forwards what it learns to the task while the
@@ -172,8 +258,8 @@ fn receive(receiver: Receiver(o, e, u)) -> Nil {
   }
   let selector = case receiver.coordinator {
     Some(monitor) ->
-      process.select_specific_monitor(selector, monitor, fn(_) {
-        CoordinatorExited
+      process.select_specific_monitor(selector, monitor, fn(down) {
+        CoordinatorExited(down_reason(down))
       })
     None -> selector
   }
@@ -186,11 +272,12 @@ fn receive(receiver: Receiver(o, e, u)) -> Nil {
   }
   case event {
     Error(Nil) -> Nil
-    Ok(Starting(NotStarted)) -> Nil
+    Ok(Starting(NoHandle)) -> Nil
     Ok(Starting(Started(pid))) ->
       receive(Receiver(..receiver, coordinator: Some(process.monitor(pid))))
-    Ok(Reported(outcome)) -> deliver(receiver, Delivered(outcome))
-    Ok(CoordinatorExited) -> deliver(receiver, RunLost)
+    Ok(Reported(outcome)) -> deliver(receiver, Ok(outcome))
+    Ok(CoordinatorExited(reason)) ->
+      deliver(receiver, Error(CoordinatorReportLost(reason)))
     // The task returned: it had the outcome.
     Ok(TaskExited(process.Normal)) -> Nil
     Ok(TaskExited(_)) -> receive(Receiver(..receiver, task_monitor: None))
@@ -219,16 +306,6 @@ fn deliver(receiver: Receiver(o, e, u), delivery: Delivery(o, e, u)) -> Nil {
         _ -> receiver.settle(delivery)
       }
     }
-  }
-}
-
-fn classify(
-  delivery: Delivery(output, error, undo_error),
-  explain: fn(error) -> String,
-) -> Result(output, outcome.Failure) {
-  case delivery {
-    RunLost -> Error(Unknown("the workflow run was lost"))
-    Delivered(outcome) -> outcome.classify(outcome, explain)
   }
 }
 
