@@ -523,6 +523,10 @@ A short-lived invocation worker uses `saga/reporting.run_owned(workflow, input,
 config, explain, on_stopped, rollback_within)` when compensation must be reported
 after the worker dies. A separate receiver forwards the result while the owner
 lives; on abnormal owner exit it reports the classified outcome and summary.
+Receiver startup waits at most five seconds for readiness. If the receiver exits
+or misses that deadline, `run_owned` returns `Error(outcome.Definitely(...))`
+before starting the workflow. It stops the receiver, removes its monitor and
+discards startup replies without consuming unrelated caller messages.
 The notification runs in a guarded worker with the supplied finite duration.
 Do not call this from a long-lived server loop: after returning its result the
 receiver watches that invocation's owner until it exits. Ordinary callers keep
