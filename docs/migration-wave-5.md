@@ -248,3 +248,25 @@ Dependents: fabric's unpublished `consumers/saga_tool` recipe, its
 `Compensated` to `tool.Explain` and `Unresolved` to `tool.Uncertain`, carries
 correlation, and calls `tool.settle` after cancellation. The two libraries have
 no new dependency on one another; the Postgres adapter is unchanged.
+
+### Round 9 follow-up: receiver startup failure
+
+Before, `reporting.run_owned` asserted that its independent receiver became
+ready within five seconds. A receiver that exited or missed that deadline
+could panic the caller. After, both cases return the existing
+`Error(outcome.Definitely(...))` before any workflow starts; the public
+signature and failure classification remain unchanged.
+
+```gleam
+case reporting.run_owned(workflow, input, config, describe_error,
+  on_stopped, duration.seconds(5)) {
+  Ok(value) -> accept(value)
+  Error(failure) -> record(outcome.failure_kind(failure),
+    outcome.describe_failure(failure))
+}
+```
+
+Startup failure stops the receiver and removes its monitor. A closed startup
+reply channel drops late replies, and cleanup preserves unrelated caller mail.
+The existing normal-exit and abnormal-exit reporting behavior remains unchanged.
+No caller migration is required.

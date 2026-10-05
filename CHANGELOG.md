@@ -8,6 +8,10 @@ increments toward the first local-execution release.
 
 ### Round 9
 
+- Return a definite no-effects failure when the reporting receiver exits or
+  misses its five-second startup deadline. Startup cleanup stops the receiver,
+  removes its monitor and suppresses late replies; it no longer asserts readiness.
+
 - Add `saga/outcome`: complete/compensated/unresolved classification, held-step
   evidence, safe summaries, and typed failures with stable accessors.
 - Add `saga/reporting.run_owned`: a bounded, independent receiver reports
