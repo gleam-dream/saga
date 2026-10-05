@@ -8,6 +8,17 @@ increments toward the first local-execution release.
 
 ### Round 9
 
+- Return full typed execution reports from `reporting.run_owned`; remove its
+  `explain` argument and the stopped callback's separate summary argument.
+  Reporting errors retain typed operational causes through stable accessors.
+- Distinguish proven `NotStarted` from `Unknown` effects on reporting errors;
+  a lost startup handshake does not prove that no workflow work began.
+- Include every settlement category and unknown action in `outcome.summary`,
+  preserving attempt numbers and ending kinds without application payloads.
+  Uncertain classifications render this evidence once.
+- Release the caller's receiver monitor when a report returns or execution
+  admission fails; retain the independent receiver's owner monitoring.
+
 - Return a definite no-effects failure when the reporting receiver exits or
   misses its five-second startup deadline. Startup cleanup stops the receiver,
   removes its monitor and suppresses late replies; it no longer asserts readiness.

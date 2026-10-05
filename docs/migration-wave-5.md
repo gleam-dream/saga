@@ -270,3 +270,76 @@ Startup failure stops the receiver and removes its monitor. A closed startup
 reply channel drops late replies, and cleanup preserves unrelated caller mail.
 The existing normal-exit and abnormal-exit reporting behavior remains unchanged.
 No caller migration is required.
+
+### Round 9 follow-up: retain reports and complete safe summaries
+
+- `reporting.run_owned` now returns `Result(execution.Outcome(output, error,
+undo_error), reporting.Error)`. `Ok(report)` means the report was obtained;
+  the report can describe a failed, cancelled or unresolved workflow.
+- The `explain` argument is removed. The stopped-owner callback receives the
+  same full-report result as the synchronous caller, without a separate summary
+  argument. Application values, business errors and undo errors retain their
+  original types.
+
+Before:
+
+```gleam
+reporting.run_owned(workflow, input, config, describe_error,
+  fn(result, summary) { record_after_owner_exit(result, summary) },
+  duration.seconds(5))
+// Result(output, outcome.Failure)
+```
+
+After:
+
+```gleam
+let result = reporting.run_owned(workflow, input, config,
+  fn(result) { record_after_owner_exit(result) }, duration.seconds(5))
+case result {
+  Ok(report) -> {
+    let summary = outcome.summary(report)
+    let classified = outcome.classify(report, describe_error)
+    record(classified, summary)
+  }
+  Error(error) -> record_reporting_error(reporting.error_kind(error),
+    reporting.effect_status(error), reporting.describe_error(error))
+}
+```
+
+- `reporting.Error` keeps operational errors separate from workflow outcomes.
+  `error_kind` classifies invalid rollback bounds, receiver startup exit or
+  deadline, execution admission, receiver loss and coordinator loss.
+- `run_error(error)` returns the original `execution.RunError` when present.
+  `exit_reason(error)` returns the available `process.ExitReason` for receiver
+  or coordinator loss. `invalid_rollback_within(error)` returns a rejected
+  rollback duration. Each accessor returns `None` when its cause is absent.
+- `effect_status(error)` returns `NotStarted` only for proven prelaunch
+  rejection. `ExecutionLost`, receiver loss and coordinator loss return
+  `Unknown`; neither status authorizes retry.
+- `describe_error` omits crash payloads. Typed cause accessors can contain
+  private application data and require the caller's disclosure policy.
+- `outcome.summary` now includes all settlement evidence and every unknown
+  action, attempt and ending. The fixed category order preserves report order
+  within each category; typed business, undo and crash payloads remain absent.
+  Classification renders this safe evidence once and adds an application's
+  explicit held-error explanation only when applicable.
+
+Before, a held failure could be summarized without its held steps:
+
+```text
+unresolved at charge
+```
+
+After:
+
+```text
+unresolved at charge; held charge
+```
+
+- Dependents are Fabric's `consumers/saga_tool` recipe, `consumers/app` and
+  oversight's `apps/support_desk`. Their shared projection now distinguishes an
+  obtained workflow report from an operational error without a report.
+- The receiver's lifetime, five-second readiness bound, rollback bounds and
+  notification bounds are unchanged. Completed return and admission failure
+  remove the caller's receiver monitor. Existing execution records, durable
+  records and the Postgres adapter require no migration.
