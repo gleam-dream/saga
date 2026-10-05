@@ -6,6 +6,15 @@ increments toward the first local-execution release.
 
 ## Unreleased
 
+### Round 9
+
+- Add `saga/outcome`: complete/compensated/unresolved classification, held-step
+  evidence, safe summaries, and typed failures with stable accessors.
+- Add `saga/reporting.run_owned`: a bounded, independent receiver reports
+  compensation after a short-lived owner stops. Move the former bridge's
+  verdict behavior into saga; preserve its 24 tests and add ownership checks.
+- Existing execution and durable records, and the Postgres adapter, are unchanged.
+
 ### Step correlation (wave 5)
 
 Every change below has a before and after in

@@ -194,3 +194,57 @@ resumes. The gaps found are fixed:
 Not changed: the durable layer emits no event of its own (claim, release,
 lease loss, checkpoint write). Those would be new events, not a correlation
 gap.
+
+## Round 9: outcome and task-reporting ports
+
+Additive; existing execution and durable records keep their representation.
+The former `fabric_saga/internal/verdict` implementation is `saga/outcome`.
+Its 24 table-driven tests now run in saga. `Stopped` becomes `outcome.Failure`,
+`classify` and `summary` keep their behavior, and `kind`, `held_steps`,
+`failure_kind` and `describe_failure` expose stable classifications and evidence.
+
+Before, a caller often checked only unknown actions, missing held or remaining
+known effects:
+
+```gleam
+case execution.unknown_effects(report) {
+  [] -> assume_no_effects_remain()
+  effects -> reconcile(effects)
+}
+```
+
+After, use the outcome's complete evidence:
+
+```gleam
+case outcome.classify(report, describe_error) {
+  Ok(value) -> accept(value)
+  Error(failure) -> record(outcome.failure_kind(failure),
+    outcome.describe_failure(failure))
+}
+let held = outcome.held_steps(report)
+let description = outcome.summary(report)
+```
+
+Before, a short-lived owner needed a separate monitored receiver around
+`execution.start_reporting`, forwarding outcomes while the owner lived and
+reporting rollback after its death. After:
+
+```gleam
+reporting.run_owned(workflow, input, config, describe_error,
+  fn(result, summary) { record_after_owner_exit(result, summary) },
+  duration.seconds(5))
+```
+
+`run_owned` returns `Result(output, outcome.Failure)`. A finite `rollback_within`
+from 1 ms through 2^32 - 1 ms bounds the startup-loss wait and the notification
+callback; an invalid bound starts no workflow. Execution and cleanup retain
+`execution.Config`'s bounds. The receiver monitors the per-invocation worker
+until it exits even if the result has already returned, so this port is not for
+long-lived server loops. A late report remains evidence, never permission to
+repeat an uncertain effect. Normal owner exit produces no second notification.
+
+Dependents: fabric's unpublished `consumers/saga_tool` recipe, its
+`consumers/app`, and oversight's `apps/support_desk`. The recipe maps
+`Compensated` to `tool.Explain` and `Unresolved` to `tool.Uncertain`, carries
+correlation, and calls `tool.settle` after cancellation. The two libraries have
+no new dependency on one another; the Postgres adapter is unchanged.
