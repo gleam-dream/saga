@@ -520,17 +520,32 @@ case outcome.classify(report, describe_payment_error) {
 ```
 
 A short-lived invocation worker uses `saga/reporting.run_owned(workflow, input,
-config, explain, on_stopped, rollback_within)` when compensation must be reported
-after the worker dies. A separate receiver forwards the result while the owner
-lives; on abnormal owner exit it reports the classified outcome and summary.
-Receiver startup waits at most five seconds for readiness. If the receiver exits
-or misses that deadline, `run_owned` returns `Error(outcome.Definitely(...))`
-before starting the workflow. It stops the receiver, removes its monitor and
-discards startup replies without consuming unrelated caller messages.
-The notification runs in a guarded worker with the supplied finite duration.
-Do not call this from a long-lived server loop: after returning its result the
-receiver watches that invocation's owner until it exits. Ordinary callers keep
-using `execution.run` or `start_reporting`.
+config, on_stopped, rollback_within)` when compensation must be reported after
+that worker dies.
+
+- The synchronous result and `on_stopped` callback receive
+  `Result(execution.Outcome(output, error, undo_error), reporting.Error)`.
+  `Ok(report)` means a report was obtained, including a failed or unresolved
+  workflow. The report retains application-native business and undo errors.
+- The application calls `outcome.classify(report, explain)` or
+  `outcome.summary(report)` when it needs a classification or a safe summary.
+  Summaries include every settlement category and unknown action without
+  exposing application payloads.
+- An operational error has no execution report. Use `reporting.error_kind`,
+  `effect_status` and `describe_error`; use `run_error`, `exit_reason` and
+  `invalid_rollback_within` for optional typed causes. `NotStarted` proves
+  prelaunch rejection; `Unknown` cannot exclude workflow effects.
+- Receiver readiness waits at most five seconds. Receiver exit or readiness
+  timeout returns a typed error with `NotStarted`, stops the receiver and
+  discards its startup replies without consuming unrelated caller messages.
+- The notification runs in a guarded worker bounded by `rollback_within`.
+  After returning a report the receiver watches its owner until that owner
+  exits; normal exit sends no second notification. If the owner dies before
+  confirming a coordinator and no report arrives within the bound, delivery
+  remains unconfirmed.
+- Use this boundary inside one invocation worker. Ordinary callers use
+  `execution.run` or `start_reporting`; a long-lived server loop would keep
+  receivers watching the server after each invocation.
 
 The compiled [fabric recipe](../fabric/consumers/saga_tool/src/saga_tool.gleam)
 uses both ports through public imports, without a saga dependency on fabric.
