@@ -3,7 +3,7 @@
 import gleam/erlang/process.{type Monitor, type Pid, type Subject}
 
 pub type Error {
-  ReceiverExited
+  ReceiverExited(process.ExitReason)
   TimedOut
 }
 
@@ -20,7 +20,13 @@ pub fn await(
   let received =
     process.new_selector()
     |> process.select_map(ready, Ok)
-    |> process.select_specific_monitor(monitor, fn(_) { Error(ReceiverExited) })
+    |> process.select_specific_monitor(monitor, fn(down) {
+      let reason = case down {
+        process.ProcessDown(reason:, ..) | process.PortDown(reason:, ..) ->
+          reason
+      }
+      Error(ReceiverExited(reason))
+    })
     |> process.selector_receive(within)
   close_ready()
   discard_ready(ready)

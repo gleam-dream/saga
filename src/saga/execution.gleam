@@ -313,7 +313,9 @@ pub fn settings(
   }
 }
 
-/// Why `run`/`start` never began a run at all.
+/// Why `run`/`start` could not return an execution or report.
+/// `InvalidConfig` starts no work. `ExecutionLost` does not prove that no
+/// work started: a coordinator may act before its startup handshake is lost.
 pub type RunError {
   InvalidConfig(errors: List(ConfigError))
   ExecutionLost(crash: saga.Crash)
