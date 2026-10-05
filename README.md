@@ -498,3 +498,35 @@ nix flake check
 
 `examples/order_consumer` is the external acceptance consumer: it imports
 only saga's public modules.
+
+## Act on an execution's outcome
+
+`saga/outcome` classifies what the execution proves: `Completed`, `Compensated`
+(all effects known and none left in place), or `Unresolved`. A completed value
+with unknown effects is unresolved. `held_steps` retains native step addresses;
+`summary` names actions and steps without application errors, outputs or crash
+reasons. `classify(report, explain)` returns the native output or a typed
+`Failure`; use `failure_kind` and `describe_failure`. Only the held error is
+rendered by the application's `explain` in uncertain evidence.
+
+```gleam
+import saga/outcome
+
+case outcome.classify(report, describe_payment_error) {
+  Ok(receipt) -> accept(receipt)
+  Error(failure) -> record_failure(outcome.failure_kind(failure),
+    outcome.describe_failure(failure))
+}
+```
+
+A short-lived invocation worker uses `saga/reporting.run_owned(workflow, input,
+config, explain, on_stopped, rollback_within)` when compensation must be reported
+after the worker dies. A separate receiver forwards the result while the owner
+lives; on abnormal owner exit it reports the classified outcome and summary.
+The notification runs in a guarded worker with the supplied finite duration.
+Do not call this from a long-lived server loop: after returning its result the
+receiver watches that invocation's owner until it exits. Ordinary callers keep
+using `execution.run` or `start_reporting`.
+
+The compiled [fabric recipe](../fabric/consumers/saga_tool/src/saga_tool.gleam)
+uses both ports through public imports, without a saga dependency on fabric.
