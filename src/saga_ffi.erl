@@ -6,7 +6,8 @@
     unique_integer/0,
     monotonic_time/0,
     system_time/0,
-    identity/1
+    identity/1,
+    aliased_sender/1
 ]).
 
 %% Runs `Fun` and calls back into exactly one of the supplied continuations:
@@ -48,3 +49,11 @@ system_time() ->
 %% argument).
 identity(X) ->
     X.
+
+
+%% Keep the normal Gleam subject for receiving, but send via a process alias.
+%% Deactivating the alias drops replies that arrive after the startup deadline.
+aliased_sender({subject, Owner, Tag}) when Owner =:= self() ->
+    Alias = erlang:alias(),
+    {fun(Value) -> Alias ! {Tag, Value}, nil end,
+     fun() -> erlang:unalias(Alias), nil end}.

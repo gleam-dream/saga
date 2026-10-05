@@ -6,6 +6,9 @@
 //// boundary inside a per-invocation worker, not a long-lived server process.
 //// `rollback_within` bounds waiting when the owner dies before reporting whether
 //// it started a coordinator; normal execution follows `execution.Config`.
+//// Receiver readiness has a five-second bound. A receiver that exits or
+//// misses that deadline produces a definite failure before the workflow starts.
+//// Its startup channel and monitor are discarded without consuming other mail.
 //// The notification callback runs in a guarded worker, bounded by the same
 //// `rollback_within` duration; a crash or timeout leaves delivery unconfirmed.
 
@@ -18,6 +21,7 @@ import gleam/time/duration.{type Duration}
 import saga
 import saga/execution
 import saga/internal/ffi
+import saga/internal/reporting_startup
 import saga/outcome.{Definitely, Unknown}
 
 /// What the receiver learns about the Saga run.
@@ -56,11 +60,12 @@ fn run(workflow, input, config, explain, on_stopped, rollback_within) {
   let task = process.self()
   let forward = process.new_subject()
   let ready = process.new_subject()
+  let #(send_ready, close_ready) = ffi.aliased_sender(ready)
   let receiver =
     process.spawn_unlinked(fn() {
       let report = process.new_subject()
       let start = process.new_subject()
-      process.send(ready, #(report, start))
+      send_ready(#(report, start))
       receive(Receiver(
         task_monitor: Some(process.monitor(task)),
         forward:,
@@ -78,7 +83,23 @@ fn run(workflow, input, config, explain, on_stopped, rollback_within) {
       ))
     })
   let receiver_monitor = process.monitor(receiver)
-  let assert Ok(#(report, start)) = process.receive(ready, 5000)
+  use #(report, start) <- result.try(
+    reporting_startup.await(
+      receiver,
+      receiver_monitor,
+      ready,
+      close_ready,
+      5000,
+    )
+    |> result.map_error(fn(error) {
+      Definitely(case error {
+        reporting_startup.ReceiverExited ->
+          "the workflow receiver exited before it became ready"
+        reporting_startup.TimedOut ->
+          "the workflow receiver did not become ready within 5 seconds"
+      })
+    }),
+  )
   case execution.start_reporting(workflow, input, config, to: report) {
     Error(execution.InvalidConfig(errors)) -> {
       process.send(start, NotStarted)
