@@ -2,6 +2,8 @@
 /// the coordinator and its tasks lives behind this module so the rest of the
 /// implementation stays in plain Gleam types, with no `Dynamic` and no
 /// unsafe coercion anywhere in this file or its callers.
+import gleam/erlang/process
+
 pub type CrashClass {
   ErrorClass
   ExitClass
@@ -51,3 +53,10 @@ pub fn monotonic_time() -> Int
 /// measurements.
 @external(erlang, "saga_ffi", "system_time")
 pub fn system_time() -> Int
+
+/// A startup reply channel whose sender can be deactivated without waiting
+/// for its process. The receiving subject keeps its ordinary owner and tag.
+@external(erlang, "saga_ffi", "aliased_sender")
+pub fn aliased_sender(
+  subject: process.Subject(a),
+) -> #(fn(a) -> Nil, fn() -> Nil)
