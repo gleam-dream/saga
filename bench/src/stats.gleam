@@ -1,6 +1,5 @@
-/// Simple descriptive statistics over a list of millisecond durations:
-/// median and p95 (nearest-rank), used to summarize many runs of one bench
-/// shape/N without pulling in a stats dependency.
+/// Descriptive statistics over duration samples, preserving their unit.
+/// The harness supplies microseconds; median and p95 use nearest rank.
 import gleam/int
 import gleam/list
 

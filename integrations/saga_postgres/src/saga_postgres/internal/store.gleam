@@ -1,10 +1,9 @@
 //// The `saga/storage` operations over one table, `saga_executions`.
 ////
 //// Every write is one conditional statement, committed on its own. A
-//// statement that changes no row is diagnosed by reading the row back:
-//// the conditions only move one way (revision and generation grow, the
-//// cancellation flag only turns on, a token is replaced by a claim or
-//// cleared by a release), so the row read afterwards names the reason.
+//// statement that changes no row is diagnosed by a later read, which can
+//// observe further concurrent changes. Commit diagnosis checks missing
+//// execution, then ownership, cancellation and progress disagreements.
 //// Lease expiry is judged by the database's clock alone
 //// (`clock_timestamp()`). A live claim is a row whose `owner_token` is set
 //// and whose `lease_until` lies ahead of that clock. A claim whose lease
@@ -24,8 +23,10 @@ import gleam/time/duration
 import pog
 import saga/storage.{type Claim, type Storage, type Stored}
 
-/// How long a query may take, below saga's default call timeout of
-/// 5 000 ms, so that a slow query fails here with a typed error first.
+/// The pool-backed query attempt budget in milliseconds. Each retry and
+/// refusal-diagnosis query receives its own budget. Saga's default call wait
+/// is 5 seconds; this budget is not a total adapter-operation deadline.
+/// Already checked-out transaction connections use the driver's timing.
 pub const query_timeout = 4500
 
 /// The SQL of one store, built once for its table.
@@ -82,10 +83,10 @@ fn statements(table: String) -> Statements {
   )
 }
 
-/// The storage over `table` (a quoted, schema-qualified name), whose
-/// claims last `lease` milliseconds after their last claim, commit or
-/// renewal, renewed every third of it. The lease is in milliseconds because
-/// it is a SQL parameter; the public `saga_postgres.with_lease` takes a
+/// The storage over `table`, a quoted, schema-qualified name. Accepted
+/// claims, commits and renewals refresh the database-clock lease by `lease`
+/// milliseconds. Saga owns renewal every third of that duration. The SQL
+/// parameter uses milliseconds; public `saga_postgres.with_lease` takes a
 /// `Duration`.
 pub fn new(connection: pog.Connection, table: String, lease: Int) -> Storage {
   let sql = statements(table)
@@ -242,8 +243,8 @@ fn commit(
         True ->
           case current.cancelled == commit.observed_cancelled {
             False -> storage.CancellationChanged
-            // A row that matches every condition when read back changed
-            // in between; the committer reloads either way.
+            // Ownership and cancellation still match. The caller reloads
+            // the checkpoint before trying another revision.
             True -> storage.Conflict
           }
       })
@@ -371,8 +372,9 @@ fn from_query_error(error: pog.QueryError) -> storage.Error {
   }
 }
 
-/// A query failure as text, for logs. It names no credential: pog's errors
-/// carry none.
+/// A query failure as text for logs. It includes no pool configuration,
+/// but server messages and decoded argument detail are passed through.
+/// This is diagnostic rendering, not a general redaction boundary.
 pub fn describe(error: pog.QueryError) -> String {
   case error {
     pog.ConnectionUnavailable -> "no database connection is available"

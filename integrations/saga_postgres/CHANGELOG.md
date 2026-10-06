@@ -2,20 +2,7 @@
 
 ## Unreleased
 
-- Initial package: a PostgreSQL storage for saga's durable runs over one
-  table, `saga_executions`, on the application's own `pog.Connection`.
-- `config`, `with_lease` (a `Duration`, default 30 seconds, at least 100
-  milliseconds) and
-  `with_schema` (default `public`).
-- `storage` implements the `saga/storage` contract with leased claims,
-  renewed every lease / 3, and passes `saga/storage/conformance`. Lease
-  expiry is judged by the database's clock. Each query is bounded at
-  4.5 seconds.
-- `migrate` applies forward-only numbered migrations in one transaction
-  under a per-schema advisory lock, recorded in `saga_schema_migrations`.
-  The same SQL ships in `priv/migrations/`.
-- A runner killed while `drive`'s caller lives no longer holds its claim
-  for the whole lease: saga releases it at once. The lease remains the
-  fallback when the runner's node is lost, and the tests cover both paths.
-- `pog` and `pgo` are pinned to the minor ranges grind uses, so one
-  application pool serves the application, grind and saga.
+- Initial PostgreSQL storage adapter for Saga durable executions on the application's pool, with schema configuration, leased generation/token claims, conditional checkpoint writes, cancellation intent, and unfinished discovery.
+- Forward transaction-locked migrations and equivalent packaged SQL support application migration tooling.
+- Adapter and public conformance tests exercise the disposable PostgreSQL 16 cluster and shared-pool consumer.
+- [Design decisions](docs/adr) preserve package, ownership, migration, lease, deadline, and retained-scope rationale; [the standing design](docs/design/design.typ) states the actual contracts and unresolved limits.

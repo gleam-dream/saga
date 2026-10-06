@@ -20,11 +20,12 @@
 //// the application's own queries. Each execution is one row: its
 //// checkpoint bytes, revision, ownership generation, cancellation flag,
 //// phase, and claim (a random token and a lease expiry). Every write is one
-//// conditional statement. A claim lasts until it is released or its lease
-//// expires; saga renews it every third of the lease while its runner lives, so
-//// a runner that dies loses its claim within one lease. Lease expiry is
-//// judged by the database's clock alone (`clock_timestamp()`), so the
-//// nodes' clocks need not agree.
+//// conditional statement. Saga renews a live runner's lease every third
+//// of its duration. Release clears ownership; expiry permits takeover.
+//// An expired claim can still commit, renew or release until another claim
+//// replaces it. Lease expiry uses the database's clock alone
+//// (`clock_timestamp()`), so node clocks need not agree. Fencing saved
+//// writes does not retract an already sent external effect.
 
 import gleam/dynamic/decode
 import gleam/int
@@ -49,11 +50,10 @@ pub fn config(connection: pog.Connection) -> Config {
   Config(connection:, lease: duration.seconds(30), schema: "public")
 }
 
-/// Sets the lease (default 30 seconds): how long a claim lasts after its
-/// last claim, commit or renewal, and so how long another runner waits
-/// before it resumes an execution whose runner died. Saga renews a live
-/// runner's claim every third of the lease. A lease below 100 milliseconds
-/// is raised to 100 milliseconds.
+/// Sets the lease (default 30 seconds), measured from the last accepted
+/// claim, commit or renewal. Expiry permits takeover but does not revoke
+/// an unreplaced claim. Saga renews a live runner's lease every third of
+/// its duration. A lease below 100 milliseconds is raised to 100 milliseconds.
 pub fn with_lease(config: Config, lease: Duration) -> Config {
   let milliseconds = int.max(100, duration.to_milliseconds(lease))
   Config(..config, lease: duration.milliseconds(milliseconds))
@@ -180,10 +180,15 @@ pub fn migrate(config: Config) -> Result(Nil, MigrateError) {
 }
 
 /// The `saga/storage.Storage` of this configuration, over the table
-/// `saga_executions` in its schema. It declares renewal every third of the
-/// lease (`storage.with_renewal`). Each query is bounded at 4.5 seconds,
-/// below saga's default call timeout of 5 seconds, and fails with
-/// `storage.TimedOut` when slower. Run `migrate` first.
+/// `saga_executions` in its schema. Run `migrate` first. Saga owns the
+/// heartbeat declared through `storage.with_renewal`, every third of the lease.
+///
+/// Each pool-backed query attempt has a 4.5-second budget and reports
+/// `storage.TimedOut` on expiry. Retries and refusal diagnosis have separate
+/// budgets; this is not a total operation deadline. Saga's default call wait
+/// is 5 seconds. Transaction-scoped connections and migration use the driver's
+/// connection/transaction timing. See
+/// docs/adr/0004-separate-query-budgets-from-total-deadlines.md.
 pub fn storage(config: Config) -> Storage {
   store.new(
     config.connection,

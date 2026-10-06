@@ -867,20 +867,11 @@ fn context_from_node(attempt: node.Attempt) -> Context {
 // Scope tokens (define vs. embed, and foreign-port rejection)
 // ---------------------------------------------------------------------------
 
-/// Identifies one workflow's evaluation. A `Port` created under one scope
-/// cannot be consumed by `perform`/`map`/`both`/`all` under an unrelated
-/// scope; mixing them is rejected as `ForeignPort` at `define` time. `embed`
-/// passes the parent scope's `id` through unchanged (only extending `path`
-/// for addressing), so an inner builder may legitimately capture outer
-/// ports. `registry` accumulates every node `perform` creates anywhere in
-/// this one evaluation — including ones a builder later discards rather
-/// than threading into its returned port — with an O(1) append per node
-/// (see `saga/internal/cell`'s `Registry`), so `define`/`for_run` can both
-/// detect steps unreachable from the final output (see `OrphanStep`) and
-/// assemble the workflow's node table, without any `Port` ever having to
-/// carry or merge a node map of its own. See `Port`'s own doc comment for
-/// why threading a node map through every `Port` used to cost O(N) per
-/// `both`/`map` combinator call.
+/// Identifies one workflow construction. Unrelated scopes cannot exchange
+/// Ports; define reports ForeignPort. Embed preserves the parent's id while
+/// extending the address path, so an inner builder may capture outer Ports.
+/// The registry retains every constructed node. Define uses it to assemble
+/// the graph and find orphans without storing transitive node maps in Ports.
 type ScopeToken(e, u) {
   ScopeToken(id: Int, path: List(String), registry: cell.Registry(Node(e, u)))
 }
@@ -979,25 +970,14 @@ pub fn both(
   })
 }
 
-/// Combines `first` and `rest` into one port producing their values, in
-/// list order (`first` then `rest`, in `rest`'s own order). Takes `first`
-/// as a separate required argument (rather than one `List(Port(..))` that
-/// could be empty) so there is no empty case to report or work around at
-/// all: a caller with zero ports simply has no `Port` to pass as `first`
-/// and cannot call `all` in the first place, which the type system already
-/// enforces at the call site — nothing here needs its own placeholder
-/// value or definition error for it.
+/// Combines port values in list order. The required first Port excludes an
+/// empty input; callers with a list of Ports must handle the empty case.
 pub fn all(
   first: Port(a, e, u),
   rest: List(Port(a, e, u)),
 ) -> Port(List(a), e, u) {
-  // Builds the combined list newest-first (prepend, not `list.append`,
-  // inside the fold) and reverses exactly once at the very end, rather
-  // than appending one element at a time across `rest`'s ports: an append
-  // per step is O(k) for a list already k long, so appending across k
-  // ports would cost O(k^2) total (paid once per run, inside the final
-  // `map`'s closure, for every attempt that reads this combined port) —
-  // prepending is O(1) per step, O(k) total, with one final O(k) reverse.
+  // Prepend and reverse once to build k values in O(k) work. Appending
+  // each value would copy the growing list and cost O(k^2).
   list.fold(rest, map(first, fn(a) { [a] }), fn(acc, port) {
     both(acc, port) |> map(fn(pair) { [pair.1, ..pair.0] })
   })
@@ -1565,11 +1545,7 @@ pub opaque type Workflow(i, o, e, u) {
     root_input_id: Int,
     nodes: Dict(Int, Node(e, u)),
     order: List(Int),
-    // The reverse-dependency index (`saga/internal/node.build_dependents`),
-    // computed once here since it depends only on `nodes`' own fixed
-    // `deps` lists — themselves fixed once the graph is built — and reused
-    // unchanged by the coordinator across every run, rather than
-    // recomputed per run.
+    // Fixed dependency lists permit one reverse index shared by every run.
     dependents: Dict(Int, List(Int)),
     fetch_output: fn(Store) -> fn() -> o,
     descriptors: List(StepDescriptor),
@@ -1615,14 +1591,8 @@ pub fn try_define(
   let root_input = fresh_root_port(scope, root_input_id)
   let output = build(root_input)
 
-  // `scope.registry`'s every entry, indexed by id once, O(N) total — this
-  // is the *only* place this scope's whole node table is ever assembled
-  // into a `Dict`; every `perform` call above only ever appended to the
-  // registry (O(1) each), never merged one. See `reachable_nodes`'s own doc
-  // comment for why walking `deps` from `output` against this table,
-  // instead of threading a node map through every `Port`, is what makes
-  // this — and every intermediate `both`/`map` call above — no longer O(N)
-  // per combinator call.
+  // Index registered nodes once, then walk dependencies from the output.
+  // Ports carry typed fetches and direct dependencies, not transitive maps.
   let all_nodes =
     cell.all_registered(scope.registry)
     |> list.fold(dict.new(), fn(acc, a_node) {
@@ -1668,18 +1638,10 @@ pub fn try_define(
   }
 }
 
-/// The subset of `all_nodes` transitively reachable from `roots` (a set of
-/// immediate dependency ids — `output.deps` at the top-level call), by
-/// following each reached node's own `deps` list outward. `all_nodes` is
-/// this scope's *entire* registered node table (including any node a
-/// builder created but never threaded into its final output), so the
-/// result is exactly what `output` actually depends on, directly or
-/// indirectly — the same set `define`'s node table and `orphan_errors_for`
-/// both need, computed once here by a single O(V+E) graph walk instead of
-/// by threading and `dict.merge`-ing a node map through every intermediate
-/// `Port` a builder ever constructs (which cost O(N) per `both`/`map` call,
-/// O(N^2) total for a builder with N such calls — see `bench/RESULTS.md`'s
-/// "define time" section).
+/// Follows dependencies from roots to obtain the reachable registered nodes.
+/// Definition and orphan detection share this graph traversal. Avoiding a
+/// transitive node map in every Port prevents repeated dictionary merges;
+/// docs/adr/0002-build-once-run-scoped-values.md records the measured trade-off.
 fn reachable_nodes(
   all_nodes: Dict(Int, Node(e, u)),
   roots: Set(Int),
@@ -1761,10 +1723,8 @@ fn fresh_root_port(
   })
 }
 
-/// Resolves builder-call-order occurrence ranks for every node produced by
-/// one evaluation, ordered by ascending node id. Shared by `define`'s
-/// static descriptors and `for_run`'s live graph, which both need the same
-/// resolution so a define-time descriptor and its run-time address agree.
+/// Assigns occurrence ranks in builder order, using ascending node ids.
+/// Definition-time descriptors and executions reuse these resolved addresses.
 fn resolve_addresses(
   nodes_by_id: Dict(Int, Node(e, u)),
 ) -> #(List(Int), Dict(Int, StepAddress)) {
@@ -1792,12 +1752,8 @@ fn resolve_addresses(
   #(ordered_ids, addresses_by_id)
 }
 
-/// Builds every step's static descriptor from `resolved_nodes`'s own
-/// output: a node table whose addresses are already resolved to their
-/// correct builder-order occurrence rank, ordered by ascending node id
-/// (`ordered_ids`). Takes both directly, rather than re-deriving them from
-/// a `Port`, so this never re-runs `resolve_addresses` a second time over
-/// the same table `define` already resolved once.
+/// Builds descriptors from the resolved node table in builder order without
+/// resolving addresses again.
 fn descriptors_for(
   ordered_ids: List(Int),
   nodes_by_id: Dict(Int, Node(e, u)),
@@ -1836,29 +1792,13 @@ fn resolved_nodes(
   #(ordered_ids, with_resolved_addresses)
 }
 
-/// Prepares one fresh run of `workflow`: a brand-new `Store` seeded with
-/// `input` at the workflow's reserved root-input id, alongside the
-/// workflow's already-built node graph (shared, unchanged, across every
-/// run — see `Workflow`'s doc comment) and a thunk that fetches the final
-/// output once every node is done. Used only by `saga/execution`/
-/// `saga/internal/coordinator`, which own process/run lifecycle; this
-/// function performs no I/O and starts no process itself.
+/// Prepares a fresh Store seeded with the workflow input and reuses the
+/// immutable graph. Performs no I/O and starts no process; execution and the
+/// coordinator own that lifetime. Concurrent runs never share a Store.
 ///
-/// Every run gets its own initial `Store`, returned here so the coordinator
-/// can pass it (and every later, updated version it produces via
-/// `store.put` as nodes commit) to each node's `prepare_attempt`/
-/// `prepare_crash_recovery` (see `saga/internal/node`) as it admits that
-/// node — so concurrent or successive runs of the same `Workflow` never
-/// observe each other's values despite replaying the identical node
-/// closures.
-///
-/// The returned fetch-output thunk deliberately takes the `Store` as a
-/// parameter, supplied by the caller at the moment every node is actually
-/// done, rather than closing over the initial `run_store` above: `Store` is
-/// immutable, so the coordinator's own, current, fully-committed store
-/// (threaded through its `RunState` as each node's `commit` returns an
-/// updated value) is a *different* value from the one seeded here, and is
-/// the one that must be read from.
+/// The output fetch receives the fully committed Store at completion. It
+/// must not capture the initial Store, because immutable updates produce
+/// new values as nodes commit.
 @internal
 pub fn for_run(
   workflow: Workflow(i, o, e, u),
@@ -1871,15 +1811,8 @@ pub fn for_run(
   fn(Store) -> ffi.RescueResult(o),
 ) {
   let run_store = store.new() |> store.put(workflow.root_input_id, input)
-  // `workflow.fetch_output` (level 2 — see `Port`'s doc comment) must not be
-  // called until every node is actually done: it is what performs the
-  // dependency reads (`store.get`) for the workflow's final output, and
-  // those values only exist once their producing nodes have committed. The
-  // coordinator's own loop only invokes the thunk returned here once
-  // `all_nodes_done`, passing its own current `Store` at that moment, so the
-  // level-2 call is deferred to happen *inside* that thunk, alongside the
-  // level-3 call and its `rescue` — never eagerly, here, at run setup,
-  // before a single node has run.
+  // Defer dependency reads until every producer has committed. Rescue also
+  // covers the final user transformation inside the returned thunk.
   #(
     workflow.nodes,
     workflow.order,
@@ -1953,25 +1886,11 @@ pub fn map_errors(
     let shadow_registry = cell.new_registry()
     let shadow_input = retype_empty_port(input, shadow_registry)
     let shadow_output = workflow.build(shadow_input)
-    // `workflow.build` is the same not-necessarily-pure builder `embed`'s
-    // own doc comment warns about: it can return a `Port` stashed from a
-    // different, unrelated `define`'s scope. Checked here, against the
-    // *shadow* scope (the one `shadow_input` was actually built under),
-    // before anything is registered into `input`'s own registry below —
-    // exactly the same shape of check `embed` itself applies to its own
-    // (unwrapped) builder call.
+    // Validate against the shadow scope before registering nodes in the
+    // destination scope; a builder can return a captured foreign Port.
     let foreign_errors = foreign_error_for(shadow_input.scope, shadow_output)
-    // Drains the shadow scope's own registry (holding every `Node(e1, u1)`
-    // the original builder created, typed under its own original
-    // vocabulary) and re-registers each one, translated, into `input`'s own
-    // (e2, u2)-typed registry — an O(1) append per node, exactly like an
-    // ordinary `perform` call's own registration, never a `dict.merge` of
-    // two node maps. `input.scope.registry` is the *same* registry this
-    // `embed`'s composing `define` will later read via `cell.all_registered`
-    // to assemble its own node table and detect orphans, so a node
-    // `workflow.build` creates but never threads into `shadow_output` is
-    // still registered here — and still reported as an orphan there — as
-    // it must be.
+    // Translate every registered node, including orphans, into the
+    // destination registry. The composing define performs orphan detection.
     cell.all_registered(shadow_registry)
     |> list.each(fn(a_node) {
       cell.register(
@@ -2002,26 +1921,14 @@ pub fn map_errors(
   )
 }
 
-/// Rebuilds a fresh port carrying the same scope id/path, dependencies,
-/// errors, and fetch behaviour as `input`, but with a fresh `shadow_registry`
-/// retyped for the original (e1, u1) vocabulary in place of `input`'s own
-/// (e2, u2)-typed one. This is sound because a `Port`'s only field that
-/// mentions `e`/`u` (besides `fetch`, untouched here) is its scope's
-/// registry, and the shadow registry starts empty; every node the shadow
-/// builder subsequently creates is registered into it under the correct
-/// (e1, u1) type, then translated back through `node.map_errors` by
-/// `translating_build` once the shadow build is done — never read under the
-/// wrong type. Reusing `input.scope`'s `id` (not allocating a fresh one) is
-/// what lets the original builder legitimately read a `Port` it captured
-/// from its own outer scope: `foreign_error_for` only ever compares scope
-/// *ids*, and this shadow evaluation must validate as the *same* scope the
-/// composing `define` is building, not a foreign one. `deps` and `errors`
-/// must be carried over unchanged (not reset): dropping `deps` would make
-/// every step performed on this shadow input believe it has no dependencies
-/// at all, admitting before its real upstream node finishes and deadlocking
-/// on that node's still-unwritten cell; dropping `errors` would silently
-/// discard definition errors collected before this `embed`/`map_errors`
-/// boundary.
+/// Retains the input's scope id/path, fetch, dependencies and errors while
+/// replacing its registry with an empty registry in the original error types.
+/// Nodes enter that registry at their native types and are translated before
+/// entering the destination registry; no node is read at the wrong type.
+///
+/// The same scope id admits captured outer Ports. Dependencies must remain
+/// intact to prevent reads before upstream commit. Errors must remain intact
+/// so this mapping cannot discard earlier definition failures.
 fn retype_empty_port(
   input: Port(i, e2, u2),
   shadow_registry: cell.Registry(Node(e1, u1)),
