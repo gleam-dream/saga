@@ -134,11 +134,9 @@ nonempty result entries, dependency revisions and environment/lock metadata in
 `.artifacts/PROFILE`. Failures stop the profile and retain their evidence.
 
 Hosted verification checks out immutable revisions from `sibling-revisions.txt`.
-Private Sinal read access requires `vars.SIBLINGS_APP_CLIENT_ID` and
-`secrets.SIBLINGS_APP_PRIVATE_KEY`, or `secrets.SIBLINGS_READ_TOKEN` restricted to
-Sinal. Public JSON Blueprint uses ordinary checkout. Checkout never persists
-credentials. Fork pull requests receive no private credential and fail explicitly;
-verify their changes from a trusted repository branch.
+Sinal and JSON Blueprint use ordinary checkout with the default GitHub Actions
+token to read their public repositories. Checkout never persists credentials.
+Fork pull requests run the same required checks.
 
 The oracle proves only its seven scoped scenarios, not general Reactor or
 Temporal parity. The database harness disables fsync and synchronous_commit;
