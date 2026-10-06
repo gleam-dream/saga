@@ -1,7 +1,26 @@
-name: CI
+name: Retained oracle and benchmark
 on:
   push:
+    paths: &relevant
+      - "src/**"
+      - "test/**"
+      - "examples/**"
+      - "fixtures/**"
+      - "integrations/**"
+      - "oracle/**"
+      - "bench/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+      - "gleam.toml"
+      - "manifest.toml"
+      - "flake.*"
+      - "sibling-revisions.txt"
+      - "PROVENANCE.md"
+      - "THIRD-PARTY-NOTICES*"
   pull_request:
+    paths: *relevant
+  schedule:
+    - cron: "23 4 * * 1"
   workflow_dispatch:
 permissions:
   contents: read
@@ -10,7 +29,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   verification:
-    name: Full verification
+    name: Reactor oracle and measurements
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -60,42 +79,25 @@ jobs:
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           extra_nix_config: experimental-features = nix-command flakes
-      - name: All retained deterministic runtime checks
+      - name: Compare all seven scoped Reactor scenarios
         working-directory: saga
-        run: nix develop --no-update-lock-file -c python3 -B scripts/check.py ci
-      - name: Retain runtime evidence
+        run: nix develop .#oracle --no-update-lock-file --command python3 -B scripts/check.py oracle --logs .artifacts/extended/oracle
+      - name: Capture observational benchmark
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: saga
+        run: nix develop --no-update-lock-file -c python3 -B scripts/check.py benchmark --logs .artifacts/extended/benchmark
+      - name: Retain oracle and benchmark evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: saga-verification
-          path: saga/.artifacts/ci/
+          name: saga-extended
+          path: saga/.artifacts/extended/
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 14
-  design:
-    name: Design layers
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-        with:
-          extra_nix_config: experimental-features = nix-command flakes
-      - run: nix develop --no-update-lock-file -c python3 -B scripts/check.py design
-      - name: Retain design evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: saga-design
-          path: .artifacts/design/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
   ci:
-    name: CI
-    needs: [verification, design]
+    name: Extended CI
+    needs: [verification]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

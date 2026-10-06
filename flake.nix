@@ -57,10 +57,21 @@
           settings.global.excludes = [
             "**/*.pdf"
             ".render/**"
+            "**/.render/**"
+            "**/build/**"
+            "**/.artifacts/**"
+            "oracle/**"
+            "fixtures/**"
           ];
           programs.gleam.enable = true;
           programs.nixfmt.enable = true;
           programs.prettier.enable = true;
+          programs.ruff.format = true;
+          programs.shfmt.enable = true;
+          settings.formatter.shfmt.options = [
+            "-i"
+            "2"
+          ];
         };
       in
       {
@@ -74,6 +85,10 @@
             gleam
             beam28Packages.erlang
             rebar3
+            python3
+            ruff
+            shellcheck
+            actionlint
             # A disposable PostgreSQL 16 for integrations/saga_postgres's
             # storage conformance run (scripts/test-postgres.sh).
             postgresql_16
@@ -81,9 +96,9 @@
         };
 
         # Elixir-equipped shell for the Reactor differential oracle
-        # (oracle/reactor/). Kept out of devShells.default and CI so the
-        # package's own toolchain stays Elixir-free; run explicitly with
-        # `nix develop .#oracle -- scripts/oracle.sh`.
+        # (oracle/reactor/). The ordinary shell stays Elixir-free; extended
+        # CI and local oracle checks explicitly select this shell with
+        # `nix develop .#oracle --command scripts/oracle.sh`.
         devShells.oracle = pkgs.mkShell {
           packages = with pkgs; [
             lefthook
@@ -91,6 +106,10 @@
             beam28Packages.erlang
             beam28Packages.elixir
             rebar3
+            python3
+            ruff
+            shellcheck
+            actionlint
           ];
         };
 
