@@ -44,8 +44,13 @@ if ! command -v mix >/dev/null 2>&1; then
   exit 1
 fi
 
-work_dir="$(mktemp -d)"
-trap 'rm -rf "$work_dir"' EXIT
+if [[ -n ${SAGA_ORACLE_EVIDENCE_DIR:-} ]]; then
+  work_dir="$SAGA_ORACLE_EVIDENCE_DIR"
+  mkdir -p "$work_dir"
+else
+  work_dir="$(mktemp -d)"
+  trap 'rm -rf "$work_dir"' EXIT
+fi
 
 echo "== Reactor 1.0.6 side: replaying scenarios against real Reactor =="
 (
@@ -61,6 +66,7 @@ for scenario_path in "$oracle_dir"/scenarios/d*.exs; do
   id="$(echo "$scenario_file" | sed -E 's/^(d[0-9]+)_.*/\1/')"
   expected_file="$oracle_dir/expected/$id.txt"
   actual="$(cd "$oracle_dir" && mix run "scenarios/$scenario_file" 2>&1)"
+  printf '%s\n' "$actual" >"$work_dir/reactor-raw-$id.txt"
 
   if [ ! -f "$expected_file" ]; then
     echo "MISSING expected file for $scenario_file: $expected_file" >&2

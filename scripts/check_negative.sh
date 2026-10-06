@@ -104,7 +104,7 @@ for fixture in "$FIXTURES_DIR"/*.gleam; do
   while IFS= read -r fragment; do
     # Skip blank lines and comment lines in the .expect file.
     case "$fragment" in
-      "" | "#"*) continue ;;
+    "" | "#"*) continue ;;
     esac
     if ! grep -qF "$fragment" <<<"$output"; then
       echo "FAIL: $name.gleam did not contain expected diagnostic fragment: $fragment" >&2

@@ -1,0 +1,116 @@
+name: Retained oracle and benchmark
+on:
+  push:
+    paths: &relevant
+      - "src/**"
+      - "test/**"
+      - "examples/**"
+      - "fixtures/**"
+      - "integrations/**"
+      - "oracle/**"
+      - "bench/**"
+      - "scripts/**"
+      - ".github/workflows/**"
+      - "gleam.toml"
+      - "manifest.toml"
+      - "flake.*"
+      - "sibling-revisions.txt"
+      - "PROVENANCE.md"
+      - "THIRD-PARTY-NOTICES*"
+  pull_request:
+    paths: *relevant
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verification:
+    name: Reactor oracle and measurements
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Require trusted access to private sibling sources
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Fork pull requests cannot access private Sinal source. Run verification on a trusted repository branch." >&2
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: saga
+          persist-credentials: false
+      - name: Validate the complete pinned sibling revisions
+        id: pins
+        run: python3 -B saga/scripts/check.py pins >> "$GITHUB_OUTPUT"
+      - name: Read token for private Sinal source
+        id: siblings
+        if: vars.SIBLINGS_APP_CLIENT_ID != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.SIBLINGS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SIBLINGS_APP_PRIVATE_KEY }}
+          owner: gleam-dream
+          repositories: sinal
+          permission-contents: read
+      - name: Require private-source credentials before sibling checkout
+        env:
+          SIBLINGS_TOKEN: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
+        run: |
+          if [ -z "$SIBLINGS_TOKEN" ]; then
+            echo "Configure vars.SIBLINGS_APP_CLIENT_ID with secrets.SIBLINGS_APP_PRIVATE_KEY, or secrets.SIBLINGS_READ_TOKEN, for read access to Sinal." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: gleam-dream/sinal
+          ref: ${{ steps.pins.outputs.sinal }}
+          path: sinal
+          token: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: lostbean/json_blueprint
+          ref: ${{ steps.pins.outputs.json_blueprint }}
+          path: json_blueprint
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - name: Compare all seven scoped Reactor scenarios
+        working-directory: saga
+        run: nix develop .#oracle --no-update-lock-file --command python3 -B scripts/check.py oracle --logs .artifacts/extended/oracle
+      - name: Capture observational benchmark
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: saga
+        run: nix develop --no-update-lock-file -c python3 -B scripts/check.py benchmark --logs .artifacts/extended/benchmark
+      - name: Retain oracle and benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: saga-extended
+          path: saga/.artifacts/extended/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+  ci:
+    name: Extended CI
+    needs: [verification]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every mandatory result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          results = json.loads(os.environ['RESULTS'])
+          failures = {job: value['result'] for job, value in results.items() if value['result'] != 'success'}
+          if not results or failures:
+              raise SystemExit(f'Required jobs did not succeed: {failures}')
+          PY

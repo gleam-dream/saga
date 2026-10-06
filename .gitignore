@@ -11,3 +11,5 @@ oracle/reactor/_build/
 oracle/reactor/upstream/
 .render/
 **/.render/
+
+.artifacts/

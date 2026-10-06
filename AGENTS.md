@@ -18,20 +18,20 @@ The [coverage map](docs/COVERAGE.md) records runtime, tooling, and retained inte
 
 ## Gates
 
-Run from the repo root, inside `nix develop`:
+Run the authoritative registry from the repository root:
 
 ```sh
-gleam format --check src test
-gleam build --warnings-as-errors
-gleam test
-(cd examples/order_consumer && gleam format --check src test && gleam build --warnings-as-errors && gleam test && gleam run)
-(cd bench && gleam format --check src && gleam build --warnings-as-errors)
-(cd integrations/saga_postgres && gleam format --check src test && gleam build --warnings-as-errors && scripts/test-postgres.sh)
-scripts/check_negative.sh
-scripts/check_durable_restart.sh
-nix fmt
-nix flake check
+nix develop --command python3 -B scripts/check.py fast
+nix develop --command python3 -B scripts/check.py full
+nix develop .#oracle --command python3 -B scripts/check.py oracle
+nix develop --command python3 -B scripts/check.py benchmark
 ```
+
+`full` covers every deterministic runtime obligation and both native design
+layers. CI splits the same registry into `ci` and `design`; every mandatory
+result must succeed. The retained oracle runs on relevant source changes,
+weekly and manually; observational benchmarks run weekly and manually. See README's development
+inventory. Gate commands validate the existing tree without formatting it.
 
 `examples/order_consumer` is a separate Gleam package (path dependency on
 saga) that only imports saga's public modules — it is the external

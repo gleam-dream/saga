@@ -103,15 +103,46 @@ records the oracle revision, test coverage and deliberate behavior differences.
 
 ## Development
 
-Run from this repository:
+Run the shared registry from this repository:
 
 ```sh
-nix develop
-gleam format --check src test
-gleam build --warnings-as-errors
-gleam test
-(cd examples/order_consumer && gleam test && gleam run)
+nix develop --command python3 -B scripts/check.py fast
+nix develop --command python3 -B scripts/check.py full
+nix develop .#oracle --command python3 -B scripts/check.py oracle
+nix develop --command python3 -B scripts/check.py benchmark
 ```
 
-The [agent instructions](AGENTS.md#gates) list compiler-negative, restart,
-benchmark and adapter checks for changes affecting those contracts.
+| Profile     | Obligations and evidence                                                                                                                                                          |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fast`      | Formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions and root strict build/tests.                                                                          |
+| `ci`        | All four packages; external order consumer tests and executable; strict benchmark build; disposable PostgreSQL 16; positive/negative compiler fixtures; actual VM restart probes. |
+| `design`    | Both native layers' render freshness, vocabulary, links and integrity.                                                                                                            |
+| `full`      | All `ci` and `design` obligations.                                                                                                                                                |
+| `oracle`    | Seven real Reactor 1.0.6 scenarios, captured upstream output and normalized Saga comparison, including retained deliberate differences; full root tests.                          |
+| `benchmark` | Existing chain/fan/wide harness with correctness assertions and observational timings; no latency threshold.                                                                      |
+
+Every package build treats Gleam warnings as errors and separately compiles
+authored Erlang in `src` and `test` with `erlc -Werror` and dependency includes.
+Generated dependency code and retained oracle/fixture bytes are excluded from
+authored script formatting/lint. Ruff checks syntax, imports and undefined names;
+it is not a Python type checker. Gate commands check the tree without repairing it.
+
+The ordinary push, pull request and manual workflow requires both `ci` and
+`design` results. A separate workflow runs the oracle on relevant source changes,
+weekly and manually; observational benchmarks run weekly and manually. Each profile retains per-check logs,
+nonempty result entries, dependency revisions and environment/lock metadata in
+`.artifacts/PROFILE`. Failures stop the profile and retain their evidence.
+
+Hosted verification checks out immutable revisions from `sibling-revisions.txt`.
+Private Sinal read access requires `vars.SIBLINGS_APP_CLIENT_ID` and
+`secrets.SIBLINGS_APP_PRIVATE_KEY`, or `secrets.SIBLINGS_READ_TOKEN` restricted to
+Sinal. Public JSON Blueprint uses ordinary checkout. Checkout never persists
+credentials. Fork pull requests receive no private credential and fail explicitly;
+verify their changes from a trusted repository branch.
+
+The oracle proves only its seven scoped scenarios, not general Reactor or
+Temporal parity. The database harness disables fsync and synchronous_commit;
+passing runner/VM recovery tests do not prove database power-loss durability.
+The [benchmark guide](bench/README.md) gives the retained measurement method and
+limits. The [agent instructions](AGENTS.md#gates) describe the retained consumers
+and restart probes.
