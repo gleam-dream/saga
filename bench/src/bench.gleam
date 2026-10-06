@@ -21,16 +21,12 @@ import stats.{type Summary}
 
 const sizes = [10, 50, 100, 250, 500, 1000, 2000]
 
-/// Wall-clock budget per one bench cell (one shape at one N): once a single
-/// iteration's own run time exceeds this, larger sizes for that shape are
-/// skipped rather than run, and the skip is reported in the table.
+/// If a cell's warm-up exceeds this microsecond budget, report it as skipped
+/// and skip larger sizes for that shape.
 const max_iteration_us = 60_000_000
 
-/// Warm-up iterations before measurement, then this many measured runs per
-/// shape/N. N >= 1000 still gets a larger sample than a naive "fewer for
-/// big N" rule might suggest, since each run is now cheap enough (single-
-/// digit milliseconds, post build-once/admission fixes) that more samples
-/// cost little wall time.
+/// Measured runs after one separately timed warm-up: 20 below 1000 steps,
+/// 15 at larger sizes.
 const measured_runs = 20
 
 const measured_runs_huge = 15
@@ -180,9 +176,7 @@ fn assert_run_correct(
   }
 }
 
-// A tiny local fold-until (gleam_stdlib's `list.fold_until` uses
-// `list.ContinueOrStop`, imported here under local names for clarity at
-// call sites above).
+// Stops processing larger sizes when the warm-up budget is exceeded.
 type FoldSignal(acc) {
   Continue(acc)
   Stop(acc)

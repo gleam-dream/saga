@@ -2,20 +2,13 @@
 
 -export([monotonic_time/0, new_counter/0, counter_increment/1, counter_read/1]).
 
-%% Native monotonic clock, microseconds (finer resolution than the
-%% millisecond clock this bench used to use, which under-resolved the
-%% smallest N/shape cells to 0-1ms). The bench harness's own timing utility
-%% -- saga's internal ffi module is off limits (bench only imports saga's
-%% public modules), and gleam_erlang exposes no public monotonic clock, so
-%% this one function is the bench package's own tiny native surface.
+%% Microsecond resolution avoids rounding small cells to 0-1 ms. The
+%% benchmark has its own clock because Saga's internal FFI is not public.
 monotonic_time() ->
     erlang:monotonic_time(microsecond).
 
-%% A counter safe for concurrent increments from many processes (the
-%% workflow build function under benchmark runs inside each run's own
-%% coordinator process, not the bench harness's process, so a single-process
-%% mailbox trick cannot safely count it). Backed by an atomics array of one
-%% counter, which is exactly what it exists for.
+%% Atomic increments remain safe when compared revisions invoke builders
+%% from separate coordinator processes.
 new_counter() ->
     atomics:new(1, [{signed, false}]).
 

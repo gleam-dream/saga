@@ -4,10 +4,8 @@
 /// outputs via `saga.both`). Every step does trivial work (returns an Int)
 /// so the measured cost is scheduling/bookkeeping overhead, not step work.
 ///
-/// Every shape's builder closure increments `build_count` (a `Counter`)
-/// each time it runs, so a bench run can report how many times the
-/// workflow's build function was actually invoked across many runs of the
-/// same definition -- the number this whole benchmark exists to drive down.
+/// Each builder increments build_count on every invocation, independently
+/// of the timing measurements.
 import counter.{type Counter}
 import gleam/int
 import gleam/list

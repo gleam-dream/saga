@@ -1,131 +1,149 @@
 # saga_postgres
 
-A PostgreSQL storage for [saga](../../README.md)'s durable runs, for runners
-on one node or several nodes that share one database. Each execution is one
-row of the table `saga_executions`: its checkpoint bytes, revision,
-ownership generation, cancellation flag, phase, and claim (a random token
-and a lease expiry). The package implements the `saga/storage` contract and
-passes saga's conformance suite (`saga/storage/conformance`).
+`saga_postgres` stores [Saga](../../README.md) durable executions in PostgreSQL.
+It borrows the application's `pog.Connection` and implements `saga/storage`.
 
-It depends on `saga` and `pog` (4.1, over `pgo` 0.20). Saga itself does not
-depend on pog. It is developed and tested against PostgreSQL 16.
+## Installation
 
-## Usage
+The package is unreleased and uses local path dependencies. With an application,
+Saga checkout, and Sinal checkout in sibling directories, add these dependencies
+to the application for the example below:
 
-The application owns the connection pool and passes its `pog.Connection`.
-Run `migrate` once the pool is up, then hand `storage(config)` to
-`saga/durable`:
+```toml
+[dependencies]
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
+gleam_time = ">= 1.11.0 and < 2.0.0"
+pog = ">= 4.1.0 and < 4.2.0"
+saga = { path = "../saga" }
+saga_postgres = { path = "../saga/integrations/saga_postgres" }
+```
+
+The adapter targets Erlang and is developed and tested against PostgreSQL 16.
+Its pog and pgo minor ranges must stay aligned with Grind when both share a pool;
+the [dependency decision](docs/adr/0001-keep-postgres-as-a-borrowed-pool-adapter.md)
+explains that constraint.
+
+## Use the application pool
+
+The application starts, supervises, and stops the pool with pog. Pass its pooled
+connection to `prepare_storage` once at startup, then reuse the storage for every
+execution in the selected schema. Neither function below owns a pool to stop.
 
 ```gleam
-import gleam/erlang/process
+import gleam/result
 import gleam/time/duration
 import pog
 import saga/durable
+import saga/execution
+import saga/storage
 import saga_postgres
 
-let pool = process.new_name("db")
-let assert Ok(pool_config) = pog.url_config(pool, database_url)
-// Under a supervisor, add `pog.supervised(pool_config)` instead.
-let assert Ok(_) = pog.start(pool_config |> pog.pool_size(10))
-let db = pog.named_connection(pool)
+pub fn prepare_storage(
+  db: pog.Connection,
+) -> Result(storage.Storage, saga_postgres.MigrateError) {
+  let config = saga_postgres.config(db)
+  use Nil <- result.try(saga_postgres.migrate(config))
+  Ok(saga_postgres.storage(config))
+}
 
-let config = saga_postgres.config(db)
-let assert Ok(Nil) = saga_postgres.migrate(config)
-let storage = saga_postgres.storage(config)
-
-// `persistence` comes from `durable.new`, as with any saga storage.
-let assert Ok(run) =
-  durable.start_or_reconnect(persistence, storage, id: "checkout:order-123", input: order)
-let outcome = durable.drive(run, timeout: duration.seconds(30))
+pub fn checkout(
+  persistence: durable.Persistence(i, o, e, u),
+  store: storage.Storage,
+  order_id: String,
+  order: i,
+) -> Result(execution.Outcome(o, e, u), durable.Error) {
+  use run <- result.try(durable.start_or_reconnect(
+    persistence,
+    store,
+    id: "checkout:" <> order_id,
+    input: order,
+  ))
+  durable.drive(run, timeout: duration.seconds(30))
+}
 ```
 
-`durable.read`, `durable.cancel`, `durable.reconnect` and
-`durable.unfinished` take the same storage. One storage value serves every
-execution; build it once and share it.
+`persistence` comes from `durable.new`. The application's workflow, root and step
+codecs, compatible versions, and interrupted-effect resolvers are described in
+[Saga's durable usage guide](../../DURABILITY.md). A successful `checkout` returns
+the workflow's typed outcome; failure returns `durable.Error` without discarding
+its recovery information. Use `durable.error_kind` to decide the next action:
+Busy can require waiting for a lost owner's lease, while NeedsReconciliation
+requires application evidence before an interrupted effect may run again.
 
-## Defaults
+The same storage supports `durable.read`, `durable.cancel`, `durable.reconnect`,
+and `durable.unfinished`. Retain a pool connection handle for storage; a
+transaction-scoped connection has the driver's transaction lifetime and is
+unsuitable as a reusable store across runners.
 
-| Setting           | Default                      | Change with                               |
-| ----------------- | ---------------------------- | ----------------------------------------- |
-| Lease             | 30 seconds (at least 100 ms) | `with_lease(Duration)`                    |
-| Renewal           | every lease / 3 (10 seconds) | follows the lease                         |
-| Query timeout     | 4.5 seconds per statement    | fixed, below saga's call timeout          |
-| Call timeout      | 5 seconds                    | `storage.with_call_timeout` (saga)        |
-| Schema            | `public`                     | `with_schema` (1-63 of `a-z`, `0-9`, `_`) |
-| Owner-loss window | the lease                    | follows the lease                         |
+## Configuration and operations
 
-A query slower than 4.5 seconds fails with `storage.TimedOut` before saga gives
-up on the call. Raising saga's call timeout does not raise the query
-timeout.
+| Setting                   | Default                    | Change or ownership                                                                         |
+| ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------- |
+| Schema                    | `public`                   | `with_schema`; 1–63 lowercase ASCII letters/digits/underscores, first character not a digit |
+| Lease                     | 30 seconds, minimum 100 ms | `with_lease(Duration)`                                                                      |
+| Renewal interval          | Effective lease / 3        | Declared by the adapter; Saga owns the heartbeat                                            |
+| Pool query attempt budget | 4.5 seconds                | Fixed per pool-backed query attempt                                                         |
+| Saga operation wait       | 5 seconds                  | `storage.with_call_timeout`; independent of query budget                                    |
 
-## When a runner dies
+Query retries and refusal diagnosis can issue more than one statement, so the
+attempt budget is not a total operation deadline. Transaction-scoped connections
+and migration use the driver's transaction/connection timing. The
+[deadline decision](docs/adr/0004-separate-query-budgets-from-total-deadlines.md)
+records this limit. A timed-out or lost reply does not prove a write was absent.
 
-A runner claims an execution before it runs it, and saga renews the claim
-every lease / 3 while the runner lives, however long a step takes. When the
-runner is killed or crashes while `drive`'s caller lives, `drive` releases
-the claim at once and returns `RunnerLost`, so the next `drive` resumes
-without waiting for the lease. A runner whose node dies stops renewing, and
-nothing releases its claim. That claim ends when the lease expires, judged by the database's clock (`clock_timestamp()`), so the
-nodes' clocks need not agree. Until then another `drive` of the execution
-returns `StorageFailure(Busy)`, and `durable.unfinished` does not list it:
-retry `Busy` no sooner than the lease, so that a job's snooze limit cannot
-run out first.
-After expiry, `durable.unfinished` lists it, and the next `drive` claims it
-with a new generation and token and resumes from the last checkpoint. It
-asks the resolver of each interrupted step what happened instead of running
-the step again. The dead runner's claim is fenced: any commit with it fails
-with `StaleOwner`.
+A successful release makes an execution available immediately. Without release,
+takeover becomes possible when the database-clock lease expires. A successful
+takeover replaces the generation/token and fences the former claim's writes.
+An expired claim that has not been replaced can still commit, renew, or release.
+Fencing cannot retract an already sent external effect; use stable effect
+identities and Saga's recovery evidence.
 
-A claim whose lease expired stays current until another claim replaces it,
-so a runner that was only slow may still commit; the commit renews the
-lease.
-
-Saga does not wake runners. Call `durable.unfinished(storage, limit:)` from
-a sweeper or a job, and `durable.reconnect` plus `durable.drive` for each id.
-
-## One pool for the application, grind and saga
-
-`saga_postgres` keeps only the application's `pog.Connection`, so the
-application's own queries, grind, and saga's storage share one pool. Each
-storage operation checks a connection out for one statement and returns it,
-so a step may query the same pool.
-
-`pog` and `pgo` are pinned to `>= 4.1.0 and < 4.2.0` and
-`>= 0.20.0 and < 0.21.0`, not to the next major version. Grind pins these
-exact minor ranges because its FFI matches pog's and pgo's private
-connection shapes. An application that uses both packages resolves one
-version of each, so these ranges must stay aligned with grind's
-`gleam.toml`.
+Applications own scanning and wakeups. `durable.unfinished(storage, limit:)`
+returns candidates without reserving them; reconnect and drive can still
+encounter Busy. The adapter retains finished rows indefinitely and has no
+pruning API. Application effects, job scheduling, and checkpoint commits have
+separate transaction boundaries.
 
 ## Migrations
 
-`migrate` creates the schema if missing and applies each numbered migration
-not yet applied, in one transaction, under a transaction-scoped advisory
-lock per schema. It records versions in `saga_schema_migrations`. It is
-idempotent and safe to call from several nodes at once. Migrations only move
-forward.
+`migrate` applies forward schema migrations in a READ COMMITTED transaction under
+the selected schema's advisory lock. Concurrent package callers serialize, and a
+repeat skips applied versions.
 
-The same SQL is in `priv/migrations/` (`--- migration:up` /
-`--- migration:down` sections) for an application that applies migrations
-with its own tool. Run it with `search_path` set to the target schema; it
-takes the same lock.
+[priv/migrations](priv/migrations) ships the equivalent SQL up sections. An
+application migration tool selects unapplied versions under that lock and runs
+them in a transaction with `search_path` set to the target schema. The raw up file
+itself is not repeat-idempotent.
 
-The statements are written for READ COMMITTED, PostgreSQL's default. A
-write that fails to serialise under REPEATABLE READ or SERIALIZABLE is
-retried a few times.
+The packaged down section drops retained execution data. Package `migrate` never
+runs it or converts Saga checkpoint bytes.
 
-## Tests
+## Development
 
-The tests run against a throwaway PostgreSQL 16 cluster only. From the saga
-dev shell (`nix develop`), which provides PostgreSQL:
+Use the parent Saga Nix shell. From this package, check formatting and compilation:
 
 ```sh
-cd integrations/saga_postgres
-scripts/test-postgres.sh
+nix develop ../.. --command bash -c 'gleam format --check src test && gleam build --warnings-as-errors'
 ```
 
-The script runs `initdb` in a temporary directory, starts the server on
-127.0.0.1 at a random free port with trust authentication and `fsync` off,
-ignores every `PG*` variable, exports `SAGA_TEST_DATABASE_URL`, runs
-`gleam test`, and removes the cluster on exit. Plain `gleam test` fails,
-because `SAGA_TEST_DATABASE_URL` is unset.
+Run tests with the disposable PostgreSQL 16 harness:
+
+```sh
+nix develop ../.. --command scripts/test-postgres.sh
+```
+
+The script clears `PG*` settings and the prior test URL, creates its own loopback
+cluster at a free port, and stops/removes the cluster on exit. Plain `gleam test`
+fails without its script-provided `SAGA_TEST_DATABASE_URL`.
+
+Tests cover Saga's public storage conformance, schema/SQL equivalence, fencing,
+cancellation races, renewal, query timeout, runner loss/recovery, and shared
+application-pool use. The harness disables media durability, so these tests do
+not establish database failover, multi-VM partition behavior, or acknowledged-write
+survival.
+
+The [design](docs/design/design.typ), [rendered design](docs/design/design-layer.pdf),
+[vocabulary](docs/design/CONTEXT.typ), [decisions](docs/adr), and
+[coverage](docs/COVERAGE.md) describe the adapter and its unresolved extensions.
+Saga owns the shared [storage protocol](../../docs/design/design.typ#storage-and-claim-lifetime).
+[AGENTS.md](AGENTS.md) gives the nested design-document commands.

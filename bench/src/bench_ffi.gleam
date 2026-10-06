@@ -1,6 +1,4 @@
-/// Thin typed binding onto `bench_ffi.erl`'s native monotonic clock. See
-/// that file for why the bench harness needs its own tiny native surface
-/// (saga's own internal ffi module is off limits; `gleam_erlang` exposes no
-/// public monotonic clock).
+/// Monotonic microsecond clock from bench_native. The benchmark uses its
+/// own native binding because Saga's internal FFI is outside the public API.
 @external(erlang, "bench_native", "monotonic_time")
 pub fn monotonic_time() -> Int

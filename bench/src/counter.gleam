@@ -1,12 +1,6 @@
-/// A concurrency-safe counter, used only to count how many times a
-/// workflow's build function actually runs across a bench shape's many
-/// runs. The build function is evaluated once at `define` time and (before
-/// the build-once refactor) once more per run *inside that run's own
-/// coordinator process* -- never the bench harness's own process -- so a
-/// single-process mailbox cell (as `saga/internal/cell` uses internally)
-/// cannot safely count it: many coordinator processes increment
-/// concurrently. Backed by an Erlang atomics array, which exists precisely
-/// for this.
+/// Counts builder invocations across definition and execution. The atomic
+/// counter supports increments from separate processes, so it also measures
+/// older revisions whose coordinators reevaluate the builder.
 pub type Counter
 
 @external(erlang, "bench_native", "new_counter")
