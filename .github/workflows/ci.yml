@@ -14,11 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Require trusted access to private sibling sources
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        run: |
-          echo "Fork pull requests cannot access private Sinal source. Run verification on a trusted repository branch." >&2
-          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: saga
@@ -26,30 +21,11 @@ jobs:
       - name: Validate the complete pinned sibling revisions
         id: pins
         run: python3 -B saga/scripts/check.py pins >> "$GITHUB_OUTPUT"
-      - name: Read token for private Sinal source
-        id: siblings
-        if: vars.SIBLINGS_APP_CLIENT_ID != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.SIBLINGS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.SIBLINGS_APP_PRIVATE_KEY }}
-          owner: gleam-dream
-          repositories: sinal
-          permission-contents: read
-      - name: Require private-source credentials before sibling checkout
-        env:
-          SIBLINGS_TOKEN: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
-        run: |
-          if [ -z "$SIBLINGS_TOKEN" ]; then
-            echo "Configure vars.SIBLINGS_APP_CLIENT_ID with secrets.SIBLINGS_APP_PRIVATE_KEY, or secrets.SIBLINGS_READ_TOKEN, for read access to Sinal." >&2
-            exit 1
-          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: gleam-dream/sinal
           ref: ${{ steps.pins.outputs.sinal }}
           path: sinal
-          token: ${{ steps.siblings.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
