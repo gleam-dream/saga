@@ -48,6 +48,23 @@ let result = durable.drive(run, timeout: duration.seconds(30))
 - `NotSent` requires proof of absence; `MaybeSent` preserves suspension. Do not replay a remote effect because the old driver disappeared or a delivery system retried.
 - Explicit cancel records intent. Reconcile interrupted admitted effects before rollback; cancellation does not prove reversal, and an already completed last step may be undone when cancellation wins before terminal commit.
 
+## Recover a committed local database effect
+
+- Sharing PostgreSQL or a pool does not make an application's SQL transaction atomic with Saga's subsequent checkpoint. The [adapter's commit boundaries](integrations/saga_postgres/docs/design/design.typ#effect-timing-and-recovery) keep those writes separate.
+- Retain a stable business operation ID and an authoritative posting record in the application transaction. Make the effect idempotent and discoverable under that identity. Do not use a missing checkpoint as evidence that SQL rolled back.
+- The [financial recovery consumer](https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery) exercises this sequence through public APIs, disposable PostgreSQL, a scripted provider and controlled runner termination:
+
+  ```text
+  Posting transaction commits
+    → runner dies before Saga checkpoints completion
+    → restarted resolver reads the application's posting record
+    → Completed restores the recorded result
+    → posting callback is not repeated
+  ```
+
+- Reconnect the same durable execution with a compatible definition. Its attempt resolver returns `Completed` only when the application record establishes the result. A failed lookup or inconclusive absence remains `MaybeSent`; it does not authorize another effect.
+- The consumer also demonstrates Grind redelivering the coordinator. That delivery resumes Saga recovery; it does not itself authorize resubmitting a payment. The application owns financial evidence, reservation and posting independently of both libraries.
+
 ## Discover unfinished executions
 
 ```gleam
