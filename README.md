@@ -88,6 +88,11 @@ shows shared dependencies and application-owned records and error types. [Durabl
 cover codecs, resolvers, saved identities, timing margins and recovery. Storage
 adapters include memory, file and the separate [PostgreSQL package](integrations/saga_postgres).
 
+A local SQL write can commit before Saga saves its checkpoint, even when both
+use the same database. The [financial recovery consumer](https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery)
+shows how an application posting record resolves that interruption without
+repeating the posting callback. See [local database recovery](DURABILITY.md#recover-a-committed-local-database-effect).
+
 ## Benchmarks and design
 
 The [benchmark guide](bench/README.md) includes retained measurements and a
