@@ -11,8 +11,8 @@ gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_json = ">= 3.0.0 and < 4.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 saga = { path = "../.." }
-sinal = { path = "../../../sinal" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "4aee4c3b920bd7241da7659995dfc0a0b5767348" }
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
-json_blueprint = { path = "../../../json_blueprint" }
+json_blueprint = { git = "https://github.com/lostbean/json_blueprint.git", ref = "0015fc50ddfd334b9c44253c36dc429d29a5845d" }

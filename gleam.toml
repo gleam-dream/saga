@@ -14,10 +14,8 @@ gleam_otp = ">= 1.0.0 and < 2.0.0"
 gleam_json = ">= 3.0.0 and < 4.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 # Sinal is required: the coordinator emits saga/telemetry events on every
-# run. It stays a path dependency until it is published; then this line
-# becomes `sinal = ">= 0.1.0 and < 1.0.0"`. CI checks out the revision in
-# sibling-revisions.txt.
-sinal = { path = "../sinal" }
+# run. Pin its published source so consumers need no sibling checkout.
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "4aee4c3b920bd7241da7659995dfc0a0b5767348" }
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
