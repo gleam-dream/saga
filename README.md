@@ -13,8 +13,8 @@ checkout to your application's `gleam.toml`:
 saga = { path = "../saga" }
 ```
 
-Keep a [Sinal checkout](https://github.com/gleam-dream/sinal) beside Saga:
-Saga currently depends on `../sinal` for its execution events. The application
+Gleam fetches the pinned [Sinal source](https://github.com/gleam-dream/sinal)
+for execution events; no sibling checkout is required. The application
 owns any external clients and storage it supplies.
 
 ## Run a checkout workflow

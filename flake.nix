@@ -81,6 +81,7 @@
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
+            git
             lefthook
             gleam
             beam28Packages.erlang
@@ -101,6 +102,7 @@
         # `nix develop .#oracle --command scripts/oracle.sh`.
         devShells.oracle = pkgs.mkShell {
           packages = with pkgs; [
+            git
             lefthook
             gleam
             beam28Packages.erlang
