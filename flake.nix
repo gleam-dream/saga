@@ -3,7 +3,7 @@
 
   inputs = {
     design-layer.url = "github:lostbean/design-layer";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
@@ -84,8 +84,8 @@
             git
             lefthook
             gleam
-            beam28Packages.erlang
-            rebar3
+            beam29Packages.erlang
+            beam29Packages.rebar3
             python3
             ruff
             shellcheck
@@ -105,9 +105,9 @@
             git
             lefthook
             gleam
-            beam28Packages.erlang
-            beam28Packages.elixir
-            rebar3
+            beam29Packages.erlang
+            beam29Packages.elixir_1_20
+            beam29Packages.rebar3
             python3
             ruff
             shellcheck
