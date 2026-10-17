@@ -21,7 +21,8 @@ pub type Migration {
 /// statement below computes from `current_schema()`.
 pub const lock_prefix = "saga-postgres-migrate:"
 
-const lock = "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended('saga-postgres-migrate:' || current_schema(), 0))) AS l"
+const lock =
+  "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended('saga-postgres-migrate:' || current_schema(), 0))) AS l"
 
 pub fn all() -> List(Migration) {
   [
