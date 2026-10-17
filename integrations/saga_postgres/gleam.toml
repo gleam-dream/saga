@@ -17,7 +17,7 @@ gleam_time = ">= 1.11.0 and < 2.0.0"
 # A path dependency until saga is published. Saga's own path dependency on
 # sinal must resolve from here too.
 saga = { path = "../.." }
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "4aee4c3b920bd7241da7659995dfc0a0b5767348" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "9727f9baab6ed4f796780a0c3a1027c3292c5fc7" }
 # Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`: an application that
 # uses both saga_postgres and grind shares one pog/pgo pool (the app's own
 # `pog.Connection` serves the app, grind and saga), and grind pins these exact
