@@ -7,7 +7,7 @@
 //// The posting record here is a process-independent in-memory table standing
 //// in for an application transaction. The real PostgreSQL version of this
 //// sequence is exercised by the Oversight financial-recovery consumer
-//// (https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery).
+//// (https://github.com/gleam-dream/oversight/tree/main/apps/financial_recovery).
 
 import gleam/erlang/process
 import gleam/int

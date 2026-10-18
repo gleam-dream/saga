@@ -51,12 +51,12 @@
   #answers(title: "saga_postgres", responsibility: [Translate Saga Storage into PostgreSQL execution persistence and fenced claims.], interface: [One public module with Config, schema admission, migration, diagnostic rendering, and Storage construction.], interactions: [Borrows pog.Connection; uses PostgreSQL statements; declares Saga renewal callbacks.], invariants: [No adapter process registry, pool startup, or workflow decoding is required.], failure: [Typed schema/migration failures and Saga storage errors preserve caller decisions; unresolved replies preserve uncertainty.])
   #md-table(3, (
     [*Boundary*], [*Relationship and authority*], [*Contract owner*],
-    [Adapter → Saga], [Conformist: Saga defines storage values and workflow permission; adapter enforces database mutations.], [#lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/design.typ")[Saga storage and claim lifetime]],
+    [Adapter → Saga], [Conformist: Saga defines storage values and workflow permission; adapter enforces database mutations.], [#lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/design.typ")[Saga storage and claim lifetime]],
     [Adapter → PostgreSQL/pog], [Anti-corruption layer: PostgreSQL rows and driver failures become Saga Stored, Claim, and Error values.], [This layer's row, operation, and failure units.],
     [Application → adapter], [Customer/supplier: application supplies pooled connection, schema access, and lease policy; adapter supplies persistence.], [Pool ownership and configuration.],
   ))
   #points(
-    [Saga owns #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/CONTEXT.typ")[durable execution], #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/CONTEXT.typ")[checkpoint], #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/CONTEXT.typ")[claim], and #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/CONTEXT.typ")[revision] semantics. This glossary defines only the PostgreSQL projection and its lease/migration vocabulary.],
+    [Saga owns #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/CONTEXT.typ")[durable execution], #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/CONTEXT.typ")[checkpoint], #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/CONTEXT.typ")[claim], and #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/CONTEXT.typ")[revision] semantics. This glossary defines only the PostgreSQL projection and its lease/migration vocabulary.],
     [The aggregate owner here is the PostgreSQL store for each #term("term-execution-row"). Its database/schema scope separates identical execution ids; an id alone does not locate a database or authenticate a caller.],
     [The package targets Erlang and depends on Saga, Sinal's transitive identity vocabulary, Gleam libraries, pog, and pgo. It has no Grind, Fabric, Relay, Blueprint, provider, or scheduling dependency; #adr(1) records the package boundary.],
   )
@@ -257,7 +257,7 @@
     [Migration transaction commit], [Schema steps and version markers together], [A lost commit reply can leave the migration applied; a new migrate call is safe.],
   ))
   #points(
-    [#term("term-conditional-write") admission is the adapter's effect boundary. Saga's #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/design.typ")[checkpoint and effect permission] and #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/design.typ")[recovery rules] own checkpoint format, codecs, compatibility stamps, and resolver outcomes.],
+    [#term("term-conditional-write") admission is the adapter's effect boundary. Saga's #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/design.typ")[checkpoint and effect permission] and #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/design.typ")[recovery rules] own checkpoint format, codecs, compatibility stamps, and resolver outcomes.],
     [An application step may query the same pool, but its business write and Saga's subsequent checkpoint are independent transactions. This adapter exposes no combined business/checkpoint transaction or scheduling outbox.],
     [Ownership fencing guards later saved writes. An already sent remote request can continue after runner loss or takeover; applications use stable effect identities, downstream deduplication, and resolver evidence.],
     [The adapter creates no per-checkpoint observation event. Applications consume typed storage/durable results and the parent observation contract rather than treating lack of an event as proof of absence.],
@@ -362,7 +362,7 @@
     [One discovery call is a snapshot, not a reservation or a continuous watch. Repeated sweepers can receive the same ids; there is no notification, cursor, automatic wakeup, or fairness guarantee.],
     [#term("term-retention") is indefinite here: no TTL, pruner, delete, or archival API removes executions. Finished rows remain loadable and reserve their ids; release does not delete bytes or journal evidence.],
     [Deleting data with administrative SQL discards recovery and idempotent admission evidence. Applications must decide reference validity, child/compensation authority, backups, and identifier reuse before introducing retention deletion.],
-    [The parent #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/execution/design.typ")[composition contracts] retain independent result/journal retention and owner-backed compensation authority. Those contracts do not exist in this schema and are the extension boundary recorded by #adr(5).],
+    [The parent #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/execution/design.typ")[composition contracts] retain independent result/journal retention and owner-backed compensation authority. Those contracts do not exist in this schema and are the extension boundary recorded by #adr(5).],
   )
 ])
 
@@ -383,7 +383,7 @@
     [Those settings make tests disposable rather than media-durability evidence. Production acknowledged-write survival depends on the application's PostgreSQL settings, storage, backups, and replication/failover contract.],
     [The callable boundary inventory is six public adapter functions, seven Storage callbacks, and one renewal callback. Behavior areas are configuration, migration, admission/reads, ownership, conditional progress, cancellation, and discovery; asynchronous UI/delivery, domain-event publication, and provider policy are inapplicable because the adapter owns none.],
     [A new storage wrapper must preserve renewal and Saga's call-timeout ownership. A new schema step must preserve atomic authority, refusal precedence, opaque bytes, and the packaged SQL equivalence test.],
-    [The parent #lnk("https://github.com/gleam-dream/saga/blob/master/docs/design/durability/design.typ")[storage verification] owns the common conformance contract. #adr(3) states the evidence limit; #adr(5) preserves extension requirements.],
+    [The parent #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/durability/design.typ")[storage verification] owns the common conformance contract. #adr(3) states the evidence limit; #adr(5) preserves extension requirements.],
   )
 ])
 ]
