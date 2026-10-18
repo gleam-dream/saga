@@ -25,4 +25,4 @@
 
 - Source-derived documentation finding recorded 2026-10-06 against Saga `2a6bc4bf380145e62015e66e15d216f9a6d7d1d4` and the checked-in adapter/manifest.
 - The public README and module comments used broader query wording. They are clarified in the staged documentation; production source, query timeouts, SQL, examples, and tests are unchanged.
-- Parent [drive-budget ADR](https://github.com/gleam-dream/saga/blob/master/docs/adr/0009-drive-budget-and-example-gaps.md#adr-0009) owns drain/release after drive timeout. This record owns the distinct adapter query/transaction topology limit.
+- Parent [drive-budget ADR](https://github.com/gleam-dream/saga/blob/main/docs/adr/0009-drive-budget-and-example-gaps.md#adr-0009) owns drain/release after drive timeout. This record owns the distinct adapter query/transaction topology limit.

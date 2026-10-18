@@ -22,4 +22,4 @@
 - Sources captured before retirement: Oversight's Saga release review, its release decisions and its public API guidelines (ownership and composition rules).
 - Immutable source: [Oversight release decisions](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/release-api/DECISIONS.md) and [Saga release review](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/release-api/saga.md).
 - The exact original discussion leading to each SQL representation is not recoverable from the inspected source/history. The owner-authorized package boundary is recorded; no additional historical approval is inferred.
-- Parent claim semantics and their rationale remain in [Saga's storage ADR](https://github.com/gleam-dream/saga/blob/master/docs/adr/0005-storage-claims-as-values.md#adr-0005).
+- Parent claim semantics and their rationale remain in [Saga's storage ADR](https://github.com/gleam-dream/saga/blob/main/docs/adr/0005-storage-claims-as-values.md#adr-0005).
