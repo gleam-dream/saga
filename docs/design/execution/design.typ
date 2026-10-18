@@ -31,9 +31,6 @@
   pending-entry(title: "Shared capacity and explicit lifecycle extensions", kind: "ruling", since: "2026-10-06", adr: [#adr(8)])[
     Shared or partitioned budgets across runs and children, coordinator supervision, explicit in-memory halt/resume, and undo retry policy await a decision. Concurrency is per run and each undo is attempted once.
   ],
-  pending-entry(title: "The common example must retain typed failures", kind: "ruling", since: "2026-10-06", adr: [#adr(9)])[
-    The execution module example reduces all noncompletion to unknown-effects lists and admission failure to an empty list. Correcting the executable example and its consumer assertion requires a coordinated example change; the library already returns full typed reports.
-  ],
   pending-entry(title: "Defaults and rules folded from retired guides are unchecked", kind: "verify", since: "2026-10-17")[
     The defaults and setters tables, the callback and correlation rules, and the unknown-effect semantics came from retired usage guides. The compiled usage examples exercise the observable topics. Only the attempt timeout default has been compared with source. Each other numeric default and bound needs a source check.
   ],
