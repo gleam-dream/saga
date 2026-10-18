@@ -8,6 +8,12 @@ import gleam/io
 import gleam/list
 import gleam/time/duration
 import order_consumer/domain.{type Order, Order}
+import order_consumer/usage/checkout as usage_checkout
+import order_consumer/usage/committed_effect
+import order_consumer/usage/correlation as usage_correlation
+import order_consumer/usage/durable_run
+import order_consumer/usage/operations
+import order_consumer/usage/unknown_effect
 import order_consumer/workflows
 import saga/execution
 import saga/telemetry
@@ -19,6 +25,7 @@ pub fn main() -> Nil {
   scenario_b_failure_and_compensation()
   scenario_c_advanced_config_and_cancellation()
   scenario_d_caller_owned_error_types()
+  usage_examples()
   io.println("\n== all scenarios completed ==")
 }
 
@@ -197,4 +204,26 @@ fn string_of_cancel_reason(reason: execution.CancelReason) -> String {
 
 fn string_of_outcome_kind(kind: telemetry.OutcomeKind) -> String {
   telemetry.outcome_kind_name(kind)
+}
+
+/// The documented usage examples; each asserts what its guide section states.
+fn usage_examples() -> Nil {
+  io.println("-- usage examples")
+  let examples = [
+    #("checkout: common path", usage_checkout.run_common_path),
+    #("checkout: configuration", usage_checkout.run_configuration),
+    #("checkout: telemetry", usage_checkout.run_telemetry),
+    #("unknown effects", unknown_effect.run),
+    #("step correlation", usage_correlation.run),
+    #("durable run", durable_run.run),
+    #("durable: stable id and reconnect", operations.run_stable_id),
+    #("durable: discover unfinished", operations.run_discover_unfinished),
+    #("durable: error kinds", operations.run_error_kinds),
+    #("durable: committed local effect", committed_effect.run),
+  ]
+  list.each(examples, fn(example) {
+    let #(name, run) = example
+    run()
+    io.println("   ok  " <> name)
+  })
 }
