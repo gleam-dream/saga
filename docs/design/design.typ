@@ -72,7 +72,7 @@
   #points(
     [Every package build treats Gleam warnings as errors and compiles authored Erlang in `src` and `test` with `erlc -Werror` and dependency includes. Generated dependency code and retained oracle or fixture bytes are excluded from authored-script formatting and lint.],
     [Gate commands check the tree without repairing it. A profile stops at its first failure and retains per-check logs, nonempty result entries, dependency revisions, and environment metadata under `.artifacts/PROFILE`.],
-    [Hosted verification checks out immutable sibling revisions from `sibling-revisions.txt` without persisting credentials. Fork pull requests run the same required checks.],
+    [Hosted verification builds from the committed lock files without persisting credentials. Unpublished sibling packages are git dependencies on `main`, and each manifest locks the resolved commit. Fork pull requests run the same required checks.],
     [A push, pull request, or manual run requires the ci and design profiles. The oracle runs on relevant source changes, weekly, and manually; the benchmark runs weekly and manually.],
     [The oracle proves only its seven scoped scenarios, not general Reactor or Temporal parity. The database harness disables fsync and synchronous commit, so passing runner and VM recovery tests establish no database power-loss durability. The decision is #adr(13).],
   )
