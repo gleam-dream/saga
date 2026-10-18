@@ -8,7 +8,6 @@ erl_crash.dump
 # committed so `reactor == 1.0.6` stays pinned.
 oracle/reactor/deps/
 oracle/reactor/_build/
-oracle/reactor/upstream/
 .render/
 **/.render/
 
