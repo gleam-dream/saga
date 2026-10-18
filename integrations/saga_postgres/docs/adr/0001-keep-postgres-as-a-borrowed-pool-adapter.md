@@ -18,8 +18,8 @@
 ## Evidence and historical limits
 
 - Adapter introduction: Saga commit `2ee5e0add00b94ea6da43734d28d01491b0bc6f1`, 2026-10-02. Its package comments, public module, and shared-pool consumer record the ownership and dependency rationale.
-- The Oversight release plan recorded the owner choice to ship this adapter in the first package set. The later Round 9 decision retained both PostgreSQL adapters because their correctness-critical infrastructure justified package isolation.
-- Sources captured before retirement: `oversight/docs/release-api/saga.md` SAGA-R2/R3 and questions 2/7; `DECISIONS.md` Round 9; `PLAN.md` Saga PostgreSQL and Round 9 rows; `PUBLIC-API-GUIDELINES.md` ownership/composition rules.
+- Oversight's release review recorded the owner choice to ship this adapter in the first package set. A later decision retained both PostgreSQL adapters because their correctness-critical infrastructure justified package isolation.
+- Sources captured before retirement: Oversight's Saga release review, its release decisions and its public API guidelines (ownership and composition rules).
 - Immutable source: [Oversight release decisions](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/release-api/DECISIONS.md) and [Saga release review](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/release-api/saga.md).
 - The exact original discussion leading to each SQL representation is not recoverable from the inspected source/history. The owner-authorized package boundary is recorded; no additional historical approval is inferred.
 - Parent claim semantics and their rationale remain in [Saga's storage ADR](https://github.com/gleam-dream/saga/blob/master/docs/adr/0005-storage-claims-as-values.md#adr-0005).

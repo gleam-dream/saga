@@ -1409,7 +1409,7 @@ pub fn error_kinds_classify_every_variant_test() {
 }
 
 // ---------------------------------------------------------------------------
-// unknown_when across a restart (open question 1)
+// unknown_when across a restart
 // ---------------------------------------------------------------------------
 
 /// A "maybe sent" error is recorded as unknown when it ends, and the record
