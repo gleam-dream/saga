@@ -21,7 +21,7 @@
 #   4. Runs the full `gleam test` suite (the assertions themselves).
 #
 # See oracle/differences/README.md for the diff file format and
-# PROVENANCE.md for what each scenario proves.
+# docs/adr/0010-reactor-is-a-scoped-differential-oracle.md for what each scenario proves.
 #
 # Requires Elixir/mix, which is NOT in the package's default dev shell.
 # Run this from `nix develop .#oracle`, e.g.:
@@ -93,7 +93,7 @@ done
 if [ "$fail" -ne 0 ]; then
   echo "error: one or more Reactor scenarios drifted from expected/. The" >&2
   echo "recorded oracle evidence no longer matches upstream Reactor 1.0.6 —" >&2
-  echo "investigate before trusting PROVENANCE.md's deliberate-difference claims." >&2
+  echo "investigate before trusting ADR 0010's deliberate-difference claims." >&2
   exit 1
 fi
 
@@ -147,7 +147,7 @@ if [ "$compare_fail" -ne 0 ]; then
   echo "error: the mechanical reactor-vs-saga comparison did not match its" >&2
   echo "recorded classification for at least one scenario. Either Saga's" >&2
   echo "behavior changed, or oracle/differences/*.diff is stale — update" >&2
-  echo "PROVENANCE.md and the checked diff together, deliberately, never" >&2
+  echo "ADR 0010 and the checked diff together, deliberately, never" >&2
   echo "silently." >&2
   exit 1
 fi
@@ -162,11 +162,11 @@ for scenario_path in "$oracle_dir"/scenarios/d*.exs; do
   scenario_file="$(basename "$scenario_path")"
   id="$(echo "$scenario_file" | sed -E 's/^(d[0-9]+)_.*/\1/')"
   if [ -f "$diffs_dir/$id.diff" ]; then
-    echo "  $id -> deliberate difference (see oracle/differences/$id.diff, PROVENANCE.md)"
+    echo "  $id -> deliberate difference (see oracle/differences/$id.diff, ADR 0010)"
   else
     echo "  $id -> match"
   fi
 done
 echo
-echo "See PROVENANCE.md for the full upstream-test-to-Saga-test mapping and"
+echo "See ADR 0010 for the upstream-test-to-Saga-test mapping and"
 echo "oracle/differences/README.md for the diff-checking mechanism above."

@@ -11,7 +11,7 @@
 # Reactor undoes in FORWARD completion order (e1, e2, e3) and retains
 # every undo failure plus the triggering run failure as separate error
 # classes. Saga is a DELIBERATE DIFFERENCE here: it undoes in REVERSE
-# completion order (e3, e2, e1). See PROVENANCE.md D2 / oracle/reactor's
+# completion order (e3, e2, e1). See ADR 0010 D2 / oracle/reactor's
 # scripts/oracle.sh, which asserts the difference rather than hiding it.
 
 defmodule Oracle.D2 do

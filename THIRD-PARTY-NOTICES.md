@@ -35,5 +35,5 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTI
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-See [`PROVENANCE.md`](PROVENANCE.md) for which Saga tests were adapted from
+See [ADR 0010](docs/adr/0010-reactor-is-a-scoped-differential-oracle.md) for which Saga tests were adapted from
 which upstream Reactor tests, and which behaviors are deliberately different.

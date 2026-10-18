@@ -21,5 +21,5 @@
 
 ## Related executable example
 
-- README and execution module examples reduce noncompletion to unknown-effects lists and admission errors to Error([]); the readme consumer expects that list for declined payment.
+- The execution module example reduces noncompletion to unknown-effects lists and admission errors to Error([]); the checkout usage example expects that list for declined payment.
 - The library already preserves native Outcome. A coordinated example/assertion change must retain business failure, admission failure, undo failure, and uncertainty distinctly; the existing consumer assertion currently expects the erased value.

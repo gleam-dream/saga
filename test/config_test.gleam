@@ -23,7 +23,7 @@ pub fn config_defaults_to_a_60_second_step_timeout_test() {
   settings.step_timeout |> should.equal(Some(60_000))
 }
 
-/// Every default in the README's defaults table, read from the checked
+/// Every default in the design's time-and-capacity table, read from the checked
 /// settings a run starts with.
 pub fn config_defaults_match_the_defaults_table_test() {
   let assert Ok(settings) = execution.settings(execution.config(), None)

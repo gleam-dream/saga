@@ -15,7 +15,7 @@ on:
       - "manifest.toml"
       - "flake.*"
       - "sibling-revisions.txt"
-      - "PROVENANCE.md"
+      - "docs/adr/0010-reactor-is-a-scoped-differential-oracle.md"
       - "THIRD-PARTY-NOTICES*"
   pull_request:
     paths: *relevant

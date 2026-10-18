@@ -22,7 +22,7 @@
 ///     settlement) must match a checked-in expected diff under
 ///     `oracle/differences/*.diff`, not an echoed summary.
 ///
-/// See `PROVENANCE.md` for the full upstream-test-to-Saga-test mapping
+/// See `docs/adr/0010-reactor-is-a-scoped-differential-oracle.md` for the upstream-test-to-Saga-test mapping
 /// and exactly what "differential comparison" means for each scenario.
 import gleam/erlang/process.{type Subject}
 import gleam/int
@@ -462,7 +462,7 @@ fn trace_d3() -> Nil {
 // ---------------------------------------------------------------------------
 // D4: retry limits. Reactor: max_retries: 2 -> 3 total attempts, ok.
 // Saga's equivalent is max_attempts: 3 (Saga counts total attempts, not
-// retries after the first, per PROVENANCE D4/R7).
+// retries after the first, per ADR 0010 D4/R7).
 // ---------------------------------------------------------------------------
 
 fn run_d4() -> #(execution.Outcome(Nil, DemoError, DemoUndoError), Int) {
