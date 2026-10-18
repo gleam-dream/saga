@@ -58,21 +58,37 @@ pub fn checkout() {
   })
 }
 
-/// Run to a result: the receipt, or the effects whose outcome is unknown.
+/// The caller's own failure type keeps both reports intact.
+pub type Failure(o, e, u) {
+  NotStarted(execution.RunError)
+  Unfinished(execution.Outcome(o, e, u))
+}
+
+/// Run to a result: the receipt, or the run error or outcome unchanged.
 pub fn run_checkout(workflow, order) {
   case execution.run(workflow, order, execution.config()) {
     Ok(execution.Completed(receipt)) -> Ok(receipt)
-    Ok(outcome) -> Error(execution.unknown_effects(outcome))
-    Error(_run_error) -> Error([])
+    Ok(outcome) -> Error(Unfinished(outcome))
+    Error(run_error) -> Error(NotStarted(run_error))
   }
 }
 
 /// The common path: success returns the receipt; a business failure
-/// compensates and reports no unknown effects.
+/// compensates, keeps the typed cause and reports no unknown effects; a
+/// refused configuration keeps its run error.
 pub fn run_common_path() -> Nil {
   let workflow = checkout()
   let assert Ok("receipt-" <> _) = run_checkout(workflow, "o-1")
-  let assert Error([]) = run_checkout(workflow, "declined")
+  let assert Error(Unfinished(declined)) = run_checkout(workflow, "declined")
+  let assert execution.Failed(
+    cause: execution.StepFailed(error: Declined, ..),
+    ..,
+  ) = declined
+  let assert [] = execution.unknown_effects(declined)
+  let refused = execution.config() |> execution.with_max_concurrency(0)
+  let assert Error(execution.InvalidConfig([
+    execution.MaxConcurrencyNotPositive(0),
+  ])) = execution.run(workflow, "o-1", refused)
   Nil
 }
 

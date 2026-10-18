@@ -12,16 +12,27 @@
 //// import gleam/time/duration
 //// import saga/execution
 ////
+//// // The caller's own failure type keeps both reports intact.
+//// type Failure(o, e, u) {
+////   NotStarted(execution.RunError)
+////   Unfinished(execution.Outcome(o, e, u))
+//// }
+////
 //// let config =
 ////   execution.config()
 ////   |> execution.with_max_concurrency(4)
 ////   |> execution.with_deadline(execution.After(duration.seconds(5)))
 //// case execution.run(workflow, "order-1", config) {
 ////   Ok(execution.Completed(receipt)) -> Ok(receipt)
-////   Ok(outcome) -> Error(execution.unknown_effects(outcome))
-////   Error(_run_error) -> Error([])
+////   Ok(outcome) -> Error(Unfinished(outcome))
+////   Error(run_error) -> Error(NotStarted(run_error))
 //// }
 //// ```
+////
+//// `NotStarted` keeps the `RunError` that refused the run. `Unfinished`
+//// keeps the `Outcome`, so the caller still reads the failure and its
+//// settlement, and `execution.unknown_effects(outcome)` names the actions
+//// whose effect is unknown when the caller needs them.
 ////
 //// **Defaults.** `config()` gives one concurrent task per scheduler, no run
 //// deadline, a 60 second per-attempt timeout, a 5 second settle window, a 5
