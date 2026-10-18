@@ -55,13 +55,15 @@ vocabulary, and `docs/adr/` records decision rationale. `docs/CONTEXT-MAP.md`
 indexes the design documents. `docs/COVERAGE.md` maps repository parts to their
 design owners.
 
-**Tracker** — GitHub issues in `gleam-dream/saga`, accessed with
-`gh issue list --repo gleam-dream/saga` and `gh issue view NUMBER --repo gleam-dream/saga`.
-Labels bind roles as follows: `needs-triage` → `needs-triage`,
-`needs-info` → `question`, `ready-for-agent` → `ready-for-agent`,
-`ready-for-human` → `ready-for-human`, `in-progress` → `in-progress`,
-`done` → `done`, `wontfix` → `wontfix`, `bug` → `bug`,
-and `enhancement` → `enhancement`.
+**Tracker** — local markdown under `issues/`: one directory per feature
+(`issues/<feature-slug>/`), the PRD at `issues/<feature-slug>/PRD.md`, issue
+files at `issues/<feature-slug>/issues/<NN>-<slug>.md` numbered from 01. Each
+issue file carries two header lines near the top — `Status: <state>`,
+`Category: <category>`. Conversation appends to the bottom
+of the file under a `## Comments` heading. Labels (canonical strings, adopted
+verbatim): states `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `in-progress`, `done`, `wontfix`; categories `bug`,
+`enhancement`.
 
 **AI disclaimer** — AI-authored tracker comments start with
 `AI-assisted contribution.`
