@@ -19,5 +19,5 @@
 
 - Native lifecycle dates to 2026-09-23. Retry admission/interruption fixes: `072d20d2da51542fd499c68f176143aaa35f998a`, `a28805d237d33ec05ff0a4d57c342cfe881e2916`.
 - Marked uncertainty/stable keys: `f27b6287fd0002b0be3b54f0cc36050f40fe5fbe`, 2026-10-02. Default Hold correction: `92612fd0759260b42ec806f0a7dae03fb6519278`, same date.
-- Evidence: unknown/rollback/retry tests, public consumer, `PROVENANCE.md`, mechanically checked oracle `d2.diff` and `d3.diff`.
+- Evidence: unknown/rollback/retry tests, public consumer, the oracle scenarios of ADR 0010, and the mechanically checked `d2.diff` and `d3.diff`.
 - Prior contracts: Oversight composition research, interface-lab ACTIVITY-RECOVERY, Saga compensation/undo design. Broader continuation intent does not assert delivered halt/resume.

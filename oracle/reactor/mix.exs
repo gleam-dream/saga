@@ -4,7 +4,7 @@ defmodule Oracle.MixProject do
   # Differential oracle harness: runs the plan's side-by-side scenarios
   # against real Reactor 1.0.6 and prints a normalized trace that
   # `scripts/oracle.sh` diffs against `expected/d*.txt`. See
-  # `/code/gleam-dream/saga/PROVENANCE.md` for what each scenario proves.
+  # `docs/adr/0010-reactor-is-a-scoped-differential-oracle.md` for what each scenario proves.
   def project do
     [
       app: :oracle,

@@ -5,7 +5,8 @@
 //// must act once a step reaches some state, for example to cancel the run
 //// while a step is blocked. The rest of what such a test needs (a gate the
 //// step body enters and the test releases) is ordinary BEAM concurrency;
-//// see docs/USAGE.md's "Testing workflows" section for a recipe.
+//// see the execution design's observation and verification section and the
+//// order consumer's `test/support/gate.gleam` for a recipe.
 ////
 //// ```gleam
 //// import gleam/list

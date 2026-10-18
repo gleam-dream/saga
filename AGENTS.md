@@ -2,12 +2,11 @@
 
 ## About this repo
 
-`saga` runs typed workflows of dependent steps in Gleam.
-
-Saga is a native typed implementation. Reactor 1.0.6 is a scoped behavioral oracle.
-Design: [docs/design/design.typ](docs/design/design.typ); vocabulary:
-[docs/design/CONTEXT.typ](docs/design/CONTEXT.typ); rationale: [docs/adr](docs/adr).
-The [coverage map](docs/COVERAGE.md) records runtime, tooling, and retained intent.
+`saga` runs typed workflows of dependent steps in Gleam. It is a native typed
+implementation; Reactor 1.0.6 is a scoped behavioral oracle. The design layer
+holds everything else: `docs/design/` (two contexts, execution and durability),
+`docs/CONTEXT-MAP.md`, `docs/adr/` for rationale, and `docs/COVERAGE.md`, which
+maps repository parts to their design owners.
 
 ## Tooling
 
@@ -18,7 +17,8 @@ The [coverage map](docs/COVERAGE.md) records runtime, tooling, and retained inte
 
 ## Gates
 
-Run the authoritative registry from the repository root:
+Run the authoritative registry from the repository root. Gate commands validate the
+existing tree without formatting it.
 
 ```sh
 nix develop --command python3 -B scripts/check.py fast
@@ -27,27 +27,19 @@ nix develop .#oracle --command python3 -B scripts/check.py oracle
 nix develop --command python3 -B scripts/check.py benchmark
 ```
 
-`full` covers every deterministic runtime obligation and both native design
-layers. CI splits the same registry into `ci` and `design`; every mandatory
-result must succeed. The retained oracle runs on relevant source changes,
-weekly and manually; observational benchmarks run weekly and manually. See README's development
-inventory. Gate commands validate the existing tree without formatting it.
+- `fast` is the local loop; `full` covers every deterministic runtime obligation and both native design layers. CI splits `full` into `ci` and `design`. The profiles and their obligations are in the design's verification gates.
+- `examples/order_consumer` is a separate package (path dependency on saga) that imports only public modules. Run `gleam test` inside it.
+- `integrations/saga_postgres` is a separate package so that saga never depends on pog. `scripts/test-postgres.sh` runs its tests, including the storage conformance suite, against a throwaway PostgreSQL 16 cluster.
+- `scripts/check_negative.sh` proves the compiler-negative fixtures under `fixtures/negative/` still fail to compile. `scripts/check_durable_restart.sh` kills a VM during concurrent effect and compensation work and recovers in a fresh VM.
+- `nix develop .#oracle --command scripts/oracle.sh` runs the Reactor differential oracle; recompute `oracle/differences/*.diff` only after a reviewed behavior change.
+- Run the benchmark with `cd bench && gleam run`.
+- Edit the design layer, then run the design gate commands from the fenced section below.
 
-`examples/order_consumer` is a separate Gleam package (path dependency on
-saga) that only imports saga's public modules — it is the external
-acceptance test for saga's facade, not part of saga's own build.
-`integrations/saga_postgres` is the PostgreSQL storage adapter, a separate
-package so that saga never depends on pog. `scripts/test-postgres.sh` runs its
-tests, including saga's storage conformance suite, against a throwaway
-PostgreSQL 16 cluster that the script creates and removes.
-`scripts/check_negative.sh` proves the compiler-negative fixtures under
-`fixtures/negative/` still fail to compile, from that same external point
-of view.
-`scripts/check_durable_restart.sh` kills an Erlang VM after two concurrent
-external-effect probes but before saga saves their outputs, then recovers
-the same DAG in a fresh VM through the file storage adapter. A second probe
-interrupts two compensation callbacks and resolves their saved decisions in a
-fresh VM without repeating either callback.
+## References
+
+- [docs/ORACLE.md](docs/ORACLE.md) pins Reactor 1.0.6 (`v1.0.6`, commit `e4ddc9e`) as the behavioral oracle, lists the adapted tests and every deliberate difference, and states the limits of the claim. `scripts/oracle.sh` runs it; recompute `oracle/differences/*.diff` only after a reviewed behavior change.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) records the run-cost method, retained results and limits. Results are observational and never gate a change; `scripts/check.py benchmark` runs the harness.
+- `examples/order_consumer` holds the usage examples as compiled, runnable code (`gleam test`, `gleam run`). Add or change an example in the same change as the API it shows.
 
 <!-- agent-skills:begin -->
 <!-- framework-commit: cab7c0590036edaa66d8430cc5016399a9fd2c71 origin: git@github.com:lostbean/skills.git -->
@@ -56,10 +48,12 @@ fresh VM without repeating either callback.
 
 ## Agent skills
 
-**Design layer** — `docs/design/design.typ` describes the design,
-`docs/design/CONTEXT.typ` defines its vocabulary, and `docs/adr/` records
-decision rationale. The rendered document is `docs/design/design-layer.pdf`.
-`docs/COVERAGE.md` maps repository parts to their design owners.
+**Design layer** — `docs/design/design.typ` describes the design (the layer
+renders to one `docs/design/design-layer.pdf`), each context's `CONTEXT.typ`
+under `docs/design/execution/` and `docs/design/durability/` defines its
+vocabulary, and `docs/adr/` records decision rationale. `docs/CONTEXT-MAP.md`
+indexes the design documents. `docs/COVERAGE.md` maps repository parts to their
+design owners.
 
 **Tracker** — GitHub issues in `gleam-dream/saga`, accessed with
 `gh issue list --repo gleam-dream/saga` and `gh issue view NUMBER --repo gleam-dream/saga`.

@@ -19,7 +19,7 @@
 # effect). Saga is a DELIBERATE DIFFERENCE here: it settles active
 # siblings before returning, so `slow` is either undone after it finishes
 # within `settle_timeout`, or killed and reported `interrupted`. See
-# PROVENANCE.md D3.
+# ADR 0010 D3.
 
 defmodule Oracle.D3 do
   use Reactor

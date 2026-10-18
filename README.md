@@ -63,89 +63,92 @@ pub fn main() {
 
 A known charge failure runs `release` for the completed reservation. The callback
 error type belongs to the application. `execution.run` returns a typed terminal
-report that retains failure, cleanup and unknown-effect evidence; inspect that
-report before using [outcome classification](docs/USAGE.md#act-on-an-executions-outcome).
+report that retains failure, cleanup and unknown-effect evidence; `saga/outcome`
+classifies it, and `outcome.summary` renders it without application payloads.
 
 A payment error that could mean the charge succeeded needs an explicit
-uncertainty policy. The [checkout guide](docs/USAGE.md#define-a-checkout-workflow)
-shows `unknown_when`, compensation and held reconciliation. Idempotency keys
-stay stable across attempts of one step; local runs receive a fresh run identity.
+uncertainty policy: `saga.unknown_when` marks the error, and `saga.compensate`
+or `saga.on_unknown` chooses retry, rollback or a held run that keeps completed
+steps for reconciliation. Idempotency keys stay stable across attempts of one
+step.
 
-## Configure and recover
+## Configure a run
 
 Local execution needs no codecs or storage. The process that starts it owns its
-lifetime. When using `start`, cancel and consume the terminal report with `await`
-before dropping an unfinished handle.
+lifetime. Defaults allow one attempt per step, use the online scheduler count for
+run concurrency, and set a 60-second attempt timeout plus five-second settlement
+and cleanup windows. A run deadline is opt-in; every bound is a `Duration`.
 
-Defaults allow one attempt per step, use the online scheduler count for run
-concurrency, and set a 60-second attempt timeout plus five-second settlement and
-cleanup windows. A run deadline is opt-in. [Configuration and defaults](docs/USAGE.md#configuration)
-explain overrides and timing limits.
+```gleam
+let config =
+  execution.config()
+  |> execution.with_max_concurrency(4)
+  |> execution.with_deadline(execution.After(duration.seconds(30)))
+let assert Ok(exec) = execution.start(workflow, order, config)
+execution.cancel(exec)
+let assert Ok(outcome) = execution.await(exec, timeout: duration.seconds(10))
+```
 
-The [usage guide](docs/USAGE.md) covers configuration, correlation, telemetry,
-test synchronization and reporting across owner exit. The [order consumer](examples/order_consumer/src/order_consumer/workflows.gleam)
-shows shared dependencies and application-owned records and error types. [Durable operations](DURABILITY.md)
-cover codecs, resolvers, saved identities, timing margins and recovery. Storage
-adapters include memory, file and the separate [PostgreSQL package](integrations/saga_postgres).
+Cancel and consume the terminal report with `await` before dropping an
+unfinished handle. `execution.start_reporting` delivers the report to another
+`Subject`, and `saga/reporting.run_owned` preserves it across the exit of a
+short-lived invocation worker.
 
-A local SQL write can commit before Saga saves its checkpoint, even when both
-use the same database. The [financial recovery consumer](https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery)
-shows how an application posting record resolves that interruption without
-repeating the posting callback. See [local database recovery](DURABILITY.md#recover-a-committed-local-database-effect).
+## Persist progress
 
-## Benchmarks and design
+A durable run saves a checkpoint at every step boundary and survives the loss of
+its runner, caller or VM. Attach versioned codecs and interrupted-effect
+resolvers to the same workflow, then admit and drive one stable execution id:
 
-The [benchmark guide](bench/README.md) includes retained measurements and a
-reproduction command. These measure trivial workflow construction and scheduling,
-with their historical revision and environment limits stated beside the results.
+```gleam
+let persistence =
+  durable.new(workflow, input: order, output: text, error: text, undo_error: text)
+let assert Ok(run) =
+  durable.start_or_reconnect(persistence, store, id: "checkout:o-1", input: "o-1")
+case durable.drive(run, timeout: duration.seconds(30)) {
+  Ok(outcome) -> handle(outcome)
+  Error(error) -> act_on(durable.error_kind(error))
+}
+```
 
-Read the [design PDF](docs/design/design-layer.pdf) for architecture and ownership,
-and [ADRs](docs/adr) for decision rationale. The [design source](docs/design/design.typ),
-[vocabulary](docs/design/CONTEXT.typ) and [coverage map](docs/COVERAGE.md) are also available.
+Storage adapters are `saga/storage/memory`, `saga/storage/file` and the separate
+[PostgreSQL package](integrations/saga_postgres). A local SQL write can commit
+before Saga saves its checkpoint, even when both use the same database; the
+[financial recovery consumer](https://github.com/gleam-dream/oversight) shows how
+an application posting record resolves that interruption without repeating the
+posting callback.
 
-Reactor 1.0.6 is a scoped behavioral reference. [Provenance](PROVENANCE.md)
-records the oracle revision, test coverage and deliberate behavior differences.
+## Observe and test
 
-## Development
+`saga/telemetry` defines six Sinal events that carry the run's correlation, and
+every step reads the same correlation from its `EffectKey`. `saga/testing`
+provides `wait_until` for synchronizing a test with a run in progress.
 
-Run the shared registry from this repository:
+The [order consumer](examples/order_consumer) compiles and runs every example in
+this README, and the operating topics beyond it, with fake application services:
+[checkout and configuration](examples/order_consumer/src/order_consumer/usage/checkout.gleam),
+[unknown effects](examples/order_consumer/src/order_consumer/usage/unknown_effect.gleam),
+[step correlation](examples/order_consumer/src/order_consumer/usage/correlation.gleam),
+[durable runs](examples/order_consumer/src/order_consumer/usage/durable_run.gleam),
+[stable ids, reconnecting and discovering unfinished runs](examples/order_consumer/src/order_consumer/usage/operations.gleam),
+and [recovering a committed local effect](examples/order_consumer/src/order_consumer/usage/committed_effect.gleam).
+The full gate runs them, so an API change that breaks an example fails the build.
+
+## Design and development
+
+The [design source](docs/design/design.typ) holds the architecture and its two
+contexts, [execution](docs/design/execution/design.typ) and
+[durability](docs/design/durability/design.typ). The [context map](docs/CONTEXT-MAP.md),
+[ADRs](docs/adr) and [coverage map](docs/COVERAGE.md) hold vocabulary, rationale and
+the part-to-design mapping. Two retained references back the behavior claims:
+[docs/ORACLE.md](docs/ORACLE.md) pins Reactor 1.0.6 as the behavioral comparison
+and lists every deliberate difference, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+records the run-cost method and results.
+
+Run the shared registry from this repository; [AGENTS.md](AGENTS.md) lists every
+profile:
 
 ```sh
 nix develop --command python3 -B scripts/check.py fast
 nix develop --command python3 -B scripts/check.py full
-nix develop .#oracle --command python3 -B scripts/check.py oracle
-nix develop --command python3 -B scripts/check.py benchmark
 ```
-
-| Profile     | Obligations and evidence                                                                                                                                                          |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fast`      | Formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions and root strict build/tests.                                                                          |
-| `ci`        | All four packages; external order consumer tests and executable; strict benchmark build; disposable PostgreSQL 16; positive/negative compiler fixtures; actual VM restart probes. |
-| `design`    | Both native layers' render freshness, vocabulary, links and integrity.                                                                                                            |
-| `full`      | All `ci` and `design` obligations.                                                                                                                                                |
-| `oracle`    | Seven real Reactor 1.0.6 scenarios, captured upstream output and normalized Saga comparison, including retained deliberate differences; full root tests.                          |
-| `benchmark` | Existing chain/fan/wide harness with correctness assertions and observational timings; no latency threshold.                                                                      |
-
-Every package build treats Gleam warnings as errors and separately compiles
-authored Erlang in `src` and `test` with `erlc -Werror` and dependency includes.
-Generated dependency code and retained oracle/fixture bytes are excluded from
-authored script formatting/lint. Ruff checks syntax, imports and undefined names;
-it is not a Python type checker. Gate commands check the tree without repairing it.
-
-The ordinary push, pull request and manual workflow requires both `ci` and
-`design` results. A separate workflow runs the oracle on relevant source changes,
-weekly and manually; observational benchmarks run weekly and manually. Each profile retains per-check logs,
-nonempty result entries, dependency revisions and environment/lock metadata in
-`.artifacts/PROFILE`. Failures stop the profile and retain their evidence.
-
-Hosted verification checks out immutable revisions from `sibling-revisions.txt`.
-Sinal and JSON Blueprint use ordinary checkout with the default GitHub Actions
-token to read their public repositories. Checkout never persists credentials.
-Fork pull requests run the same required checks.
-
-The oracle proves only its seven scoped scenarios, not general Reactor or
-Temporal parity. The database harness disables fsync and synchronous_commit;
-passing runner/VM recovery tests do not prove database power-loss durability.
-The [benchmark guide](bench/README.md) gives the retained measurement method and
-limits. The [agent instructions](AGENTS.md#gates) describe the retained consumers
-and restart probes.

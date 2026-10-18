@@ -56,7 +56,8 @@
 //// Waking a runner after a restart is the caller's job: `unfinished` lists
 //// the executions that wait for one.
 ////
-//// See DURABILITY.md for the storage contract and recovery rules.
+//// See the durability design (`docs/design/durability/design.typ`) for the storage
+//// contract and recovery rules.
 
 import gleam/bit_array
 import gleam/erlang/process.{type Pid, type Subject}

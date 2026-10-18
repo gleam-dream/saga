@@ -148,7 +148,7 @@ pub fn hold_leaves_completed_effects_unresolved_test() {
 
 // Adapted from reactor/executor/step_runner_test.exs:252-307: undo
 // receives the step's original input and its successful output. Saga has
-// no undo-retry loop at all (deliberate difference, see PROVENANCE.md
+// no undo-retry loop at all (deliberate difference, see ADR 0010
 // R10 and design §3.3): a failing undo is retained once, never retried.
 pub fn undo_receives_input_and_output_test() {
   let workflow =
