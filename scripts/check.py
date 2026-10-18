@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import re
 import subprocess
 import time
 import tomllib
@@ -25,22 +24,6 @@ class Check:
     name: str
     directory: str
     command: tuple[str, ...]
-
-
-def pins(root: Path) -> dict[str, str]:
-    values = {}
-    for line in (root / "sibling-revisions.txt").read_text().splitlines():
-        if not line or line.startswith("#"):
-            continue
-        match = re.fullmatch(r"(sinal|json_blueprint)=([a-f0-9]{40})", line)
-        if not match or match[1] in values:
-            raise ValueError("invalid or duplicate sibling revision entry")
-        values[match[1]] = match[2]
-    if set(values) != {"sinal", "json_blueprint"}:
-        raise ValueError(
-            "missing sibling revisions: sinal and json_blueprint are required"
-        )
-    return values
 
 
 def checks(root: Path, profile: str) -> list[Check]:
@@ -282,18 +265,10 @@ def main() -> None:
             "benchmark",
             "static",
             "build",
-            "pins",
         ),
     )
     parser.add_argument("--logs", type=Path)
     arguments = parser.parse_args()
-    if arguments.profile == "pins":
-        try:
-            for name, revision in pins(ROOT).items():
-                print(f"{name}={revision}")
-        except (ValueError, OSError) as error:
-            raise SystemExit(str(error)) from error
-        return
     if arguments.profile == "static":
         raise SystemExit(quality.static(ROOT))
     if arguments.profile == "build":
@@ -303,7 +278,6 @@ def main() -> None:
     (logs / "results.json").write_text("[]\n")
     try:
         selected = checks(ROOT, arguments.profile)
-        pins(ROOT)
         sources = [] if arguments.profile == "design" else dependencies(ROOT)
     except (ValueError, OSError, KeyError) as error:
         (logs / "preflight.log").write_text(str(error) + "\n")
