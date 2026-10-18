@@ -22,4 +22,4 @@
 - Sources captured before retirement: `oversight/docs/release-api/saga.md` SAGA-R2/R3 and questions 2/7; `DECISIONS.md` Round 9; `PLAN.md` Saga PostgreSQL and Round 9 rows; `PUBLIC-API-GUIDELINES.md` ownership/composition rules.
 - Immutable source: [Oversight release decisions](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/release-api/DECISIONS.md) and [Saga release review](https://github.com/gleam-dream/oversight/blob/3baff7030a96d5b6cf78b2335c16d8c203727da5/docs/release-api/saga.md).
 - The exact original discussion leading to each SQL representation is not recoverable from the inspected source/history. The owner-authorized package boundary is recorded; no additional historical approval is inferred.
-- Parent claim semantics and their rationale remain in [Saga's storage ADR](../../../../docs/adr/0005-storage-claims-as-values.md#adr-0005).
+- Parent claim semantics and their rationale remain in [Saga's storage ADR](https://github.com/gleam-dream/saga/blob/master/docs/adr/0005-storage-claims-as-values.md#adr-0005).

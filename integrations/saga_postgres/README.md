@@ -1,6 +1,6 @@
 # saga_postgres
 
-`saga_postgres` stores [Saga](../../README.md) durable executions in PostgreSQL.
+`saga_postgres` stores [Saga](https://github.com/gleam-dream/saga) durable executions in PostgreSQL.
 It borrows the application's `pog.Connection` and implements `saga/storage`.
 
 ## Installation
@@ -62,20 +62,15 @@ pub fn checkout(
 }
 ```
 
-`persistence` comes from `durable.new`. The application's workflow, root and step
-codecs, compatible versions, and interrupted-effect resolvers are described in
-[Saga's durable usage guide](../../DURABILITY.md). A successful `checkout` returns
-the workflow's typed outcome; failure returns `durable.Error` without discarding
-its recovery information. Use `durable.error_kind` to decide the next action:
-Busy can require waiting for a lost owner's lease, while NeedsReconciliation
-requires application evidence before an interrupted effect may run again.
-
-The same storage supports `durable.read`, `durable.cancel`, `durable.reconnect`,
+`persistence` comes from `durable.new`; the application's codecs, versions and
+interrupted-effect resolvers are described in the main Saga README. A successful
+`checkout` returns the workflow's typed outcome; failure returns `durable.Error`
+with its recovery information, and `durable.error_kind` selects the next action.
+The same storage supports `durable.read`, `durable.cancel`, `durable.reconnect`
 and `durable.unfinished`. Retain a pool connection handle for storage; a
-transaction-scoped connection has the driver's transaction lifetime and is
-unsuitable as a reusable store across runners.
+transaction-scoped connection is unsuitable as a reusable store across runners.
 
-## Configuration and operations
+## Configuration
 
 | Setting                   | Default                    | Change or ownership                                                                         |
 | ------------------------- | -------------------------- | ------------------------------------------------------------------------------------------- |
@@ -85,65 +80,23 @@ unsuitable as a reusable store across runners.
 | Pool query attempt budget | 4.5 seconds                | Fixed per pool-backed query attempt                                                         |
 | Saga operation wait       | 5 seconds                  | `storage.with_call_timeout`; independent of query budget                                    |
 
-Query retries and refusal diagnosis can issue more than one statement, so the
-attempt budget is not a total operation deadline. Transaction-scoped connections
-and migration use the driver's transaction/connection timing. The
-[deadline decision](docs/adr/0004-separate-query-budgets-from-total-deadlines.md)
-records this limit. A timed-out or lost reply does not prove a write was absent.
-
-A successful release makes an execution available immediately. Without release,
-takeover becomes possible when the database-clock lease expires. A successful
-takeover replaces the generation/token and fences the former claim's writes.
-An expired claim that has not been replaced can still commit, renew, or release.
-Fencing cannot retract an already sent external effect; use stable effect
-identities and Saga's recovery evidence.
-
-Applications own scanning and wakeups. `durable.unfinished(storage, limit:)`
-returns candidates without reserving them; reconnect and drive can still
-encounter Busy. The adapter retains finished rows indefinitely and has no
-pruning API. Application effects, job scheduling, and checkpoint commits have
-separate transaction boundaries.
+Application effects, job scheduling and checkpoint commits have separate
+transaction boundaries, and the adapter keeps finished rows indefinitely. Lease,
+fencing, query-budget and recovery semantics are in the [design](docs/design/design.typ).
 
 ## Migrations
 
 `migrate` applies forward schema migrations in a READ COMMITTED transaction under
-the selected schema's advisory lock. Concurrent package callers serialize, and a
-repeat skips applied versions.
-
-[priv/migrations](priv/migrations) ships the equivalent SQL up sections. An
-application migration tool selects unapplied versions under that lock and runs
-them in a transaction with `search_path` set to the target schema. The raw up file
-itself is not repeat-idempotent.
-
-The packaged down section drops retained execution data. Package `migrate` never
-runs it or converts Saga checkpoint bytes.
+the selected schema's advisory lock; a repeat skips applied versions.
+[priv/migrations](priv/migrations) ships the equivalent SQL up sections for an
+application migration tool, which runs them in a transaction with `search_path` set
+to the target schema. The raw up file is not repeat-idempotent. The packaged down
+section drops retained execution data, and package `migrate` never runs it.
 
 ## Development
 
-Use the parent Saga Nix shell. From this package, check formatting and compilation:
-
-```sh
-nix develop ../.. --command bash -c 'gleam format --check src test && gleam build --warnings-as-errors'
-```
-
-Run tests with the disposable PostgreSQL 16 harness:
-
-```sh
-nix develop ../.. --command scripts/test-postgres.sh
-```
-
-The script clears `PG*` settings and the prior test URL, creates its own loopback
-cluster at a free port, and stops/removes the cluster on exit. Plain `gleam test`
-fails without its script-provided `SAGA_TEST_DATABASE_URL`.
-
-Tests cover Saga's public storage conformance, schema/SQL equivalence, fencing,
-cancellation races, renewal, query timeout, runner loss/recovery, and shared
-application-pool use. The harness disables media durability, so these tests do
-not establish database failover, multi-VM partition behavior, or acknowledged-write
-survival.
-
-The [design](docs/design/design.typ), [rendered design](docs/design/design-layer.pdf),
-[vocabulary](docs/design/CONTEXT.typ), [decisions](docs/adr), and
-[coverage](docs/COVERAGE.md) describe the adapter and its unresolved extensions.
-Saga owns the shared [storage protocol](../../docs/design/design.typ#storage-and-claim-lifetime).
-[AGENTS.md](AGENTS.md) gives the nested design-document commands.
+Use the parent Saga Nix shell; [AGENTS.md](AGENTS.md) lists the commands. The
+disposable PostgreSQL 16 harness is `scripts/test-postgres.sh`, and plain
+`gleam test` fails without its script-provided database URL. The harness disables
+media durability, so its tests establish no database failover or power-loss
+guarantee.
