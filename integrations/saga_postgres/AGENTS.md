@@ -1,6 +1,6 @@
 # Saga PostgreSQL adapter instructions
 
-- This is a nested package in [Saga](https://github.com/gleam-dream/saga/blob/master/AGENTS.md). Use the parent dev shell, design-gate pin, and `gleam-dream/saga` tracker; this package has no independent flake, gate copy, or tracker.
+- This is a nested package in [Saga](https://github.com/gleam-dream/saga/blob/master/AGENTS.md). Use the parent dev shell, design-gate pin, and the parent's local `issues/` tracker; this package has no independent flake, gate copy, or tracker.
 - The standing adapter contract is [docs/design/design.typ](docs/design/design.typ), its vocabulary is [docs/design/CONTEXT.typ](docs/design/CONTEXT.typ), and its rationale is [docs/adr](docs/adr). [docs/COVERAGE.md](docs/COVERAGE.md) records the source/tooling and intended-extension boundaries.
 - Parent [storage contracts](https://github.com/gleam-dream/saga/blob/master/docs/design/durability/design.typ) own Claim, Stored, Commit, workflow checkpoint meaning, and recovery permission. This adapter owns SQL, schema installation, database-clock leases, and borrowed-pool semantics.
 - Keep executable SQL and its internal statement list equivalent. Do not infer external-effect replay safety from lease or revision fencing.
