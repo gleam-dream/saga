@@ -19,7 +19,7 @@
 - Add a total deadline or surviving asynchronous cleanup owner. Required decisions include worker stop, stale-owner fencing, temporary Busy, cleanup retry and lifetime.
 - No change to cleanup ownership has been approved. Driver interruption preserves resumable state and does not record cancellation.
 
-## Related executable example
+## The common example retains typed failures
 
-- The execution module example reduces noncompletion to unknown-effects lists and admission errors to Error([]); the checkout usage example expects that list for declined payment.
-- The library already preserves native Outcome. A coordinated example/assertion change must retain business failure, admission failure, undo failure, and uncertainty distinctly; the existing consumer assertion currently expects the erased value.
+- The execution module example and the checkout usage example return the run error and the outcome unchanged, in the caller's own `Failure` type. A declined payment therefore keeps its typed cause, and the example asserts an empty unknown-effects list for it.
+- The library already preserves the native `Outcome`. The example keeps business failure, admission failure, undo failure and uncertainty distinct, so copying it does not erase them.
