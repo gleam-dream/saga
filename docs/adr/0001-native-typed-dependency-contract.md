@@ -19,4 +19,4 @@
 
 - Native authoring: `6285bb53e78e12b1269143d12313ad9431ee9499`, 2026-09-23. External consumer/compiler negatives: `907e4b806cbb799130ee9ff802d6885dc6010fdc`, same date.
 - Current evidence: `src/saga.gleam`, `examples/order_consumer`, `fixtures/negative`.
-- Prior scope: Oversight `saga-design.md` core/DAG sections; `PUBLIC-API.md`; `API-COVERAGE.md` Saga rows; `research/workflow-boundaries.md`; interface-lab unified/shared/choice consumers. Laboratory names remain evidence, not extra current APIs.
+- Prior scope: Oversight's Saga design (core and DAG sections), its public API coverage rows, its workflow-boundary research and the interface-lab unified, shared and choice consumers. Laboratory names remain evidence, not extra current APIs.

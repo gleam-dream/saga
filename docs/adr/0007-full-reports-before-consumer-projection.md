@@ -20,4 +20,4 @@
 
 - Ports: `f280539d2bc7f6264f498dea2691cb2387c514f9`, 2026-10-05. Bounded startup failure: `299e2b9c032b50e2fd2260c7aac97c51189545d8`.
 - Full reports/summary: `29e9e9a4ff9c65964e01641d590f8760af41cae3`; documentation alignment: `2a6bc4bf380145e62015e66e15d216f9a6d7d1d4`.
-- Evidence: outcome/reporting/startup source/tests, native reporting consumer, Fabric saga_tool recipe. Owner rationale: Oversight DECISIONS pre-release composition and PLAN Round 9 typed-composition follow-up. Earlier flattened-report examples are superseded.
+- Evidence: outcome/reporting/startup source/tests, native reporting consumer, Fabric saga_tool recipe. Owner rationale: Oversight's pre-release composition decisions and its typed-composition follow-up. Earlier flattened-report examples are superseded.

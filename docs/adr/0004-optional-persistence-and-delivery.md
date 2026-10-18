@@ -21,4 +21,4 @@
 - Optional persistence: `23f0bdcfacafbd25bf66c3c72393dc776b01d79d`, 2026-09-29. The implementation history records owner authorization and recovery hardening; the retired IMPLEMENTATION log is available in git history.
 - Durable handle/owned drive: `1d965bd5819ae8acd61132d5e9542930a4e0ece8`, 2026-10-02.
 - Evidence: durable/coordinator/checkpoint/codec source, durable tests/public consumer, real VM-kill restart script.
-- Prior scope: Oversight durability/freeze-thaw, composition/child research, lab checkpoint/child evidence, release DECISIONS durability ownership. Migrations, approvals, forks, children, and transactional delivery remain intended contracts.
+- Prior scope: Oversight durability/freeze-thaw, composition/child research, lab checkpoint/child evidence, release decisions on durability ownership. Migrations, approvals, forks, children, and transactional delivery remain intended contracts.

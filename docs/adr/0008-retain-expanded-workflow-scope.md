@@ -17,5 +17,5 @@
 ## Evidence and history
 
 - Oversight capability disposition cites original scope at `9194f02`. Individual historical rationale/dates are not recoverable from that document and are not invented here.
-- Scope: Saga design, API-COVERAGE Saga/composition rows, PUBLIC-API, workflow/composition/child research, interface-lab unified/shared/choice/local/recovery/child/runtime-schema evidence.
+- Scope: Saga design, public API coverage rows for Saga and composition, workflow/composition/child research, interface-lab unified/shared/choice/local/recovery/child/runtime-schema evidence.
 - Lab immutable/scripted records prove distinctions, not concurrent storage/authentication/recovery. The retired CAPABILITIES inventory is retained in git history; implementation descriptions are derived from source. Executable probes remain preserved.
