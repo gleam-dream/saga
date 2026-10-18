@@ -16,35 +16,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          path: saga
-          persist-credentials: false
-      - name: Validate the complete pinned sibling revisions
-        id: pins
-        run: python3 -B saga/scripts/check.py pins >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: gleam-dream/sinal
-          ref: ${{ steps.pins.outputs.sinal }}
-          path: sinal
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: lostbean/json_blueprint
-          ref: ${{ steps.pins.outputs.json_blueprint }}
-          path: json_blueprint
           persist-credentials: false
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
           extra_nix_config: experimental-features = nix-command flakes
       - name: All retained deterministic runtime checks
-        working-directory: saga
         run: nix develop --no-update-lock-file -c python3 -B scripts/check.py ci
       - name: Retain runtime evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: saga-verification
-          path: saga/.artifacts/ci/
+          path: .artifacts/ci/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14

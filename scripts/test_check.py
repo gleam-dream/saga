@@ -44,24 +44,6 @@ class GateTest(unittest.TestCase):
                 json.loads((root / "results.json").read_text())[0]["exit_code"], 127
             )
 
-    def test_sibling_pins_require_exact_complete_known_revisions(self):
-        valid = "sinal=" + "a" * 40 + "\njson_blueprint=" + "b" * 40 + "\n"
-        with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
-            path = root / "sibling-revisions.txt"
-            path.write_text(valid)
-            self.assertEqual(set(check.pins(root)), {"sinal", "json_blueprint"})
-            for text in (
-                "",
-                "unknown=" + "a" * 40,
-                valid + "sinal=" + "a" * 40,
-                valid.replace("b" * 40, "bad"),
-                valid.replace("sinal=", "sinal=="),
-            ):
-                with self.subTest(pins=text), self.assertRaises(ValueError):
-                    path.write_text(text)
-                    check.pins(root)
-
     def test_authored_erlang_warning_is_fatal_in_test_sources(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
