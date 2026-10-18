@@ -18,6 +18,9 @@
   pending-entry(title: "A total drive return deadline needs an owner decision", kind: "ruling", since: "2026-10-06", adr: [#adr(9)])[
     The drive execution budget is followed by synchronous runner drain and possible bounded claim release. A stronger total-return promise requires an explicit cleanup owner and takeover contract.
   ],
+  pending-entry(title: "Durability timing margins and recovery rules are unchecked", kind: "verify", since: "2026-10-17")[
+    The timing margins, the stable-identity rules and the committed-local-effect recovery rules came from the retired durability guide. The compiled durable-run examples exercise stable identity, reconnect, unfinished-run discovery and committed-local-effect recovery. The timing margins need a comparison with source.
+  ],
 )
 
 #section(title: "Durable execution model", lead: "A saved execution outlives a drive; a fresh compatible definition supplies executable behavior.", body: [
