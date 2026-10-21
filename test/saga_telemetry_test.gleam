@@ -1,4 +1,5 @@
 import gleam/erlang/process.{type Subject}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None}
 import gleam/time/duration
@@ -67,8 +68,9 @@ fn all_subscriptions(collector: Collector) -> sinal.SubscriptionPlan {
     sinal.subscription(telemetry.run_started(), fn(_m, _d) {
       record(collector, "run_start")
     }),
-    sinal.subscription(telemetry.run_stopped(), fn(_m, d) {
+    sinal.subscription(telemetry.run_stopped(), fn(m, d) {
       record(collector, "run_stop:" <> outcome_kind_string(d.outcome))
+      record(collector, "undo_failures:" <> int.to_string(m.undo_failures))
     }),
     sinal.subscription(telemetry.step_started(), fn(_m, d) {
       record(collector, "step_start:" <> d.step)
@@ -152,6 +154,7 @@ pub fn observation_events_test() {
   events(collector)
   |> should.equal([
     "run_start", "step_start:s", "step_stop:s:succeeded", "run_stop:completed",
+    "undo_failures:0",
   ])
 }
 
@@ -179,16 +182,21 @@ pub fn observation_events_failed_with_undo_failure_test() {
   let recorded = events(collector)
   list.contains(recorded, "run_stop:failed") |> should.be_true
   list.contains(recorded, "undo_stop:a:failed") |> should.be_true
+  list.contains(recorded, "undo_failures:1") |> should.be_true
   list.contains(recorded, "step_stop:b:failed") |> should.be_true
 }
 
-/// A cancelled run emits `run_stop:cancelled`.
+/// A cancelled run reports the failed undo in its terminal measurements.
 pub fn observation_events_cancelled_test() {
   let collector = new_collector()
   let gate = probe.new_gate()
   let workflow =
     saga.define("obs_cancelled", fn(input) {
       input
+      |> saga.perform(
+        saga.step("reserved", fn(x: Int) { Ok(x) })
+        |> saga.undo(fn(_undo) { Error(UndoBoom) }),
+      )
       |> saga.perform(
         saga.step("blocked", fn(x: Int) {
           probe.enter(gate)
@@ -212,7 +220,10 @@ pub fn observation_events_cancelled_test() {
       })
     })
 
-  list.contains(events(collector), "run_stop:cancelled") |> should.be_true
+  let recorded = events(collector)
+  list.contains(recorded, "run_stop:cancelled") |> should.be_true
+  list.contains(recorded, "undo_stop:reserved:failed") |> should.be_true
+  list.contains(recorded, "undo_failures:1") |> should.be_true
 }
 
 /// A step-timeout kill with a `compensate` decider attached still emits its
