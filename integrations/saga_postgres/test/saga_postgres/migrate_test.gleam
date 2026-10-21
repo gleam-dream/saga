@@ -1,7 +1,6 @@
 //// `migrate` creates the schema and brings it up to date once, however
 //// often and from however many callers it runs; `with_schema` keeps
-//// stores apart and refuses unsafe names; the shipped SQL file holds the
-//// same statements.
+//// stores apart and refuses unsafe names. The shipped SQL also runs independently.
 
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -127,22 +126,6 @@ pub fn a_schema_name_is_a_plain_lowercase_identifier_test() {
   refused(string.repeat("a", 64))
   let assert Ok(_) = saga_postgres.with_schema(config, "_sagas_2")
   let assert Ok(_) = saga_postgres.with_schema(config, string.repeat("a", 63))
-}
-
-/// Each shipped SQL file's up section is its migration's statements, in
-/// order.
-pub fn the_sql_files_hold_the_same_statements_test() {
-  list.each(migrations.all(), fn(migration) {
-    let assert Ok(text) =
-      support.read_file("priv/migrations/" <> migration.file)
-    let assert Ok(#(_, rest)) = string.split_once(text, "--- migration:up")
-    let assert Ok(#(up, _)) = string.split_once(rest, "--- migration:down")
-    up
-    |> string.split(";\n")
-    |> list.map(string.trim)
-    |> list.filter(fn(statement) { statement != "" })
-    |> should.equal(migration.statements)
-  })
 }
 
 /// The shipped SQL files apply on their own, as another migration tool

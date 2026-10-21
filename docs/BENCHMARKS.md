@@ -20,7 +20,7 @@ cd bench
 gleam run > /tmp/saga-bench.md
 ```
 
-The gate profile `benchmark` runs the same harness (see
+The benchmark is an optional direct command (see
 [AGENTS.md](../AGENTS.md)). Record the Saga commit, dependency lock, CPU,
 Erlang/OTP version, scheduler count and system load alongside a capture, and
 compare revisions only under the same environment and harness method.

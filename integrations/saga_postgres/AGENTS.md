@@ -6,11 +6,10 @@
 - Keep executable SQL and its internal statement list equivalent. Do not infer external-effect replay safety from lease or revision fencing.
 - The application owns the connection pool. Do not add pool startup, shutdown, an ambient scheduler, or a shared ecosystem durability runtime to this adapter.
 
-Run documentation checks from the Saga root:
+Shared documentation rendering and context commands from the Saga root:
 
 ```sh
 nix run .#design-gate-render -- integrations/saga_postgres/docs/design integrations/saga_postgres/docs/design/design-layer.pdf
-nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
 nix run .#design-gate-context -- integrations/saga_postgres/docs/design --estimate
 nix run .#design-gate-context -- integrations/saga_postgres/docs/design --manifest
 ```
@@ -22,4 +21,10 @@ nix run .#design-gate-context -- integrations/saga_postgres/docs/design --manife
 
 ```sh
 nix develop ../.. --command bash -c 'gleam format --check src test && gleam build --warnings-as-errors && scripts/test-postgres.sh'
+```
+
+The parent CI runs the imported design checker for both layers:
+
+```sh
+nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
 ```

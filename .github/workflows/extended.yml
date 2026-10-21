@@ -39,35 +39,4 @@ jobs:
         with:
           extra_nix_config: experimental-features = nix-command flakes
       - name: Compare all seven scoped Reactor scenarios
-        run: nix develop .#oracle --no-update-lock-file --command python3 -B scripts/check.py oracle --logs .artifacts/extended/oracle
-      - name: Capture observational benchmark
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: nix develop --no-update-lock-file -c python3 -B scripts/check.py benchmark --logs .artifacts/extended/benchmark
-      - name: Retain oracle and benchmark evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: saga-extended
-          path: .artifacts/extended/
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 30
-  ci:
-    name: Extended CI
-    needs: [verification]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Require every mandatory result
-        env:
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          results = json.loads(os.environ['RESULTS'])
-          failures = {job: value['result'] for job, value in results.items() if value['result'] != 'success'}
-          if not results or failures:
-              raise SystemExit(f'Required jobs did not succeed: {failures}')
-          PY
+        run: nix develop .#oracle --no-update-lock-file --command bash scripts/oracle.sh

@@ -12,7 +12,7 @@ gleam test   # every example and scenario, with assertions
 gleam run    # the scenarios and the usage examples, with a printed trace
 ```
 
-The full gate (`scripts/check.py full`) runs both, so an API change that breaks an
+The full gate (`bash scripts/test.sh`) runs both, so an API change that breaks an
 example fails the build.
 
 | Topic                                              | Example                                                     |

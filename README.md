@@ -145,10 +145,10 @@ the part-to-design mapping. Two retained references back the behavior claims:
 and lists every deliberate difference, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 records the run-cost method and results.
 
-Run the shared registry from this repository; [AGENTS.md](AGENTS.md) lists every
-profile:
+Run the shared tools and application tests; [AGENTS.md](AGENTS.md) lists focused commands:
 
 ```sh
-nix develop --command python3 -B scripts/check.py fast
-nix develop --command python3 -B scripts/check.py full
+nix flake check
+nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
+nix develop --command bash scripts/test.sh
 ```

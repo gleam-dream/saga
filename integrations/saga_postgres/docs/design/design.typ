@@ -372,7 +372,7 @@
     [*Evidence surface*], [*Assertions*], [*Limit*],
     [Saga storage conformance], [Atomic creation, transferable claims, cancellation races, stale/refused writes, release, live/lost ownership, discovery, killed-runner recovery], [One VM; adapter owner-loss allowance is separate from scenario operation timeout.],
     [Configuration tests], [Lease/renewal defaults and minimum; default call timeout; pool-handle password exclusion], [No general credential/redaction or hostile-server proof.],
-    [Migration tests], [Concurrent/idempotent installation, independent schemas, invalid names, newer watermark, unreachable target, SQL equality/external application], [Current version one; no historical upgrade chain or failover test.],
+    [Migration tests], [Concurrent/idempotent installation, independent schemas, invalid names, newer watermark, unreachable target, external SQL application], [Current version one; no historical upgrade chain or failover test.],
     [Store tests], [Refusal precedence, missing execution, phase discovery, current renewal, stale proof, blocked query timeout, expired unreplaced claim], [Timeout test covers a row lock on the normal pooled path.],
     [Durable tests], [Saved result reuse, long live runner heartbeat, prompt killed-runner release, lost-release fallback, resolver recovery, pre-drive cancellation], [Lost release is simulated; no multi-node partition or database power loss.],
     [Shared-pool consumer], [Five concurrent durable runs plus application writes using two connections], [Demonstrates borrowed pool composition; does not establish performance/fairness under overload.],

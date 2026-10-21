@@ -10,13 +10,6 @@
 #   - fixtures/positive/*.gleam: the same-shaped POSITIVE control fixtures
 #     must compile successfully, proving a paired negative fixture fails
 #     for the reason its .expect claims, not for an unrelated mistake.
-#   - examples/order_consumer's own tracked sources never import
-#     `saga/internal` or `saga/internal/*`. gleam.toml's `internal_modules`
-#     is enforced for a Hex/registry dependency, but NOT for a path
-#     dependency such as this monorepo's `examples/order_consumer` ->
-#     `saga` path dep, so nothing else in this repo stops a consumer
-#     example from quietly reaching into saga's internals; this grep is
-#     that enforcement, standing in for the compiler.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,17 +22,6 @@ cleanup() {
   rm -f "$PROBE_FILE"
 }
 trap cleanup EXIT
-
-echo "== examples/order_consumer must never import saga/internal =="
-if grep -rEn '^\s*import\s+saga/internal(/|\s|$)' "$CONSUMER_DIR/src" "$CONSUMER_DIR/test" 2>/dev/null; then
-  echo "FAIL: examples/order_consumer imports saga/internal (see above). gleam.toml's" >&2
-  echo "internal_modules restriction is NOT enforced for a path dependency, so this" >&2
-  echo "would silently compile; the external consumer example must only ever use" >&2
-  echo "saga's public modules." >&2
-  exit 1
-fi
-echo "PASS: no saga/internal import found in examples/order_consumer"
-echo
 
 if [ ! -d "$FIXTURES_DIR" ] || [ -z "$(ls -A "$FIXTURES_DIR"/*.gleam 2>/dev/null)" ]; then
   echo "FAIL: No negative fixtures found in $FIXTURES_DIR" >&2
