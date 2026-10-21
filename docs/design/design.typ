@@ -62,7 +62,7 @@
   ))
   #points(
     [Every package build treats Gleam warnings as errors and compiles authored Erlang in `src` and `test` with `erlc -Werror` and dependency includes. Generated dependency code and retained oracle or fixture bytes are excluded from authored-script formatting.],
-    [CI invokes Nix/treefmt and the pinned design-layer checker directly. The local scripts/test.sh compiles and tests packages, compiler contracts and VM restart behavior. It has no profile registry, source-policy checks, checker self-tests or provenance receipts. See #adr(15).],
+    [CI invokes Nix/treefmt and the pinned design-layer checker directly. The local scripts/test.sh compiles and tests packages, compiler contracts and VM restart behavior. It has no profile registry, source-policy checks, checker self-tests or provenance receipts. Shared pinned Snips synchronizes root README excerpts from named regions in the compiled consumer; its compiler and tests validate behavior, without a local custom README checker. See #adr(15).],
     [Hosted verification builds from the committed lock files without persisting credentials. Unpublished sibling packages are git dependencies on `main`, and each manifest locks the resolved commit. Fork pull requests run the same required checks.],
     [A push, pull request, or manual run runs the shared tools and scripts/test.sh. The oracle runs on relevant source changes, weekly, and manually. Benchmarks are optional local measurements.],
     [The oracle proves only its seven scoped scenarios, not general Reactor or Temporal parity. The database harness disables fsync and synchronous commit, so passing runner and VM recovery tests establish no database power-loss durability. The decision is #adr(13).],

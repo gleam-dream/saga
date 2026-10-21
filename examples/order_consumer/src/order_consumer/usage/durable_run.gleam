@@ -74,6 +74,7 @@ pub fn action_for(error: durable.Error) -> String {
   }
 }
 
+// snips-start: durable-run
 pub fn run() -> Nil {
   let assert Ok(store) = memory.start()
   let assert Ok(run) =
@@ -92,3 +93,4 @@ pub fn run() -> Nil {
   memory.stop(store)
   Nil
 }
+// snips-end: durable-run

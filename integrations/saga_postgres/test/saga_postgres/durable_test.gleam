@@ -131,6 +131,7 @@ fn listed_within(store: Storage, id: String, milliseconds: Int) -> Bool {
   }
 }
 
+// snips-start: durable-run
 pub fn a_durable_run_finishes_on_postgres_test() {
   use connection <- support.using_pool(4)
   let schema = support.schema()
@@ -155,6 +156,8 @@ pub fn a_durable_run_finishes_on_postgres_test() {
   |> should.equal(Ok(execution.Completed("x!")))
   support.drop(connection, schema)
 }
+
+// snips-end: durable-run
 
 pub fn a_live_runner_keeps_its_claim_past_the_lease_test() {
   use connection <- support.using_pool(4)

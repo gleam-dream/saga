@@ -19,47 +19,74 @@ owns any external clients and storage it supplies.
 
 ## Run a checkout workflow
 
-Build the workflow once, then run it with each order. This complete module takes
-application service callbacks; the `main` function supplies fake services so the
-example runs without a provider.
+Build the workflow once, then run it with each order. The tested checkout
+example uses fake services and includes a policy for uncertain payment outcomes.
+Call `checkout()` to obtain the workflow; the consumer tests run it against
+successful and declined orders.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/order_consumer/src/order_consumer/usage/checkout.gleam#checkout -->
 ```gleam
+import gleam/time/duration
 import saga
 import saga/execution
+import saga/telemetry
+import sinal
+import sinal/correlation
 
 pub type CheckoutError {
   OutOfStock
   Declined
+  MaybeCharged
 }
 
-pub fn checkout(
-  reserve: fn(String) -> Result(String, CheckoutError),
-  release: fn(String) -> Result(Nil, CheckoutError),
-  charge: fn(String, String) -> Result(String, CheckoutError),
-) {
-  let reservation =
+pub fn reserve(order: String) -> Result(String, CheckoutError) {
+  Ok("hold-" <> order)
+}
+
+pub fn release(_hold: String) -> Result(Nil, CheckoutError) {
+  Ok(Nil)
+}
+
+fn charge(
+  reservation: String,
+  idempotency_key key: String,
+) -> Result(String, CheckoutError) {
+  case reservation {
+    "hold-declined" -> Error(Declined)
+    _ -> Ok("receipt-" <> key)
+  }
+}
+
+/// Two dependent steps: a reservation that can be undone and a payment whose
+/// outcome may be unknown, with a compensation policy.
+pub fn checkout() {
+  let reserve =
     saga.step("reserve_inventory", reserve)
     |> saga.undo(fn(undo) { release(undo.output) })
-  let payment =
-    saga.effect("charge_payment", fn(hold, key) {
-      charge(hold, saga.idempotency_key(key))
+  let charge =
+    saga.effect("charge_payment", fn(reservation, key) {
+      // `saga.idempotency_key(key)` is the same for every attempt of this step.
+      charge(reservation, idempotency_key: saga.idempotency_key(key))
+    })
+    |> saga.unknown_when(fn(error) { error == MaybeCharged })
+    |> saga.compensate(max_attempts: 3, with: fn(failed) {
+      case failed.failure {
+        saga.Returned(MaybeCharged) ->
+          saga.RetryAfter(duration.milliseconds(500))
+        saga.Returned(error) -> saga.Abort(error)
+        saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
+      }
     })
   saga.define("checkout", fn(order) {
-    order |> saga.perform(reservation) |> saga.perform(payment)
+    order |> saga.perform(reserve) |> saga.perform(charge)
   })
 }
 
-pub fn main() {
-  let workflow =
-    checkout(
-      fn(order) { Ok("hold-" <> order) },
-      fn(_hold) { Ok(Nil) },
-      fn(hold, key) { Ok("receipt-" <> hold <> ":" <> key) },
-    )
-  let assert Ok(execution.Completed(_receipt)) =
-    execution.run(workflow, "o-1", execution.config())
-}
 ```
+
+<!-- prettier-ignore-end -->
 
 A known charge failure runs `release` for the completed reservation. The callback
 error type belongs to the application. `execution.run` returns a typed terminal
@@ -79,15 +106,29 @@ lifetime. Defaults allow one attempt per step, use the online scheduler count fo
 run concurrency, and set a 60-second attempt timeout plus five-second settlement
 and cleanup windows. A run deadline is opt-in; every bound is a `Duration`.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/order_consumer/src/order_consumer/usage/checkout.gleam#configure-run -->
 ```gleam
-let config =
-  execution.config()
-  |> execution.with_max_concurrency(4)
-  |> execution.with_deadline(execution.After(duration.seconds(30)))
-let assert Ok(exec) = execution.start(workflow, order, config)
-execution.cancel(exec)
-let assert Ok(outcome) = execution.await(exec, timeout: duration.seconds(10))
+/// Configure concurrency, deadline and correlation, then start, watch and
+/// await a run instead of blocking in `run`.
+pub fn run_configuration() -> Nil {
+  let workflow = checkout()
+  let config =
+    execution.config()
+    |> execution.with_max_concurrency(4)
+    |> execution.with_deadline(execution.After(duration.seconds(30)))
+    |> execution.with_correlation(correlation.unique())
+  let assert Ok(exec) = execution.start(workflow, "o-2", config)
+  let _ = execution.progress(exec, timeout: duration.seconds(1))
+  let assert Ok(execution.Completed(_)) =
+    execution.await(exec, timeout: duration.seconds(10))
+  Nil
+}
+
 ```
+
+<!-- prettier-ignore-end -->
 
 Cancel and consume the terminal report with `await` before dropping an
 unfinished handle. `execution.start_reporting` delivers the report to another
@@ -98,18 +139,36 @@ short-lived invocation worker.
 
 A durable run saves a checkpoint at every step boundary and survives the loss of
 its runner, caller or VM. Attach versioned codecs and interrupted-effect
-resolvers to the same workflow, then admit and drive one stable execution id:
+resolvers to the same workflow, then admit and drive one stable execution id.
+The tested `persistence()` helper in
+[the durable example](examples/order_consumer/src/order_consumer/usage/durable_run.gleam)
+constructs that definition; `action_for` classifies operational errors:
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/order_consumer/src/order_consumer/usage/durable_run.gleam#durable-run -->
 ```gleam
-let persistence =
-  durable.new(workflow, input: order, output: text, error: text, undo_error: text)
-let assert Ok(run) =
-  durable.start_or_reconnect(persistence, store, id: "checkout:o-1", input: "o-1")
-case durable.drive(run, timeout: duration.seconds(30)) {
-  Ok(outcome) -> handle(outcome)
-  Error(error) -> act_on(durable.error_kind(error))
+pub fn run() -> Nil {
+  let assert Ok(store) = memory.start()
+  let assert Ok(run) =
+    durable.start_or_reconnect(
+      persistence(),
+      memory.storage(store),
+      id: "checkout:o-1",
+      input: "o-1",
+    )
+  let handled = case durable.drive(run, timeout: duration.seconds(30)) {
+    Ok(execution.Completed(_)) -> "completed"
+    Ok(_) -> "other outcome"
+    Error(error) -> action_for(error)
+  }
+  let assert "completed" = handled
+  memory.stop(store)
+  Nil
 }
 ```
+
+<!-- prettier-ignore-end -->
 
 Storage adapters are `saga/storage/memory`, `saga/storage/file` and the separate
 [PostgreSQL package](integrations/saga_postgres). A local SQL write can commit
