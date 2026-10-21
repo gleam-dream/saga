@@ -2,6 +2,7 @@
 //// it with telemetry. Each `run_*` function asserts what the guide states, so
 //// the documented common path cannot drift from the API.
 
+// snips-start: checkout
 import gleam/time/duration
 import saga
 import saga/execution
@@ -58,6 +59,7 @@ pub fn checkout() {
   })
 }
 
+// snips-end: checkout
 /// The caller's own failure type keeps both reports intact.
 pub type Failure(o, e, u) {
   NotStarted(execution.RunError)
@@ -92,6 +94,7 @@ pub fn run_common_path() -> Nil {
   Nil
 }
 
+// snips-start: configure-run
 /// Configure concurrency, deadline and correlation, then start, watch and
 /// await a run instead of blocking in `run`.
 pub fn run_configuration() -> Nil {
@@ -107,6 +110,8 @@ pub fn run_configuration() -> Nil {
     execution.await(exec, timeout: duration.seconds(10))
   Nil
 }
+
+// snips-end: configure-run
 
 /// Attach to the run-stopped telemetry event and read its correlation,
 /// execution and outcome.

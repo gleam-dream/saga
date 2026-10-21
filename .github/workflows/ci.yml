@@ -24,5 +24,7 @@ jobs:
         run: nix flake check --no-update-lock-file
       - name: Shared design-layer checks
         run: nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
+      - name: README snippets
+        run: nix run --no-update-lock-file .#snips -- --check --commands deny README.md integrations/saga_postgres/README.md
       - name: Compile and test application behavior
         run: nix develop --no-update-lock-file -c bash scripts/test.sh
