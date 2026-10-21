@@ -88,8 +88,6 @@
             beam29Packages.rebar3
             python3
             ruff
-            shellcheck
-            actionlint
             # A disposable PostgreSQL 16 for integrations/saga_postgres's
             # storage conformance run (scripts/test-postgres.sh).
             postgresql_16
@@ -110,8 +108,6 @@
             beam29Packages.rebar3
             python3
             ruff
-            shellcheck
-            actionlint
           ];
         };
 

@@ -50,7 +50,7 @@
   )
 ])
 
-#section(title: "Verification gates", lead: "One registry of profiles proves each obligation by the evidence that can establish it.", body: [
+#section(title: "Verification gates", lead: "Shared tools validate repository structure; application tests exercise runtime contracts.", body: [
   #md-table(3, (
     [*Evidence*], [*Guarantee checked*], [*Boundary*],
     [examples/order_consumer], [Common and advanced native use, mapped errors, failures and undo, durable recovery, Blueprint bridge, and full reporting.], [Separate package using public modules only; each documented usage topic is one compiled module that asserts what it shows (#adr(14)).],
@@ -60,20 +60,11 @@
     [Reactor oracle], [Seven scoped scenarios; reverse undo and sibling settlement are deliberate differences.], [Reactor 1.0.6; not full Reactor API parity. Pin, mapping and limits: #lnk("../ORACLE.md")[oracle reference].],
     [Benchmark harness], [Build-once, store, and readiness cost, with correctness checks.], [Measured observation; no latency guarantee. Method and results: #lnk("../BENCHMARKS.md")[benchmark reference].],
   ))
-  #md-table(2, (
-    [*Profile*], [*Obligations and evidence*],
-    [fast], [Formatting, Ruff correctness lint, ShellCheck, actionlint, gate regressions, and the root strict build and tests.],
-    [ci], [All four packages; external order consumer tests and executable; strict benchmark build; disposable PostgreSQL 16; positive and negative compiler fixtures; actual VM restart probes.],
-    [design], [Render freshness, vocabulary, links, and integrity of both native layers.],
-    [full], [Every ci and design obligation.],
-    [oracle], [Seven real Reactor 1.0.6 scenarios, captured upstream output, and normalized Saga comparison including the checked deliberate differences; full root tests.],
-    [benchmark], [The chain, fan, and wide harness with correctness assertions and observational timings; no latency threshold.],
-  ))
   #points(
-    [Every package build treats Gleam warnings as errors and compiles authored Erlang in `src` and `test` with `erlc -Werror` and dependency includes. Generated dependency code and retained oracle or fixture bytes are excluded from authored-script formatting and lint.],
-    [Gate commands check the tree without repairing it. A profile stops at its first failure and retains per-check logs, nonempty result entries, dependency revisions, and environment metadata under `.artifacts/PROFILE`.],
+    [Every package build treats Gleam warnings as errors and compiles authored Erlang in `src` and `test` with `erlc -Werror` and dependency includes. Generated dependency code and retained oracle or fixture bytes are excluded from authored-script formatting.],
+    [CI invokes Nix/treefmt and the pinned design-layer checker directly. The local scripts/test.sh compiles and tests packages, compiler contracts and VM restart behavior. It has no profile registry, source-policy checks, checker self-tests or provenance receipts. See #adr(15).],
     [Hosted verification builds from the committed lock files without persisting credentials. Unpublished sibling packages are git dependencies on `main`, and each manifest locks the resolved commit. Fork pull requests run the same required checks.],
-    [A push, pull request, or manual run requires the ci and design profiles. The oracle runs on relevant source changes, weekly, and manually; the benchmark runs weekly and manually.],
+    [A push, pull request, or manual run runs the shared tools and scripts/test.sh. The oracle runs on relevant source changes, weekly, and manually. Benchmarks are optional local measurements.],
     [The oracle proves only its seven scoped scenarios, not general Reactor or Temporal parity. The database harness disables fsync and synchronous commit, so passing runner and VM recovery tests establish no database power-loss durability. The decision is #adr(13).],
   )
 ])

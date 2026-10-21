@@ -16,36 +16,36 @@ maps repository parts to their design owners.
 - `nix flake check`: fails iff the tree is not formatted (plus any existing checks).
 - Dependencies: the unpublished sibling packages (`sinal`, `json_blueprint`) are git dependencies with `ref = "main"`, and each `manifest.toml` holds the resolved commit. Move one by hand with `gleam update <package>` in the package directory. The Reactor oracle fetches its sources with mix into the gitignored `oracle/reactor/deps/`; nothing third-party is committed.
 
-## Gates
+## Validation
 
-Run the authoritative registry from the repository root. Gate commands validate the
-existing tree without formatting it.
+Use the shared tools directly, then run application tests:
 
 ```sh
-nix develop --command python3 -B scripts/check.py fast
-nix develop --command python3 -B scripts/check.py full
-nix develop .#oracle --command python3 -B scripts/check.py oracle
-nix develop --command python3 -B scripts/check.py benchmark
+nix flake check
+nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
+nix develop --command bash scripts/test.sh
 ```
 
-- `fast` is the local loop; `full` covers every deterministic runtime obligation and both native design layers. CI splits `full` into `ci` and `design`. The profiles and their obligations are in the design's verification gates.
+For the core edit loop, run `nix develop --command gleam test`.
+`scripts/test.sh` compiles and tests the retained packages and service fixtures;
+it does not wrap formatting or design validation.
+
 - `examples/order_consumer` is a separate package (path dependency on saga) that imports only public modules. Run `gleam test` inside it.
 - `integrations/saga_postgres` is a separate package so that saga never depends on pog. `scripts/test-postgres.sh` runs its tests, including the storage conformance suite, against a throwaway PostgreSQL 16 cluster.
 - `scripts/check_negative.sh` proves the compiler-negative fixtures under `fixtures/negative/` still fail to compile. `scripts/check_durable_restart.sh` kills a VM during concurrent effect and compensation work and recovers in a fresh VM.
 - `nix develop .#oracle --command scripts/oracle.sh` runs the Reactor differential oracle; recompute `oracle/differences/*.diff` only after a reviewed behavior change.
 - Run the benchmark with `cd bench && gleam run`.
-- Edit the design layer, then run the design gate commands from the fenced section below.
 
 ## References
 
 - [docs/ORACLE.md](docs/ORACLE.md) pins Reactor 1.0.6 (`v1.0.6`, commit `e4ddc9e`) as the behavioral oracle, lists the adapted tests and every deliberate difference, and states the limits of the claim. `scripts/oracle.sh` runs it; recompute `oracle/differences/*.diff` only after a reviewed behavior change.
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) records the run-cost method, retained results and limits. Results are observational and never gate a change; `scripts/check.py benchmark` runs the harness.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) records the run-cost method, retained results and limits. Results are observational and never gate a change; `cd bench && gleam run` runs the harness.
 - `examples/order_consumer` holds the usage examples as compiled, runnable code (`gleam test`, `gleam run`). Add or change an example in the same change as the API it shows.
 
 <!-- agent-skills:begin -->
 <!-- framework-commit: cab7c0590036edaa66d8430cc5016399a9fd2c71 origin: git@github.com:lostbean/skills.git -->
 
-(machine-owned; do not edit inside this fence — re-run setup to refresh)
+(Updated for the repository validation policy.)
 
 ## Agent skills
 
@@ -69,22 +69,10 @@ verbatim): states `needs-triage`, `needs-info`, `ready-for-agent`,
 **AI disclaimer** — AI-authored tracker comments start with
 `AI-assisted contribution.`
 
-**Design gate** — `nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres` checks render freshness,
-vocabulary references and layer integrity (exit 0 clean, 1 violation, 2 error).
-The gate is supplied by the pinned `design-layer` flake input.
-`nix run .#design-gate-render -- docs/design docs/design/design-layer.pdf`
-rebuilds the rendered document. `nix run .#design-gate-context -- docs/design --estimate`
-estimates agent context; the same command without `--estimate` emits ephemeral
-Markdown. `--manifest`, `--preview`, and `--section PATH --expect-digest DIGEST`
-support loading selected sections. A bare Typst compilation does not run the gate.
-
-**Context verification** — use native semantic blocks for lists, tables,
-models and behavior. After authoring, verify context estimation and a selected
-section export as well as rendering and the design gate.
-Run these commands sequentially for each layer; they share its generated
-`.render` workspace.
-
-**Staleness** — source changes since the design last changed require a
-conformance review before the layer is treated as current.
+**Shared design validation** — `nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres`
+uses the pinned design-layer implementation for render freshness, vocabulary and
+layer integrity. `nix run .#design-gate-render -- docs/design docs/design/design-layer.pdf`
+updates the rendered document; `nix run .#design-gate-context -- docs/design` exports
+context. Run these tools sequentially because they share `.render`.
 
 <!-- agent-skills:end -->
