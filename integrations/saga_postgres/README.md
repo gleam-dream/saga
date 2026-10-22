@@ -87,7 +87,7 @@ transaction-scoped connection is unsuitable as a reusable store across runners.
 
 Application effects, job scheduling and checkpoint commits have separate
 transaction boundaries, and the adapter keeps finished rows indefinitely. Lease,
-fencing, query-budget and recovery semantics are in the [design](docs/design/design.typ).
+fencing, query-budget and recovery semantics are in the [design](docs/design/design-layer.pdf).
 
 ## Migrations
 
