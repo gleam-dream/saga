@@ -1,28 +1,64 @@
-# saga
+# Saga
 
-Saga runs typed workflows of dependent steps in Gleam. It supports retries,
-undo of completed steps, cancellation and recovery from saved checkpoints.
+Saga runs typed, source-authored workflows in Gleam on Erlang. It coordinates dependent steps and keeps typed evidence about failures, cleanup, and uncertain effects. Version 0.1.0 is available from Git; Gleam 1.18 or later is required.
 
-## Installation
+## When to use Saga
 
-Saga is unpublished and targets Erlang with Gleam 1.18 or later. Add a local
-checkout to your application's `gleam.toml`:
+Use Saga when a business operation has known steps and dependencies, may need concurrent work, and needs explicit recovery when a step fails. Typical examples include reserving inventory before charging for an order, or driving a durable operation from an application-owned job or message handler.
+
+Workflows are defined in Gleam code. Your application owns its clients, stable operation IDs, delivery, and the decision to drive or cancel durable work. Saga does not make remote effects transactional with checkpoints.
+
+## Capabilities
+
+- Define and validate typed workflows from steps and value ports.
+- Share prerequisites, combine outputs, and select a workflow branch.
+- Run ready steps concurrently with a per-run limit, attempt timeouts, and an optional deadline.
+- Retry with an explicit policy, undo known completed steps, and retain cleanup failures.
+- Cancel a local run, inspect progress, and receive a typed terminal outcome.
+- Mark uncertain effects, choose retry or hold for reconciliation, and use a stable idempotency key across attempts.
+- Add versioned codecs and effect resolvers to checkpoint and resume the same workflow.
+- Store durable executions in memory, files, or the separate PostgreSQL adapter; reconnect, read, cancel, and list unfinished executions.
+- Emit correlated Sinal telemetry and synchronize tests with `saga/testing`.
+
+## Install
+
+Saga is not published to Hex. Add it from the public Git repository. `manifest.toml` records the resolved commit; keep that file in your application repository to pin the dependency.
 
 ```toml
 [dependencies]
-saga = { path = "../saga" }
+saga = { git = "https://github.com/gleam-dream/saga.git", ref = "main" }
+
+# Optional: PostgreSQL storage for durable executions.
+pog = ">= 4.1.0 and < 4.2.0"
+saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "main", path = "integrations/saga_postgres" }
 ```
 
-Gleam fetches the pinned [Sinal source](https://github.com/gleam-dream/sinal)
-for execution events; no sibling checkout is required. The application
-owns any external clients and storage it supplies.
+The PostgreSQL adapter borrows your application's `pog.Connection`; the application starts and owns the pool. See the [adapter guide](integrations/saga_postgres/README.md).
 
-## Run a checkout workflow
+## How execution works
 
-Build the workflow once, then run it with each order. The tested checkout
-example uses fake services and includes a policy for uncertain payment outcomes.
-Call `checkout()` to obtain the workflow; the consumer tests run it against
-successful and declined orders.
+A workflow definition is built once. Each run gets an OTP coordinator process that admits ready steps up to its concurrency limit and starts isolated action workers. In durable mode, the driver claims storage and checkpoints progress; after an interrupted action, an application resolver reports whether it completed, was not sent, or may have been sent.
+
+```mermaid
+flowchart LR
+  workflow["Typed workflow<br/>Steps and Ports"] --> coordinator["One coordinator process per run"]
+  coordinator --> workers["Bounded action workers"]
+  workers -->|result or failure evidence| coordinator
+  coordinator -->|typed outcome and settlement| outcome["Caller"]
+  coordinator -. "durable mode: checkpoint" .-> storage["Storage adapter and claim"]
+  storage -. "restore on a later drive" .-> coordinator
+  coordinator -. "interrupted action" .-> resolver["Application resolver"]
+  resolver -. "effect evidence" .-> coordinator
+```
+
+The caller owns a local run's lifetime: its exit cancels that run. A durable `drive` can be interrupted and resumed without recording cancellation; only `durable.cancel` records cancellation. The application owns the storage process, database pool, and job scheduling.
+
+## Define a checkout workflow
+
+The [checkout consumer](examples/order_consumer/src/order_consumer/usage/checkout.gleam)
+uses simulated reservation and payment functions. It links their outputs, attaches
+an undo to the reservation, and supplies a stable idempotency key to the charge.
+Keep its retry policy only when your real provider makes replay safe.
 
 <!-- prettier-ignore-start -->
 
@@ -88,61 +124,17 @@ pub fn checkout() {
 
 <!-- prettier-ignore-end -->
 
-A known charge failure runs `release` for the completed reservation. The callback
-error type belongs to the application. `execution.run` returns a typed terminal
-report that retains failure, cleanup and unknown-effect evidence; `saga/outcome`
-classifies it, and `outcome.summary` renders it without application payloads.
+Only a known successful step enters the undo journal, and each undo callback is attempted once. Saga cannot reverse a provider request or a committed database write on its own. Use the `EffectKey` idempotency key with the external provider, and make recovery decisions from authoritative application evidence.
 
-A payment error that could mean the charge succeeded needs an explicit
-uncertainty policy: `saga.unknown_when` marks the error, and `saga.compensate`
-or `saga.on_unknown` chooses retry, rollback or a held run that keeps completed
-steps for reconciliation. Idempotency keys stay stable across attempts of one
-step.
+## Configure and run
 
-## Configure a run
+Use `execution.run` for a blocking local run. Use `execution.start`, `progress`, `await`, and `cancel` when the caller needs to interact with a run. Concurrency is per run; a run deadline is optional. Configure a step timeout or run deadline to match the application's time budget, and consume the terminal report before dropping an unfinished handle.
 
-Local execution needs no codecs or storage. The process that starts it owns its
-lifetime. Defaults allow one attempt per step, use the online scheduler count for
-run concurrency, and set a 60-second attempt timeout plus five-second settlement
-and cleanup windows. A run deadline is opt-in; every bound is a `Duration`.
+## Persist and recover
 
-<!-- prettier-ignore-start -->
+Durable workflows require codecs for saved input and outputs, a workflow version, and resolvers for effects that may have been interrupted. Use the same stable execution ID and compatible encoded input when reconnecting; bump the workflow version when its behavior changes. `durable.drive`'s timeout bounds its work budget, but stopping workers and releasing a claim can make the call return later, so leave margin under an enclosing job deadline.
 
-<!-- snips: examples/order_consumer/src/order_consumer/usage/checkout.gleam#configure-run -->
-```gleam
-/// Configure concurrency, deadline and correlation, then start, watch and
-/// await a run instead of blocking in `run`.
-pub fn run_configuration() -> Nil {
-  let workflow = checkout()
-  let config =
-    execution.config()
-    |> execution.with_max_concurrency(4)
-    |> execution.with_deadline(execution.After(duration.seconds(30)))
-    |> execution.with_correlation(correlation.unique())
-  let assert Ok(exec) = execution.start(workflow, "o-2", config)
-  let _ = execution.progress(exec, timeout: duration.seconds(1))
-  let assert Ok(execution.Completed(_)) =
-    execution.await(exec, timeout: duration.seconds(10))
-  Nil
-}
-
-```
-
-<!-- prettier-ignore-end -->
-
-Cancel and consume the terminal report with `await` before dropping an
-unfinished handle. `execution.start_reporting` delivers the report to another
-`Subject`, and `saga/reporting.run_owned` preserves it across the exit of a
-short-lived invocation worker.
-
-## Persist progress
-
-A durable run saves a checkpoint at every step boundary and survives the loss of
-its runner, caller or VM. Attach versioned codecs and interrupted-effect
-resolvers to the same workflow, then admit and drive one stable execution id.
-The tested `persistence()` helper in
-[the durable example](examples/order_consumer/src/order_consumer/usage/durable_run.gleam)
-constructs that definition; `action_for` classifies operational errors:
+The example below calls the `persistence()` and `action_for()` helpers in the linked [durable example](examples/order_consumer/src/order_consumer/usage/durable_run.gleam). It uses memory storage to keep the code short; memory storage loses executions when its store or VM stops.
 
 <!-- prettier-ignore-start -->
 
@@ -170,44 +162,16 @@ pub fn run() -> Nil {
 
 <!-- prettier-ignore-end -->
 
-Storage adapters are `saga/storage/memory`, `saga/storage/file` and the separate
-[PostgreSQL package](integrations/saga_postgres). A local SQL write can commit
-before Saga saves its checkpoint, even when both use the same database; the
-[financial recovery consumer](https://github.com/gleam-dream/oversight) shows how
-an application posting record resolves that interruption without repeating the
-posting callback.
+Choose storage for the failure scope you need:
 
-## Observe and test
+- `saga/storage/memory` serves one VM process and loses its records when that store stops.
+- `saga/storage/file` recovers in a fresh VM when one VM at a time uses a canonical directory. It does not promise directory durability after power loss.
+- [`saga_postgres`](integrations/saga_postgres) stores runs in a shared database for runners on one or several nodes and borrows your pool. Database and application effects still commit separately from Saga checkpoints.
 
-`saga/telemetry` defines six Sinal events that carry the run's correlation, and
-every step reads the same correlation from its `EffectKey`. `saga/testing`
-provides `wait_until` for synchronizing a test with a run in progress.
+Saga lists unfinished executions but does not schedule or drive them. Your application decides when to reconnect and call `durable.drive`. An interrupted external effect must be resolved before Saga can safely continue: report `Completed` only with proof, `NotSent` only when absence is known, and otherwise preserve uncertainty for reconciliation.
 
-The [order consumer](examples/order_consumer) compiles and runs every example in
-this README, and the operating topics beyond it, with fake application services:
-[checkout and configuration](examples/order_consumer/src/order_consumer/usage/checkout.gleam),
-[unknown effects](examples/order_consumer/src/order_consumer/usage/unknown_effect.gleam),
-[step correlation](examples/order_consumer/src/order_consumer/usage/correlation.gleam),
-[durable runs](examples/order_consumer/src/order_consumer/usage/durable_run.gleam),
-[stable ids, reconnecting and discovering unfinished runs](examples/order_consumer/src/order_consumer/usage/operations.gleam),
-and [recovering a committed local effect](examples/order_consumer/src/order_consumer/usage/committed_effect.gleam).
-The full gate runs them, so an API change that breaks an example fails the build.
+## Examples and references
 
-## Design and development
+The [order consumer](examples/order_consumer/README.md) is a separate Gleam package that compiles and runs examples for checkout, configuration, unknown effects, durable operations, reconnection, and committed-effect recovery. Its test suite exercises the public modules.
 
-The [design source](docs/design/design.typ) holds the architecture and its two
-contexts, [execution](docs/design/execution/design.typ) and
-[durability](docs/design/durability/design.typ). The [context map](docs/CONTEXT-MAP.md),
-[ADRs](docs/adr) and [coverage map](docs/COVERAGE.md) hold vocabulary, rationale and
-the part-to-design mapping. Two retained references back the behavior claims:
-[docs/ORACLE.md](docs/ORACLE.md) pins Reactor 1.0.6 as the behavioral comparison
-and lists every deliberate difference, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
-records the run-cost method and results.
-
-Run the shared tools and application tests; [AGENTS.md](AGENTS.md) lists focused commands:
-
-```sh
-nix flake check
-nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
-nix develop --command bash scripts/test.sh
-```
+The [design PDF](docs/design/design-layer.pdf) describes execution and durability. The [coverage map](docs/COVERAGE.md) links implementation and evidence to those contexts. [Benchmark notes](docs/BENCHMARKS.md) explain the retained observational results and their limits; run `cd bench && gleam run` to measure a checkout. The historical measurements are not production performance claims.

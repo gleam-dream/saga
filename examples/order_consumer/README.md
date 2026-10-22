@@ -30,5 +30,5 @@ example fails the build.
 
 `test/usage_test.gleam` runs each usage module. The workflows for the scenarios
 live in `src/order_consumer/workflows.gleam`. The design's
-[testing section](../../docs/design/execution/design.typ#observation-and-verification)
+[testing section](../../docs/design/design-layer.pdf)
 states the rules for waiting on a run and for writing a step gate.
