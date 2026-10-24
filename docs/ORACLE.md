@@ -1,0 +1,131 @@
+# Oracle: Reactor 1.0.6
+
+Saga compares its scheduling, retry, rollback and concurrency behavior with a
+live reference implementation. This document is the retained reference for that
+comparison: what is pinned, what is compared and how outcomes are classified,
+where Saga deliberately differs, how to run it, and how far the claim reaches.
+Its sibling [BENCHMARKS.md](BENCHMARKS.md) records the run-cost measurements; the
+design's [verification gates](design/execution/design.typ#observation-and-verification)
+state the obligations both documents serve, and [ADR 0010](adr/0010-reactor-is-a-scoped-differential-oracle.md)
+records why Reactor is a scoped oracle and not a specification.
+
+## Reference source
+
+| Item           | Value                                                                                                                                                                                  |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implementation | [`reactor`](https://github.com/ash-project/reactor) (Elixir, Ash project)                                                                                                              |
+| Pinned release | hex `reactor == 1.0.6`, tag `v1.0.6`, commit `e4ddc9e438f08562e9fb31b08255a86f4bade8ef`                                                                                                |
+| Where pinned   | `oracle/reactor/mix.exs` (`== 1.0.6`) and `mix.lock` (package checksum `546a87255693bcee99451d022cc86927161cdb527f5216d4dcac2b31e08eb122`); the oracle shell is `nix develop .#oracle` |
+| License        | MIT; the notice this adaptation requires is in [THIRD-PARTY-NOTICES.md](../THIRD-PARTY-NOTICES.md)                                                                                     |
+| Scope          | scheduling, retry, rollback and concurrency of dependent steps; not Saga's durability, uncertainty or storage model                                                                    |
+
+## Classifications
+
+- **faithfully adapted** — same scenario shape and same expected outcome
+  as upstream, translated to Saga's API.
+- **differential comparison** — `scripts/oracle.sh` runs a live Reactor
+  1.0.6 scenario in `oracle/reactor/` and the corresponding Gleam scenario
+  in `test/oracle_test.gleam` (via `gleam run -m oracle_test`), normalizes
+  both sides' output to the same neutral text format, and mechanically
+  `diff`s them: a match must be byte-identical, and a deliberate
+  difference must byte-match a checked-in expected diff under
+  `oracle/differences/*.diff` — not read from the upstream source, and not
+  asserted by an unchecked, hand-written summary.
+- **inspired** — the upstream test motivated the scenario, but Saga's
+  outcome, mechanism, or scope intentionally differs (documented per row).
+
+## Adapted upstream tests
+
+| #   | Upstream revision | Source test                                                                                          | Behavior                                                                                    | Local equivalent                                                                                                                                                                                                                                                                                                                                                                                             | Classification                                    | Deliberate differences                                                                                                                                  |
+| --- | ----------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R1  | v1.0.6 / e4ddc9e  | `test/reactor/executor_test.exs:13-48` "it executes the steps"                                       | Dependent sequential steps run in dependency order                                          | `test/scheduling_test.gleam:sequential_dependency_order_test`; also `test/oracle_test.gleam:oracle_d1_sequential_dependency_test` (D1)                                                                                                                                                                                                                                                                       | faithfully adapted + differential comparison (D1) | Typed ports instead of `result(:name)`; D1 diffs against a live Reactor run                                                                             |
+| R2  | v1.0.6 / e4ddc9e  | `test/reactor/executor_test.exs:50-102` "the steps execute in separate pids"                         | Independent steps run in separate processes                                                 | `test/scheduling_test.gleam:independent_steps_run_in_distinct_processes_test`                                                                                                                                                                                                                                                                                                                                | faithfully adapted                                | none                                                                                                                                                    |
+| R3  | v1.0.6 / e4ddc9e  | `test/reactor/executor_test.exs:353-411` "successful steps can be undone"                            | A failure undoes all prior undoable steps                                                   | `test/rollback_test.gleam:failure_undoes_completed_steps_test`; also `test/oracle_test.gleam:oracle_d2_undo_order_and_failures_test` (D2)                                                                                                                                                                                                                                                                    | faithfully adapted + differential comparison (D2) | Undo order reversed: see D2 below                                                                                                                       |
+| R4  | v1.0.6 / e4ddc9e  | `test/reactor/executor/async_test.exs:82-99`                                                         | Non-undoable completions are not undone                                                     | `test/rollback_test.gleam:not_undoable_steps_are_reported_test`                                                                                                                                                                                                                                                                                                                                              | faithfully adapted                                | Reported explicitly in `settlement.not_undoable`                                                                                                        |
+| R5  | v1.0.6 / e4ddc9e  | `test/reactor/executor/async_test.exs:166-205`                                                       | A failure while sibling steps are still running                                             | `test/siblings_test.gleam:failure_with_active_siblings_settles_test`; also `test/oracle_test.gleam:oracle_d3_failure_with_active_sibling_settles_test` (D3)                                                                                                                                                                                                                                                  | differential comparison (D3)                      | Saga settles siblings instead of orphaning them: see D3 below                                                                                           |
+| R6  | v1.0.6 / e4ddc9e  | `test/reactor/executor/async_test.exs:206-227`                                                       | A crashed step task becomes an error, not a silent hang                                     | `test/config_test.gleam:killed_step_task_is_crash_test`                                                                                                                                                                                                                                                                                                                                                      | faithfully adapted                                | Surfaces as `StepCrashed(Crash(ExitClass, ...))`                                                                                                        |
+| R7  | v1.0.6 / e4ddc9e  | `test/reactor/executor/async_test.exs:228-262`, `test/reactor/executor/sync_test.exs:44-89`          | Retry budget and exhaustion triggers rollback                                               | `test/retry_test.gleam:retry_until_success_test`, `test/retry_test.gleam:retry_limit_triggers_rollback_test`; also `test/oracle_test.gleam:oracle_d4_retry_then_success_test` (D4)                                                                                                                                                                                                                           | faithfully adapted + differential comparison (D4) | Retry only through the explicit `compensate` decision; Saga's `max_attempts = Reactor's max_retries + 1`                                                |
+| R8  | v1.0.6 / e4ddc9e  | `test/reactor/executor/compensation_test.exs:46-81` "increments current_try"                         | Compensate `:retry` starts a new attempt with an incremented try count                      | `test/retry_test.gleam:compensation_receives_attempt_numbers_test`                                                                                                                                                                                                                                                                                                                                           | faithfully adapted                                | `Attempt.number` is 1-based (Reactor's `current_try` is 0-based)                                                                                        |
+| R9  | v1.0.6 / e4ddc9e  | `test/reactor/executor/step_runner_test.exs:170-250`                                                 | Failed-step compensation decisions (no compensation, raise, continue, retry, retry+backoff) | `test/retry_test.gleam:compensation_decisions_test` (one case per upstream case)                                                                                                                                                                                                                                                                                                                             | faithfully adapted                                | `Continue` carries its own `Undo`; backoff is `RetryAfter(ms)`                                                                                          |
+| R10 | v1.0.6 / e4ddc9e  | `test/reactor/executor/step_runner_test.exs:252-307`                                                 | Undo receives the step's original args and output; bounded undo retry                       | `test/rollback_test.gleam:undo_receives_input_and_output_test`                                                                                                                                                                                                                                                                                                                                               | args faithfully adapted; retry inspired           | No undo retry in the current execution contract; a failing undo is retained once, never retried                                                         |
+| R11 | v1.0.6 / e4ddc9e  | `test/reactor/executor_test.exs:604-647` "when the timeout is elapsed, it halts the reactor"         | A run-level timeout stops the run                                                           | `test/lifecycle_test.gleam:deadline_interrupts_run_test`                                                                                                                                                                                                                                                                                                                                                     | inspired                                          | Saga fails with `DeadlineExceeded` and rolls back; Reactor halts for a later resume (Saga has no resume)                                                |
+| R12 | v1.0.6 / e4ddc9e  | `test/reactor/executor_test.exs:910-928`                                                             | A deadline firing while a step is waiting on a retry backoff                                | `test/lifecycle_test.gleam:deadline_during_backoff_test`                                                                                                                                                                                                                                                                                                                                                     | faithfully adapted (outcome differs as in R11)    | as R11                                                                                                                                                  |
+| R13 | v1.0.6 / e4ddc9e  | `test/reactor/executor_test.exs:810-837,980-1012`                                                    | A step-provided backoff delays the next retry                                               | `test/retry_test.gleam:compensation_decisions_test` (the `RetryAfter` case)                                                                                                                                                                                                                                                                                                                                  | inspired                                          | No elapsed-time assertions; a relative delay via `send_after`-style scheduling                                                                          |
+| R14 | v1.0.6 / e4ddc9e  | `test/reactor/executor/concurrency_tracker_test.exs:34-80`, `test/reactor/executor_test.exs:649-688` | `max_concurrency` bounds the number of steps running at once                                | `test/scheduling_test.gleam:max_concurrency_bounds_running_attempts_test`; also `test/oracle_test.gleam:oracle_d6_max_concurrency_bound_test` (D6)                                                                                                                                                                                                                                                           | inspired + differential comparison (D6)           | Per-run bound only; shared/global concurrency pools are deferred (see [the retained scope](design/execution/design.typ#retained-composition-contracts)) |
+| R15 | v1.0.6 / e4ddc9e  | `test/reactor/planner_test.exs:72-104`                                                               | Graph validity: cyclic graphs and unknown-step references are rejected                      | compiler negatives under `fixtures/negative/` (checked from the external `examples/order_consumer` package by `scripts/check_negative.sh`); no fixture targets a cycle or an unknown-step reference specifically, because Saga's `Port`-threading builder makes both unrepresentable by construction — there is no expression that type-checks and produces one, so no compiler diagnostic exists to fixture | inspired                                          | Rejected at Gleam compile time, not at runtime; a cycle cannot even be constructed in Saga's builder                                                    |
+| R16 | v1.0.6 / e4ddc9e  | `test/reactor/step_test.exs:11-37` "can?/2"                                                          | Capability introspection: whether a step can undo or compensate                             | `test/authoring_test.gleam:describe_reports_capabilities_test`                                                                                                                                                                                                                                                                                                                                               | inspired                                          | Exposed as `StepDescriptor.undoable`/`StepDescriptor.compensates` on a static descriptor, not a runtime predicate                                       |
+| R17 | v1.0.6 / e4ddc9e  | `test/reactor/middleware/telemetry_test.exs`                                                         | Lifecycle events emitted during a run                                                       | `test/saga_telemetry_test.gleam:observation_events_test`                                                                                                                                                                                                                                                                                                                                                     | inspired                                          | Saga-owned Sinal event names and metadata fields, not Reactor's telemetry event names                                                                   |
+
+Deferred and excluded upstream behaviors (halt/resume, abandoned steps,
+`undo/2` of a whole successful reactor, dynamic steps, the DSL transformer
+suite, and the Mermaid exporter) are recorded in
+[the retained scope](design/execution/design.typ#retained-composition-contracts), not adapted here.
+
+## Differential oracle scenarios (`oracle/reactor/`)
+
+Each scenario below runs against a real, hex-pinned `reactor == 1.0.6` in
+`oracle/reactor/` (`oracle/reactor/scenarios/d*.exs`) and against Saga in
+`test/oracle_test.gleam` (the same `run_dN` functions used by
+`gleam test`'s `oracle_dN_..._test`, invoked again from `main()`). Both
+sides print their outcome as `normalized.dN.*` lines in one shared,
+language-neutral text format — see `Oracle.Trace.print_normalized/2`'s
+moduledoc in `oracle/reactor/lib/oracle/trace.ex` for the exact rules —
+and `scripts/oracle.sh` mechanically `diff`s the two sides' normalized
+output. This is a genuine mechanical comparison, not a hand-written
+summary: the script computes the actual textual diff and either asserts
+it is empty (a claimed "match") or asserts it is byte-identical to a
+checked-in file under `oracle/differences/*.diff` (a claimed "deliberate
+difference"). If Saga's behavior ever changes in a way that alters either
+diff, the script fails loudly rather than silently re-describing the new
+behavior as still matching its old classification.
+
+`oracle/reactor/expected/d*.txt` remains separately, as the literal,
+captured raw-Erlang-term evidence of the Reactor side — useful for a
+human reading exactly what Reactor printed — but is not itself the input
+to the mechanical comparison; `normalized.dN.*` is.
+
+| D   | Scenario                                                  | Reactor normalized fact(s)                                                                                    | Saga normalized fact(s)                                                                                      | Verdict                                        | Expected diff file           |
+| --- | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------- | ---------------------------- |
+| D1  | Sequential dependency chain a→b→c                         | `trace: [run:a, run:b, run:c]`, `result: ok`                                                                  | Identical                                                                                                    | match (empty diff)                             | —                            |
+| D2  | e1→e2→e3→e4(fail), e2 and e3's undo fail                  | `trace: [run:e1, run:e2, run:e3, undo:e1, undo:e2, undo:e3]`, `undo_failure_count: 2`, `result: error`        | `trace: [run:e1, run:e2, run:e3, undo:e3, undo:e2, undo:e1]`, `undo_failure_count: 2`, `result: error`       | **deliberate difference** (undo order)         | `oracle/differences/d2.diff` |
+| D3  | `slow` (300ms), `fast_fail` (fails fast), `quick`, joined | `fast_fail_compensated: true`, `quick_undone: true`, `slow_done: true`, `slow_undone: false`, `result: error` | `fast_fail_compensated: true`, `quick_undone: true`, `slow_done: true`, `slow_undone: true`, `result: error` | **deliberate difference** (sibling settlement) | `oracle/differences/d3.diff` |
+| D4  | Fails twice then succeeds, `max_retries: 2`               | `attempts: 3`, `result: ok`                                                                                   | Identical (naming differs: `max_attempts = max_retries + 1`, not itself printed)                             | match (empty diff)                             | —                            |
+| D5  | Compensate returns `{:continue, :replacement}`            | `trace: [run, compensate]`, `result: ok:replacement`                                                          | Identical                                                                                                    | match (empty diff)                             | —                            |
+| D6  | 10 independent steps, `max_concurrency: 3`                | `peak_concurrency: 3`, `result: ok`                                                                           | Identical                                                                                                    | match (empty diff)                             | —                            |
+| D7  | Diamond: one producer feeds two consumers that join       | `produce_count: 1`, `result: ok`                                                                              | Identical (native Saga scenario; no isolated upstream test — Reactor's memoization is implicit in its DAG)   | match (empty diff)                             | —                            |
+
+Run the oracle with:
+
+```sh
+nix develop .#oracle --command scripts/oracle.sh
+```
+
+The script fails loudly if a live Reactor 1.0.6 run ever stops matching
+`expected/d*.txt`, or if either side's `normalized.dN.*` output changes
+such that its diff against the other side no longer matches its
+classification (empty for a claimed match, or byte-identical to the
+checked-in `oracle/differences/*.diff` for a claimed deliberate
+difference) — either would mean the recorded oracle evidence is stale,
+and every match/difference claim above needs re-checking before it is
+trusted again.
+
+D3's `slow_undone` fact is evaluated at the same logical point on both
+sides (fully settled — after Reactor's fixed 500 ms settle-observation
+sleep, and at the moment `execution.run` returns on the Saga side,
+because Saga settles synchronously before returning) so the diff isolates
+the actual behavioral difference (whether an orphaned-at-return effect is
+ever undone) rather than an artifact of when each side happens to sample
+state.
+
+## Limits of the claim
+
+- The oracle covers the seven scenarios above and the adapted upstream tests in the table. It does not establish that Saga matches Reactor elsewhere, and a match is not a specification: a behavior is correct because the [design](design/execution/design.typ) states it, with Reactor as one independent witness.
+- Reactor has no durable execution, uncertain-effect hold or storage model, so durability and recovery are verified by the conformance suite and `scripts/check_durable_restart.sh`, not by this oracle.
+- The comparison is only as current as the pin. Moving to another Reactor release means re-running the oracle, reviewing any changed diff and updating the row classifications before trusting the claims again.
+- Normalized output compares facts both sides can state; timing-dependent facts such as D3's `slow_undone` are sampled at one defined settled point on both sides.
+
+## See also
+
+- [BENCHMARKS.md](BENCHMARKS.md) for the run-cost measurements.
+- `oracle/differences/` for the checked-in expected diffs, and `scripts/oracle.sh` for the runner.
+- [AGENTS.md](../AGENTS.md) for the gate profile that runs the oracle.

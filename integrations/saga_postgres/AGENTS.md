@@ -1,0 +1,38 @@
+# Saga PostgreSQL adapter instructions
+
+- This is a nested package in [Saga](https://github.com/gleam-dream/saga/blob/main/AGENTS.md). Use the parent dev shell, design-gate pin, and the parent's local `issues/` tracker; this package has no independent flake, gate copy, or tracker.
+- The standing adapter contract is [docs/design/design.typ](docs/design/design.typ), its vocabulary is [docs/design/CONTEXT.typ](docs/design/CONTEXT.typ), and its rationale is [docs/adr](docs/adr). [docs/COVERAGE.md](docs/COVERAGE.md) records the source/tooling and intended-extension boundaries.
+- Parent [storage contracts](https://github.com/gleam-dream/saga/blob/main/docs/design/durability/design.typ) own Claim, Stored, Commit, workflow checkpoint meaning, and recovery permission. This adapter owns SQL, schema installation, database-clock leases, and borrowed-pool semantics.
+- Keep executable SQL and its internal statement list equivalent. Do not infer external-effect replay safety from lease or revision fencing.
+- The application owns the connection pool. Do not add pool startup, shutdown, an ambient scheduler, or a shared ecosystem durability runtime to this adapter.
+
+Shared documentation rendering and context commands from the Saga root:
+
+```sh
+nix run .#design-gate-render -- integrations/saga_postgres/docs/design integrations/saga_postgres/docs/design/design-layer.pdf
+nix run .#design-gate-context -- integrations/saga_postgres/docs/design --estimate
+nix run .#design-gate-context -- integrations/saga_postgres/docs/design --manifest
+```
+
+- For a selected context subtree, pair `--section PATH` with the current manifest's `--expect-digest DIGEST`. Context output is ephemeral and is not another documentation source.
+- Run design apps sequentially for each layer because they share its generated `.render` directory.
+- Run runtime checks only when the change requires them, within the parent Nix shell. Run the command below from `integrations/saga_postgres`; `scripts/test-postgres.sh` starts and removes its own PostgreSQL 16 cluster.
+- Plain `gleam test` fails without the harness's script-provided test URL.
+
+```sh
+nix develop ../.. --command bash -c 'gleam format --check src test && gleam build --warnings-as-errors && scripts/test-postgres.sh'
+```
+
+The parent CI runs the imported design checker for both layers:
+
+```sh
+nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
+```
+
+## Commit messages
+
+Use a concise subject and an optional explanatory body. Do not add any commit
+footers or trailers, including `Co-authored-by`, `Signed-off-by`, `Reviewed-by`,
+`Acked-by`, or tool/AI attribution. Do not use `git commit --signoff` or let an
+automated tool append a footer. Tracker-comment attribution rules apply only to
+tracker comments, never to commit messages.

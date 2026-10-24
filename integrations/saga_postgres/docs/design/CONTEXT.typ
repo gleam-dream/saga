@@ -1,0 +1,15 @@
+#let terms = (
+  (slug: "term-postgres-store", title: [PostgreSQL store], body: [The adapter-owned persistence scope identified by one database connection target and one schema. It represents Saga storage through execution rows.]),
+  (slug: "term-execution-row", title: [Execution row], body: [The retained record of one Saga durable execution in a PostgreSQL store. Its identity is the execution identifier within that store.]),
+  (slug: "term-borrowed-pool", title: [Borrowed pool], body: [An application-owned database connection pool referenced by the adapter without transferring startup, supervision, or shutdown ownership.]),
+  (slug: "term-schema-name", title: [Schema name], body: [The admitted namespace identifier that separates PostgreSQL stores within one database.]),
+  (slug: "term-lease", title: [Lease], body: [The period during which a current ownership claim excludes takeover, measured from its last accepted refresh against the database clock. Expiry permits replacement without immediately invalidating the unreplaced claim.]),
+  (slug: "term-owner-token", title: [Owner token], body: [The adapter-issued opaque proof distinguishing one ownership claim from another claim for the same execution. It grants no independent application authentication.]),
+  (slug: "term-lease-deadline", title: [Lease deadline], body: [The database instant after which a current claim becomes eligible for takeover.]),
+  (slug: "term-takeover", title: [Takeover], body: [Replacement of an expired current claim by a new claim with a greater generation and a distinct owner token.]),
+  (slug: "term-conditional-write", title: [Conditional write], body: [A checkpoint replacement admitted only when current claim identity, expected revision, and observed cancellation all match.]),
+  (slug: "term-discovery-candidate", title: [Discovery candidate], body: [An unfinished execution identifier observed without a live claim at the instant of discovery. Discovery reserves no ownership.]),
+  (slug: "term-migration-watermark", title: [Migration watermark], body: [The greatest recorded schema migration version used to select forward migrations. It is not a schema fingerprint or a compatibility proof.]),
+  (slug: "term-migration-lock", title: [Migration lock], body: [The database transaction authority serializing migration callers for one schema.]),
+  (slug: "term-retention", title: [Retention], body: [The continued availability of saved execution evidence and identity after execution progress stops or finishes.]),
+)

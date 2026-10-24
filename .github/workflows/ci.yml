@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - name: Shared formatting checks
+        run: nix flake check --no-update-lock-file
+      - name: Shared design-layer checks
+        run: nix run .#design-gate-check -- docs/design . --nested-project integrations/saga_postgres
+      - name: README snippets
+        run: nix run --no-update-lock-file .#snips -- --check --commands deny README.md integrations/saga_postgres/README.md
+      - name: Compile and test application behavior
+        run: nix develop --no-update-lock-file -c bash scripts/test.sh

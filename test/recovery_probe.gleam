@@ -1,0 +1,111 @@
+/// Invoked by check_durable_restart.sh in two separate Erlang VMs.
+import gleam/erlang/process
+import gleam/io
+import gleam/time/duration
+import saga
+import saga/codec
+import saga/durable
+import saga/execution
+import saga/storage/file
+
+@external(erlang, "recovery_probe_ffi", "mode")
+fn mode() -> String
+
+@external(erlang, "recovery_probe_ffi", "path")
+fn path() -> String
+
+@external(erlang, "recovery_probe_ffi", "write_ledger")
+fn write_ledger(path: String, key: String) -> Nil
+
+@external(erlang, "recovery_probe_ffi", "ledger_has")
+fn ledger_has(path: String, key: String) -> Bool
+
+fn definition(
+  path: String,
+  first_vm: Bool,
+) -> durable.Persistence(String, String, String, String) {
+  let text = codec.text()
+  let branch = fn(name) {
+    saga.effect(name, fn(input, key) {
+      case first_vm {
+        True -> {
+          write_ledger(path <> "/" <> name, saga.attempt_key(key))
+          process.sleep(60_000)
+          Ok(input <> name)
+        }
+        False -> Error("effect ran twice")
+      }
+    })
+    |> durable.recoverable(
+      version: "1",
+      input: text,
+      output: text,
+      resolve: fn(input, key) {
+        case ledger_has(path <> "/" <> name, saga.attempt_key(key)) {
+          True -> durable.Completed(input <> name)
+          False -> durable.MaybeSent
+        }
+      },
+    )
+  }
+  let workflow =
+    saga.define("vm-recovery", fn(input) {
+      let shared =
+        saga.perform(
+          input,
+          saga.step("shared", fn(input) {
+            case first_vm {
+              True -> Ok(input <> "!")
+              False -> Error("saved step reran")
+            }
+          })
+            |> durable.recoverable(
+              version: "1",
+              input: text,
+              output: text,
+              resolve: fn(_, _) { durable.MaybeSent },
+            ),
+        )
+      saga.both(
+        saga.perform(shared, branch("a")),
+        saga.perform(shared, branch("b")),
+      )
+      |> saga.map(fn(pair) { pair.0 <> pair.1 })
+    })
+  let persistence =
+    durable.new(
+      workflow,
+      input: text,
+      output: text,
+      error: text,
+      undo_error: text,
+    )
+  persistence
+}
+
+pub fn main() -> Nil {
+  let path = path()
+  let first_vm = mode() == "prepare"
+  let persistence = definition(path, first_vm)
+  let storage = file.open(path)
+  let assert Ok(run) =
+    durable.start_or_reconnect(
+      persistence
+        |> durable.with_config(
+          execution.config() |> execution.with_max_concurrency(2),
+        ),
+      storage,
+      id: "vm-ref",
+      input: "order",
+    )
+  let result = durable.drive(run, timeout: duration.seconds(60))
+  case first_vm {
+    True -> Nil
+    False -> {
+      let assert Ok(execution.Completed("order!aorder!b")) = result
+      let assert Ok(durable.Finished(execution.Completed("order!aorder!b"))) =
+        durable.read(run)
+      io.println("RECOVERED")
+    }
+  }
+}

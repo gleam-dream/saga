@@ -1,0 +1,17 @@
+#let terms = (
+  (slug: "term-durable-execution", title: [Durable execution], body: [One saved execution identified within a storage and recoverable through a compatible workflow definition.]),
+  (slug: "term-run-handle", title: [Run handle], body: [An opaque durable reference combining a persistence capability, storage, execution identifier, and drive configuration.]),
+  (slug: "term-checkpoint", title: [Checkpoint], body: [A complete saved data representation of durable execution progress and its recovery authority.]),
+  (slug: "term-persistence-capability", title: [Persistence capability], body: [The checked association of an existing workflow with root codecs, compatibility identity, and checkpoint limits.]),
+  (slug: "term-compatibility-stamp", title: [Compatibility stamp], body: [A computed identity of the workflow structure, semantic versions, codecs, and declared recovery capabilities used to admit saved state.]),
+  (slug: "term-codec", title: [Codec], body: [A versioned pair of fallible conversions between a native value and saved text.]),
+  (slug: "term-storage", title: [Storage], body: [The atomic persistence port for saved bytes, execution claims, conditional commits, cancellation intent, and unfinished-execution discovery.]),
+  (slug: "term-claim", title: [Claim], body: [The revocable execution ownership value identified by execution id, increasing generation, and adapter token. _Avoid_: process identity — a current claim can be used by another process.]),
+  (slug: "term-revision", title: [Revision], body: [The increasing count of committed checkpoint changes for one durable execution.]),
+  (slug: "term-resolver", title: [Resolver], body: [An application callback that establishes the result or absence of an interrupted admitted action without blindly repeating that action.]),
+  (slug: "term-drive", title: [Drive], body: [One bounded runner attempt to advance a durable execution until it finishes, suspends, loses ownership, or exhausts its execution budget.]),
+  (slug: "term-fencing", title: [Fencing], body: [The rule that every saved write names the current claim generation and token, so a write by a replaced owner is refused.]),
+  (slug: "term-lease", title: [Lease], body: [A time-limited claim whose expiry permits takeover under an adapter's policy. Expiry never retracts an external call that an earlier runner already sent.]),
+  (slug: "term-reconciliation", title: [Reconciliation], body: [The application establishing from downstream evidence whether an interrupted admitted action took effect. _Avoid_: retry — a retry repeats the action instead of establishing its result.]),
+  (slug: "term-conformance-suite", title: [Conformance suite], body: [The public storage check that an adapter satisfies atomic creation, claims as values, ownership loss, stale writes, the cancellation race, listing, release, and killed-runner recovery.]),
+)
