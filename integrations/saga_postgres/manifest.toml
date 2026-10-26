@@ -32,4 +32,4 @@ gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 pgo = { version = ">= 0.20.0 and < 0.21.0" }
 pog = { version = ">= 4.1.0 and < 4.2.0" }
 saga = { path = "../.." }
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "main" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "95f2dbce4459942e16e819e3527eb00d9c503c9d" }
