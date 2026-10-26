@@ -14,8 +14,7 @@ repository = { type = "github", user = "gleam-dream", repo = "saga" }
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
-# A path dependency until Saga is published.
-saga = { path = "../.." }
+saga = ">= 0.1.0 and < 0.2.0"
 sinal = ">= 0.1.0 and < 0.2.0"
 # Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`: an application that
 # uses both saga_postgres and grind shares one pog/pgo pool (the app's own
