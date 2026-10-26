@@ -16,7 +16,7 @@ maps repository parts to their design owners.
 - `nix fmt`: formats the whole repo via treefmt (`gleam format`, `nixfmt`, `prettier`).
 - `lefthook`: pre-commit hook formats staged files and re-stages them.
 - `nix flake check`: fails iff the tree is not formatted (plus any existing checks).
-- Dependencies: the unpublished sibling packages (`sinal`, `json_blueprint`) are Git dependencies pinned to verified commits, and each `manifest.toml` holds the resolved commit. Move one by hand with `gleam update <package>` in the package directory. The Reactor oracle fetches its sources with mix into the gitignored `oracle/reactor/deps/`; nothing third-party is committed.
+- Dependencies: Sinal and JSON Blueprint use Hex version requirements, and each `manifest.toml` holds the resolved versions. Update one with `gleam deps update <package>` in the package directory. The Reactor oracle fetches its sources with mix into the gitignored `oracle/reactor/deps/`; nothing third-party is committed.
 
 ## Validation
 
