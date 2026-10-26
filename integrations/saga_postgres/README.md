@@ -5,18 +5,19 @@ It borrows the application's `pog.Connection` and implements `saga/storage`.
 
 ## Installation
 
-The package is unreleased and uses local path dependencies. With an application,
-Saga checkout, and Sinal checkout in sibling directories, add these dependencies
-to the application for the example below:
+Add Saga and the example's supporting packages from Hex, and the PostgreSQL
+adapter from its Git subdirectory:
 
 ```toml
 [dependencies]
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 pog = ">= 4.1.0 and < 4.2.0"
-saga = { path = "../saga" }
-saga_postgres = { path = "../saga/integrations/saga_postgres" }
+saga = ">= 0.1.0 and < 0.2.0"
+saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "main", path = "integrations/saga_postgres" }
 ```
+
+Commit `gleam.toml` and `manifest.toml` to retain the resolved versions and Git commit.
 
 The adapter targets Erlang and is developed and tested against PostgreSQL 16.
 Its pog and pgo minor ranges must stay aligned with Grind when both share a pool;

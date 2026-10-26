@@ -1,6 +1,6 @@
 # Saga
 
-Saga runs typed, source-authored workflows in Gleam on Erlang. It coordinates dependent steps and keeps typed evidence about failures, cleanup, and uncertain effects. Version 0.1.0 is available from Git; Gleam 1.18 or later is required.
+Saga runs typed, source-authored workflows in Gleam on Erlang. It coordinates dependent steps and keeps typed evidence about failures, cleanup, and uncertain effects. Gleam 1.18 or later is required.
 
 ## When to use Saga
 
@@ -22,17 +22,24 @@ Workflows are defined in Gleam code. Your application owns its clients, stable o
 
 ## Install
 
-Saga is not published to Hex. Add it from the public Git repository. `manifest.toml` records the resolved commit; keep that file in your application repository to pin the dependency.
+Add Saga from Hex:
+
+```sh
+gleam add saga
+```
+
+For PostgreSQL storage, add the adapter from its Git subdirectory:
 
 ```toml
 [dependencies]
-saga = { git = "https://github.com/gleam-dream/saga.git", ref = "main" }
+saga = ">= 0.1.0 and < 0.2.0"
 
 # Optional: PostgreSQL storage for durable executions.
 pog = ">= 4.1.0 and < 4.2.0"
 saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "main", path = "integrations/saga_postgres" }
 ```
 
+Commit `gleam.toml` and `manifest.toml` to retain the resolved versions and Git commit.
 The PostgreSQL adapter borrows your application's `pog.Connection`; the application starts and owns the pool. See the [adapter guide](integrations/saga_postgres/README.md).
 
 ## How execution works
