@@ -8,9 +8,9 @@ Saga runs typed, source-authored workflows in Gleam on Erlang. It coordinates de
 
 ## When to use Saga
 
-Use Saga when a business operation has known steps and dependencies, may need concurrent work, and needs explicit recovery when a step fails. Typical examples include reserving inventory before charging for an order, or driving a durable operation from an application-owned job or message handler.
+Use Saga for business operations with known steps and dependencies, optional concurrent work, and explicit failure recovery. For example, reserve inventory before charging for an order, or drive a durable operation from an application-owned job or message handler.
 
-Workflows are defined in Gleam code. Your application owns its clients, stable operation IDs, delivery, and the decision to drive or cancel durable work. Saga does not make remote effects transactional with checkpoints.
+Your application owns its clients, stable operation IDs, delivery, and the decision to drive or cancel durable work. Saga does not make remote effects transactional with checkpoints.
 
 ## Capabilities
 
@@ -145,7 +145,7 @@ Use `execution.run` for a blocking local run. Use `execution.start`, `progress`,
 
 Durable workflows require codecs for saved input and outputs, a workflow version, and resolvers for effects that may have been interrupted. Use the same stable execution ID and compatible encoded input when reconnecting; bump the workflow version when its behavior changes. `durable.drive`'s timeout bounds its work budget, but stopping workers and releasing a claim can make the call return later, so leave margin under an enclosing job deadline.
 
-The example below calls the `persistence()` and `action_for()` helpers in the linked [durable example](examples/order_consumer/src/order_consumer/usage/durable_run.gleam). It uses memory storage to keep the code short; memory storage loses executions when its store or VM stops.
+The [durable example](examples/order_consumer/src/order_consumer/usage/durable_run.gleam) supplies the `persistence()` and `action_for()` helpers below. It uses memory storage, which loses executions when its store or VM stops.
 
 <!-- prettier-ignore-start -->
 
