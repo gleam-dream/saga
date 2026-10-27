@@ -1,5 +1,9 @@
 # Expected oracle differences
 
+[![CI](https://github.com/gleam-dream/saga/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/saga/actions/workflows/ci.yml)
+[![saga on Hex](https://img.shields.io/hexpm/v/saga?label=Hex%3A%20saga)](https://hex.pm/packages/saga)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 Each `dN.diff` is the captured difference between the normalized Reactor output
 and the normalized Saga output of scenario `dN`. `scripts/oracle.sh` recomputes
 the comparison: a scenario without a `dN.diff` must produce an empty difference,

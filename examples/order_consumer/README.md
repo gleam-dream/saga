@@ -1,5 +1,9 @@
 # order_consumer
 
+[![CI](https://github.com/gleam-dream/saga/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/saga/actions/workflows/ci.yml)
+[![saga on Hex](https://img.shields.io/hexpm/v/saga?label=Hex%3A%20saga)](https://hex.pm/packages/saga)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 A separate Gleam package that depends on Saga by path and imports only its public
 modules. It holds Saga's usage examples as compiled, runnable code and is the
 external acceptance test for the facade, with fake application services in place

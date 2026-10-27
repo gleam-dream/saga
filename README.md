@@ -1,5 +1,9 @@
 # Saga
 
+[![CI](https://github.com/gleam-dream/saga/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/saga/actions/workflows/ci.yml)
+[![saga on Hex](https://img.shields.io/hexpm/v/saga?label=Hex%3A%20saga)](https://hex.pm/packages/saga)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 Saga runs typed, source-authored workflows in Gleam on Erlang. It coordinates dependent steps and keeps typed evidence about failures, cleanup, and uncertain effects. Gleam 1.18 or later is required.
 
 ## When to use Saga
