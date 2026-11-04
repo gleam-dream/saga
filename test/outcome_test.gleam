@@ -118,6 +118,16 @@ pub fn an_output_crash_with_everything_undone_is_definite_test() {
   )
 }
 
+/// A coordinator crash killed any work the coordinator had started but not
+/// recorded, so even a clean rollback leaves the effects uncertain.
+pub fn a_coordinator_crash_is_uncertain_test() {
+  failed(
+    execution.CoordinatorCrashed(saga.Crash(saga.ErrorClass, "badarg in m:f/1")),
+    clean(),
+  )
+  |> uncertain("coordinator crash")
+}
+
 /// A decider that aborts after a crash is reported as `StepFailed`; the
 /// crashed attempt is in the evidence.
 pub fn a_crash_followed_by_abort_is_uncertain_test() {

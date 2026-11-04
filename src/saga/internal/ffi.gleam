@@ -36,6 +36,33 @@ pub fn rescue(body: fn() -> value) -> RescueResult(value) {
   )
 }
 
+@external(erlang, "saga_ffi", "rescue_redacted")
+fn rescue_redacted_ffi(
+  body: fn() -> value,
+  on_ok: fn(value) -> RescueResult(value),
+  on_error: fn(String) -> RescueResult(value),
+  on_exit: fn(String) -> RescueResult(value),
+  on_throw: fn(String) -> RescueResult(value),
+) -> RescueResult(value)
+
+/// Like `rescue`, but the reason names only the exception's kind and the
+/// innermost frames as `module:function/arity`, never the raised terms or
+/// frame arguments. For the coordinator's own code, whose exceptions can
+/// carry application values.
+pub fn rescue_redacted(body: fn() -> value) -> RescueResult(value) {
+  rescue_redacted_ffi(
+    body,
+    fn(value) { Rescued(value) },
+    fn(reason) { Raised(ErrorClass, reason) },
+    fn(reason) { Raised(ExitClass, reason) },
+    fn(reason) { Raised(ThrowClass, reason) },
+  )
+}
+
+/// The processes linked to the calling process.
+@external(erlang, "saga_ffi", "links")
+pub fn links() -> List(process.Pid)
+
 /// Number of Erlang schedulers online, used as the default concurrency bound.
 @external(erlang, "saga_ffi", "schedulers_online")
 pub fn schedulers_online() -> Int

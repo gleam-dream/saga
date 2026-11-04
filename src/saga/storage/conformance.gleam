@@ -47,6 +47,7 @@ import saga/codec
 import saga/durable
 import saga/execution
 import saga/internal/ffi
+import saga/internal/timer
 import saga/storage.{type Claim, type Storage, type Stored}
 
 /// A storage under test and how to clean it up after one scenario.
@@ -69,7 +70,8 @@ pub type Failure {
   AdapterCrashed(String)
   /// A scenario did not finish in time.
   TimedOut
-  /// `timeout` or `owner_loss_within` was below 1 millisecond.
+  /// `timeout` or `owner_loss_within` was below 1 millisecond, or
+  /// `timeout + 4 * owner_loss_within` exceeds 4_294_967_295 milliseconds.
   InvalidTimeout
 }
 
@@ -85,11 +87,15 @@ pub fn run(
 ) -> Result(Nil, Failure) {
   let timeout = duration.to_milliseconds(timeout)
   let owner_loss_within = duration.to_milliseconds(owner_loss_within)
-  use _ <- result.try(case timeout > 0 && owner_loss_within > 0 {
-    True -> Ok(Nil)
-    False -> Error(InvalidTimeout)
-  })
   let budget = timeout + 4 * owner_loss_within
+  use _ <- result.try(
+    case
+      timeout > 0 && owner_loss_within > 0 && budget <= timer.max_milliseconds
+    {
+      True -> Ok(Nil)
+      False -> Error(InvalidTimeout)
+    },
+  )
   list.try_each(
     [
       lifecycle,
@@ -222,7 +228,7 @@ fn renew_forever(
   every: Int,
   renew: fn(Claim) -> Result(Nil, storage.Error),
 ) -> Nil {
-  process.sleep(int.max(1, every))
+  process.sleep(int.clamp(every, 1, timer.max_milliseconds))
   let _ = renew(claim)
   renew_forever(claim, every, renew)
 }

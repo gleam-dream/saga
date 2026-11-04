@@ -74,6 +74,7 @@
     [Undo reconstruction must be pure and may run during validation and restoration. A Continue that carries undo cannot commit if declared reconstruction returns NoUndo.],
     [Codec attachment, undo/resolver configuration, and error mapping preserve recovery capabilities across modifier order. A Failed resolver added after error mapping needs a compensation decider in the mapped vocabulary or fails DeciderMissingAfterMapping.],
     [Checkpoint format 2 retains correlation. Format 1 opens with correlation.from_key(id); the next commit uses format 2. Earlier binaries cannot read the newer envelope; no automatic arbitrary-definition migration is implied.],
+    [The format 2 schema gained the CoordinatorCrashed cause without a version change. A checkpoint whose trigger, sibling failures, or outcome holds it reads as Malformed in an older saga build, including saga 0.1.0 on Hex; every other format 2 checkpoint stays readable both ways.],
   )
 ])
 
@@ -169,11 +170,11 @@
 #section(title: "Durable time and capacity", lead: "Each durable bound limits one operation; none promises a total return time.", body: [
   #md-table(3, (
     [*Bound*], [*Default*], [*Ownership and limit*],
-    [Storage operation], [5 seconds, then TimedOut], [`with_call_timeout`; minimum one millisecond; a slow call suspends and stops the runner.],
+    [Storage operation], [5 seconds, then TimedOut], [`with_call_timeout`; held to 1 through 2^32−1 milliseconds; a slow call suspends and stops the runner.],
     [Memory adapter call], [5 seconds], [Not configurable.],
     [File adapter mutation lock], [5 seconds, then Busy], [Not configurable.],
     [Checkpoint bytes], [16 MiB (16 777 216 bytes)], [Whole saved snapshot; `with_max_checkpoint_bytes` changes it; an oversize snapshot returns CheckpointTooLarge.],
-    [Drive execution], [Required caller Duration], [Positive; after expiry, runner drain and claim release precede return.],
+    [Drive execution], [Required caller Duration], [1 through 2^32−1 milliseconds; after expiry, runner drain and claim release precede return.],
     [Drive caller exit], [Runner stops], [The checkpoint is kept and no cancellation is recorded.],
     [PostgreSQL claim lease], [30 seconds, renewed every 10 seconds], [Owned by the adapter's own layer.],
     [Conformance owner-loss window], [Declared by the adapter], [Passed to the #term("term-conformance-suite") as the owner-loss allowance.],

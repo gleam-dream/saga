@@ -145,7 +145,7 @@
     (from: "values", to: "ready", relation: "dataflow", label: "newly ready dependents"),
   ), caption: [A durable commit gates dispatch across these transitions. The coordinator receives uniform action events while typed node closures own native values.],
 ), body: [
-  #answers(title: "Coordinator", responsibility: [Serialize transitions of one run and enforce readiness, capacity, timers, settlement, and rollback.], interface: [Uniform completion/control messages; read-only progress; one terminal delivery function.], interactions: [Interprets immutable node closures with a fresh store, monitors owner/workers, and optionally commits checkpoint values.], invariants: [Only ready work enters a slot; attempts and compensation decisions share max_concurrency; retries reenter admission instead of bypassing capacity.], failure: [A terminal trigger stops admission and initiates settlement. Durable storage/refusal or driver loss stops dispatch under the last checkpoint authority.])
+  #answers(title: "Coordinator", responsibility: [Serialize transitions of one run and enforce readiness, capacity, timers, settlement, and rollback.], interface: [Uniform completion/control messages; read-only progress; one terminal delivery function.], interactions: [Interprets immutable node closures with a fresh store, monitors owner/workers, and optionally commits checkpoint values.], invariants: [Only ready work enters a slot; attempts and compensation decisions share max_concurrency; retries reenter admission instead of bypassing capacity.], failure: [A terminal trigger stops admission and initiates settlement. Durable storage/refusal or driver loss stops dispatch under the last checkpoint authority. Each coordinator step runs under rescue like every worker body: an unexpected raise becomes the terminal CoordinatorCrashed cause and the run settles and rolls back from its last computed state.])
   #subsection(title: "Value storage and soundness")[
     #answers(title: "Run-scoped store", responsibility: [Retain completed native outputs and typed action records for one run.], interface: [Internal opaque Store; node-bound put/fetch operations.], interactions: [The Port's typed fetch and producer are created together; the coordinator threads a fresh store through run state.], invariants: [No other run shares the store. Only the producer-bound native type reads a node's value; type erasure is confined to this module.], failure: [Reading a value before dependency commit is an internal defect and panics. Opaque Port construction and compiler-negative fixtures exclude foreign typed reads.])
     #points([The implementation uses an opaque native carrier and an identity cast, never caller-visible Dynamic. Readiness and one binding of node identity to native type make that cast sound; #adr(2) records the choice.])
@@ -153,6 +153,10 @@
   #subsection(title: "Readiness and worker lifetime")[
     #answers(title: "Readiness index", responsibility: [Admit ready nodes without rescanning the whole graph.], interface: [Dependency counts, dependents, ordered ready min-heap, active count, completed count.], interactions: [A committed success lowers dependent counts; retry readiness returns to the heap.], invariants: [No dependent fetch precedes committed output. Builder order breaks readiness ties, while actual completion order defines undo order.], failure: [Waiting nodes become skipped after admission closes; stale timer/worker messages cannot advance another action sequence.])
     #answers(title: "Action workers", responsibility: [Isolate attempt, compensation, and undo execution from coordinator transitions.], interface: [Correlated action sequence, result, monitor, timeout, and durable permission channel.], interactions: [Attempts prepare typed input; persistence checks that input before effect permission; workers report returned result or typed crash evidence.], invariants: [A stale completion cannot settle a newer action. A worker killed before permission cannot start its effect; a killed admitted action remains uncertain.], failure: [Raises and exits become Crash; time limits kill workers and retain unknown-effect evidence. Detached durable runners stop their workers without inventing cancellation.])
+    #points(
+      [CoordinatorCrashed evidence names the exception kind and its innermost frames as module, function, and arity, never a raised term or argument, so it cannot carry application values. The raise discards only the step that raised: an action whose message was lost stays in flight until the settle window or its own bound ends it as unknown, and an unrecorded worker that step spawned is killed, local or durable, while a durable runner's storage guard and claim heartbeat are kept. CoordinatorCrashed is therefore always uncertain.],
+      [A second coordinator raise in one run, or a raise while starting to settle, stops trusting the coordinator to walk the journal. A local run kills its in-flight work as interrupted, emitting the step_stopped or undo_stopped event that closes each killed worker's span, and reports each remaining journal entry with an undo as UndoCrashed carrying the coordinator crash; a durable runner stops under its last checkpoint, which still holds the journal, and the next drive resumes from it.],
+    )
   ]
 ])
 
@@ -281,19 +285,22 @@
   #md-table(3, (
     [*Bound*], [*Default*], [*Ownership and limit*],
     [Concurrent attempts + compensation decisions], [Online scheduler count], [Per run; at least one; retries need slots.],
-    [Run deadline], [Infinity], [After(Duration) is opt-in; triggers settlement and rollback.],
-    [Attempt timeout], [60 seconds], [Step-specific timeout overrides default in either direction; Infinity opts out for undeclared steps.],
-    [Sibling settlement], [5 seconds], [Can be zero; no new admission; active siblings may finish.],
-    [Each compensation / undo], [5 seconds], [Positive; undo runs sequentially and is not retried.],
-    [RetryAfter cap], [5 minutes], [Nonnegative; requested larger delay clamps and is observed.],
+    [Run deadline], [Infinity], [After(Duration) is opt-in, 1 through 2^32−1 milliseconds; triggers settlement and rollback.],
+    [Attempt timeout], [60 seconds], [1 through 2^32−1 milliseconds, at the step or as the default; step-specific timeout overrides default in either direction; Infinity opts out for undeclared steps.],
+    [Sibling settlement], [5 seconds], [0 through 2^32−1 milliseconds; no new admission; active siblings may finish.],
+    [Each compensation / undo], [5 seconds], [1 through 2^32−1 milliseconds; undo runs sequentially and is not retried.],
+    [RetryAfter cap], [5 minutes], [0 through 2^32−1 milliseconds; requested larger delay clamps and is observed.],
     [Coordinator startup handshake], [5 seconds], [Not configurable; separate from the public control handshake.],
-    [Observation wait (await, progress, testing wait)], [Required caller Duration], [A timeout limits the caller's wait and never cancels the run.],
+    [Observation wait (await, progress, testing wait)], [Required caller Duration], [A timeout limits the caller's wait and never cancels the run; a longer one is capped to 2^32−1 milliseconds.],
     [Synchronous run], [Until an outcome or coordinator loss], [A caller needing a bound uses start and await.],
     [Receiver readiness], [5 seconds], [Proven prelaunch failure returns typed reporting error.],
     [Reporting rollback / notification], [Caller Duration], [1 through 2^32−1 milliseconds; each callback has this bound.],
     [Sinal handlers], [Synchronous in the coordinator], [A slow handler delays coordinator processing; a forwarder route removes that coupling.],
   ))
-  #points([Every timeout, deadline, interval, and lease is a Duration; no public function takes milliseconds as an integer. A bound that may be lifted takes After(Duration) or an explicit Infinity, so unbounded is never implicit. The storage, checkpoint, and drive bounds belong to the #ctx("durability") context.])
+  #points(
+    [Every timeout, deadline, interval, and lease is a Duration; no public function takes milliseconds as an integer. A bound that may be lifted takes After(Duration) or an explicit Infinity, so unbounded is never implicit. The storage, checkpoint, and drive bounds belong to the #ctx("durability") context.],
+    [Every caller duration that reaches a timer or a receive bound is held to 2^32−1 milliseconds (about 49.7 days), the longest Erlang receive timeout. A longer run configuration is the typed DurationTooLong error, a longer step timeout is InvalidTimeout at definition, and neither starts work; a bound to be lifted uses Infinity. A longer observation wait (await, progress) is capped to 2^32−1 milliseconds, since a timeout there only limits the caller's wait. This is a behavior change: on OTP 29 send_after accepts up to about 292 years, so earlier releases ran timer-backed bounds between 49.7 days and that limit, which are now refused for one ceiling consistent with the receive limit and reporting.],
+  )
   #formula(id: "action-budget", title: "Conservative sequential action budget", notation: (
     ([$A_s$], [allowed attempts for step s]), ([$T_s$], [effective finite attempt timeout]),
     ([$C$], [cleanup timeout]), ([$R$], [retry-delay cap]), ([$S$], [settle timeout]),

@@ -1240,6 +1240,26 @@ pub fn drive_rejects_a_non_positive_timeout_test() {
   memory.stop(store)
 }
 
+pub fn drive_rejects_an_over_long_timeout_test() {
+  let store = start_memory()
+  let run = start(prepare(echo_workflow()), memory.storage(store), "long")
+  let long = duration.milliseconds(4_294_967_296)
+  durable.drive(run, timeout: long)
+  |> should.equal(Error(durable.InvalidTimeout(long)))
+  memory.stop(store)
+}
+
+/// A storage call bound is applied as a receive timeout, so a bound above
+/// the Erlang timer ceiling is lowered to it, as one below 1 ms is raised.
+pub fn storage_call_timeout_is_held_to_the_timer_ceiling_test() {
+  let store = start_memory()
+  memory.storage(store)
+  |> storage.with_call_timeout(duration.hours(24 * 60))
+  |> storage.call_timeout
+  |> should.equal(duration.milliseconds(4_294_967_295))
+  memory.stop(store)
+}
+
 pub fn drive_reports_an_invalid_config_test() {
   let store = start_memory()
   let persistence =

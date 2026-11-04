@@ -31,7 +31,9 @@
 //// whose last attempt crashed or timed out) names an action that Saga also
 //// lists as an unknown effect; it is uncertain on its own too, since it
 //// carries no typed error to explain. `RetrySuperseded(_, Returned(error))`
-//// is judged like `RetryLimitReached`.
+//// is judged like `RetryLimitReached`. `CoordinatorCrashed` is always
+//// uncertain: work the coordinator started but had not recorded was
+//// killed, and no action names it.
 ////
 //// `Unresolved` carries the error the step held its effects on (the error
 //// `saga.unknown_when` marked, or a recovery decision's `Hold(evidence)`).
@@ -123,7 +125,8 @@ fn failure(
     | execution.RetryLimitReached(_, saga.Crashed(_))
     | execution.RetryLimitReached(_, saga.TimedOut)
     | execution.RetrySuperseded(_, saga.Crashed(_))
-    | execution.RetrySuperseded(_, saga.TimedOut) -> Error(Nil)
+    | execution.RetrySuperseded(_, saga.TimedOut)
+    | execution.CoordinatorCrashed(_) -> Error(Nil)
   }
 }
 
@@ -250,6 +253,7 @@ fn describe_cause(cause: execution.Cause(error)) -> String {
       <> ")"
     execution.OutputCrashed(_) -> "output crash"
     execution.DeadlineExceeded -> "deadline exceeded"
+    execution.CoordinatorCrashed(_) -> "coordinator crash"
   }
 }
 

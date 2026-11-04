@@ -84,6 +84,7 @@ import gleam/time/duration.{type Duration}
 import saga.{type Workflow}
 import saga/internal/coordinator
 import saga/internal/ffi
+import saga/internal/timer
 import saga/telemetry
 import sinal/correlation.{type Correlation}
 
@@ -146,7 +147,8 @@ pub fn with_max_concurrency(config: Config, limit: Int) -> Config {
 
 /// Ends the run with `DeadlineExceeded` after `deadline`, settling and
 /// rolling back like any failure. `Infinity` (the default) sets no deadline.
-/// A duration must be at least 1 millisecond.
+/// A duration must be at least 1 millisecond and at most 4_294_967_295
+/// milliseconds (about 49.7 days, the longest Erlang timer).
 pub fn with_deadline(config: Config, deadline: Timeout) -> Config {
   Config(..config, deadline:)
 }
@@ -154,7 +156,8 @@ pub fn with_deadline(config: Config, deadline: Timeout) -> Config {
 /// Bounds each attempt of a step that has no `saga.timeout` of its own.
 /// A step's own `saga.timeout` always wins, shorter or longer. `Infinity`
 /// leaves such attempts unbounded: the explicit opt-out of the 60 second
-/// default. A duration must be at least 1 millisecond.
+/// default. A duration must be at least 1 millisecond and at most
+/// 4_294_967_295 milliseconds.
 pub fn with_step_timeout(config: Config, timeout: Timeout) -> Config {
   Config(..config, step_timeout: timeout)
 }
@@ -162,13 +165,13 @@ pub fn with_step_timeout(config: Config, timeout: Timeout) -> Config {
 /// How long in-flight attempts and compensation decisions may finish on
 /// their own once the run stops admitting work, before they are killed and
 /// reported `interrupted`. A zero duration kills them at once. Must not be
-/// negative.
+/// negative or above 4_294_967_295 milliseconds.
 pub fn with_settle_timeout(config: Config, timeout: Duration) -> Config {
   Config(..config, settle_timeout: timeout)
 }
 
 /// Bounds each compensation decision and each undo action. Must be at
-/// least 1 millisecond.
+/// least 1 millisecond and at most 4_294_967_295 milliseconds.
 pub fn with_cleanup_timeout(config: Config, timeout: Duration) -> Config {
   Config(..config, cleanup_timeout: timeout)
 }
@@ -176,7 +179,7 @@ pub fn with_cleanup_timeout(config: Config, timeout: Duration) -> Config {
 /// Caps the delay of a `RetryAfter` decision. A longer requested delay is
 /// shortened to the cap, and the decision's
 /// `telemetry.CompensationMetadata` reports `retry_delay_capped: True`.
-/// Must not be negative.
+/// Must not be negative or above 4_294_967_295 milliseconds.
 pub fn with_max_retry_delay(config: Config, delay: Duration) -> Config {
   Config(..config, max_retry_delay: delay)
 }
@@ -206,6 +209,23 @@ pub type ConfigError {
   SettleTimeoutNegative(value: Duration)
   CleanupTimeoutNotPositive(value: Duration)
   MaxRetryDelayNegative(value: Duration)
+  /// `value` is longer than an Erlang timer can hold: 4_294_967_295 ms
+  /// (about 49.7 days). Use `Infinity` where a bound may be lifted.
+  DurationTooLong(setting: TimedSetting, value: Duration)
+}
+
+/// The `Config` setting a `DurationTooLong` names.
+pub type TimedSetting {
+  /// `with_deadline`
+  Deadline
+  /// `with_step_timeout`
+  StepTimeout
+  /// `with_settle_timeout`
+  SettleTimeout
+  /// `with_cleanup_timeout`
+  CleanupTimeout
+  /// `with_max_retry_delay`
+  MaxRetryDelay
 }
 
 /// Describes a configuration error for logs.
@@ -229,6 +249,22 @@ pub fn describe_config_error(error: ConfigError) -> String {
     MaxRetryDelayNegative(value) ->
       "the retry delay cap must not be negative (with_max_retry_delay), got "
       <> describe_duration(value)
+    DurationTooLong(setting, value) ->
+      describe_timed_setting(setting)
+      <> " must be at most "
+      <> int.to_string(timer.max_milliseconds)
+      <> " ms, the longest Erlang timer, got "
+      <> describe_duration(value)
+  }
+}
+
+fn describe_timed_setting(setting: TimedSetting) -> String {
+  case setting {
+    Deadline -> "the deadline (with_deadline)"
+    StepTimeout -> "the step timeout (with_step_timeout)"
+    SettleTimeout -> "the settle timeout (with_settle_timeout)"
+    CleanupTimeout -> "the cleanup timeout (with_cleanup_timeout)"
+    MaxRetryDelay -> "the retry delay cap (with_max_retry_delay)"
   }
 }
 
@@ -237,6 +273,39 @@ pub fn describe_config_error(error: ConfigError) -> String {
 fn is_negative(value: Duration) -> Bool {
   let #(seconds, _nanoseconds) = duration.to_seconds_and_nanoseconds(value)
   seconds < 0
+}
+
+// A bound that must be at least 1 ms and fit an Erlang timer.
+fn positive_timer(
+  value: Duration,
+  setting: TimedSetting,
+  not_positive: fn(Duration) -> ConfigError,
+) -> List(ConfigError) {
+  case timer.valid_timer_duration(value), timer.too_long(value) {
+    True, _ -> []
+    False, True -> [DurationTooLong(setting, value)]
+    False, False -> [not_positive(value)]
+  }
+}
+
+// A bound that may be zero and must fit an Erlang timer.
+fn non_negative_timer(
+  value: Duration,
+  setting: TimedSetting,
+  negative: fn(Duration) -> ConfigError,
+) -> List(ConfigError) {
+  case is_negative(value), timer.too_long(value) {
+    True, _ -> [negative(value)]
+    False, True -> [DurationTooLong(setting, value)]
+    False, False -> []
+  }
+}
+
+// An observation wait in whole milliseconds, held to what a receive
+// accepts: a negative wait is 0, and one beyond `timer.max_milliseconds`
+// is capped to it rather than raising in the caller.
+fn wait_milliseconds(timeout: Duration) -> Int {
+  int.clamp(duration.to_milliseconds(timeout), 0, timer.max_milliseconds)
 }
 
 fn bound_milliseconds(bound: Timeout) -> Option(Int) {
@@ -282,31 +351,28 @@ pub fn settings(
       case config.deadline {
         Infinity -> []
         After(deadline) ->
-          case duration.to_milliseconds(deadline) > 0 {
-            True -> []
-            False -> [DeadlineNotPositive(deadline)]
-          }
+          positive_timer(deadline, Deadline, DeadlineNotPositive)
       },
       case config.step_timeout {
         Infinity -> []
         After(timeout) ->
-          case duration.to_milliseconds(timeout) > 0 {
-            True -> []
-            False -> [StepTimeoutNotPositive(timeout)]
-          }
+          positive_timer(timeout, StepTimeout, StepTimeoutNotPositive)
       },
-      case is_negative(config.settle_timeout) {
-        False -> []
-        True -> [SettleTimeoutNegative(config.settle_timeout)]
-      },
-      case duration.to_milliseconds(config.cleanup_timeout) > 0 {
-        True -> []
-        False -> [CleanupTimeoutNotPositive(config.cleanup_timeout)]
-      },
-      case is_negative(config.max_retry_delay) {
-        False -> []
-        True -> [MaxRetryDelayNegative(config.max_retry_delay)]
-      },
+      non_negative_timer(
+        config.settle_timeout,
+        SettleTimeout,
+        SettleTimeoutNegative,
+      ),
+      positive_timer(
+        config.cleanup_timeout,
+        CleanupTimeout,
+        CleanupTimeoutNotPositive,
+      ),
+      non_negative_timer(
+        config.max_retry_delay,
+        MaxRetryDelay,
+        MaxRetryDelayNegative,
+      ),
     ])
   case errors {
     [] ->
@@ -366,6 +432,13 @@ pub type Cause(e) {
   RetrySuperseded(step: saga.StepAddress, last: saga.AttemptFailure(e))
   OutputCrashed(crash: saga.Crash)
   DeadlineExceeded
+  /// The run's coordinator raised while handling one of its own messages:
+  /// an internal defect, not a step's failure. The run still settled and
+  /// rolled back from its last consistent state; work it had started but
+  /// not yet recorded was killed, so effects may be unknown beyond
+  /// `unknown_effects`. `crash.reason` names only the exception kind and
+  /// the functions it was raised in, never the values it was raised with.
+  CoordinatorCrashed(crash: saga.Crash)
 }
 
 /// One completed step's undo did not succeed, during rollback.
@@ -905,6 +978,8 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
 /// externally before it could report an outcome, whether that happened
 /// before this call started or during it (`execution.pid` lets
 /// applications monitor it themselves independently, for comparison).
+/// A `timeout` above 4_294_967_295 milliseconds (about 49.7 days, the
+/// longest Erlang receive timeout) waits that long instead.
 ///
 /// **Timing.** An `await` issued immediately after a previous `await`
 /// already returned `Ok` may still return `Error(AwaitTimedOut)` rather
@@ -925,7 +1000,7 @@ pub fn await(
   use #(monitor, result) <- awaited_by_self(execution)
   let #(fresh_monitor, selector) =
     await_selector(execution.pid, monitor, result)
-  case process.selector_receive(selector, duration.to_milliseconds(timeout)) {
+  case process.selector_receive(selector, wait_milliseconds(timeout)) {
     Ok(signal) -> await_signal(monitor, fresh_monitor, signal)
     Error(_) -> {
       process.demonitor_process(fresh_monitor)
@@ -991,7 +1066,8 @@ type ProgressSignal {
 /// so without a monitor this would always time out rather than report
 /// `ExecutionEnded` promptly. A short-lived monitor (armed only for this
 /// one call, always demonitored with `[flush]` before returning) races the
-/// reply against the coordinator's exit instead.
+/// reply against the coordinator's exit instead. A `timeout` above
+/// 4_294_967_295 milliseconds waits that long instead.
 pub fn progress(
   execution: Execution(o, e, u),
   timeout timeout: Duration,
@@ -1006,7 +1082,7 @@ pub fn progress(
       ProgressCoordinatorDown
     })
   let outcome = case
-    process.selector_receive(selector, duration.to_milliseconds(timeout))
+    process.selector_receive(selector, wait_milliseconds(timeout))
   {
     Ok(GotProgress(progress)) -> Ok(to_public_progress(progress))
     Ok(ProgressCoordinatorDown) -> Error(ExecutionEnded)
@@ -1078,6 +1154,8 @@ pub fn describe_cause(
     OutputCrashed(crash) ->
       "computing the workflow's output crashed: " <> crash.reason
     DeadlineExceeded -> "the run passed its deadline"
+    CoordinatorCrashed(crash) ->
+      "the run's coordinator crashed (an internal defect): " <> crash.reason
   }
 }
 
@@ -1160,6 +1238,8 @@ fn to_public_cause(cause: coordinator.Cause(e)) -> Cause(e) {
     coordinator.OutputCrashed(crash) ->
       OutputCrashed(saga.crash_from_node(crash))
     coordinator.DeadlineExceeded -> DeadlineExceeded
+    coordinator.CoordinatorCrashed(crash) ->
+      CoordinatorCrashed(saga.crash_from_node(crash))
   }
 }
 

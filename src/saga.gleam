@@ -66,6 +66,7 @@ import saga/internal/node.{
   EvidenceCompleted, EvidenceFailed, EvidenceMaybeSent, EvidenceNotSent, Node,
 }
 import saga/internal/store.{type Store}
+import saga/internal/timer
 import sinal/correlation.{type Correlation}
 
 /// A step's recorded location: nested scope (from `embed` and `choose`), a
@@ -316,7 +317,9 @@ pub fn describe_definition_error(error: DefinitionError) -> String {
       <> address_to_string(step)
       <> " has timeout "
       <> int.to_string(duration.to_milliseconds(value))
-      <> " ms; it must be positive"
+      <> " ms; it must be between 1 and "
+      <> int.to_string(timer.max_milliseconds)
+      <> " ms"
     ForeignPort(step) ->
       "a port from another workflow definition is used in "
       <> address_to_string(step)
@@ -606,7 +609,8 @@ pub fn on_unknown(
 
 /// Bounds one attempt of this step to `limit`, overriding the run's
 /// `execution.with_step_timeout` default in either direction. `define`
-/// rejects a limit below 1 millisecond.
+/// rejects a limit below 1 millisecond or above 4_294_967_295 milliseconds
+/// (about 49.7 days, the longest Erlang timer).
 pub fn timeout(step: Step(i, o, e, u), limit: Duration) -> Step(i, o, e, u) {
   Step(..step, timeout: Some(limit))
 }
@@ -1494,7 +1498,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
   let timeout_error = case step.timeout {
     None -> []
     Some(limit) ->
-      case duration.to_milliseconds(limit) > 0 {
+      case timer.valid_timer_duration(limit) {
         True -> []
         False -> [InvalidTimeout(step: address, value: limit)]
       }

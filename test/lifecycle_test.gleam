@@ -740,3 +740,33 @@ pub fn await_timeout_then_success_test() {
     Nil
   })
 }
+
+/// An observation wait longer than the longest Erlang receive timeout
+/// (2^32 - 1 ms) is capped to it, so `await` and `progress` with a 60 day
+/// timeout return their ordinary result instead of raising. The step waits
+/// on a gate, so neither reply is in the mailbox when the wait begins.
+pub fn observation_waits_longer_than_a_receive_timeout_are_capped_test() {
+  let gate = probe.new_gate()
+  let workflow =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("s", fn(x: Int) {
+          probe.enter(gate)
+          Ok(x)
+        }),
+      )
+    })
+  let sixty_days = duration.hours(24 * 60)
+  let assert Ok(run) = execution.start(workflow, 3, execution.config())
+  let assert Ok(_) = probe.wait_entered(gate, 2000)
+  let assert Ok(execution.Progress(..)) = execution.progress(run, sixty_days)
+  let opener =
+    process.spawn(fn() {
+      process.sleep(50)
+      probe.open(gate)
+    })
+  execution.await(run, sixty_days)
+  |> should.equal(Ok(execution.Completed(3)))
+  process.kill(opener)
+}

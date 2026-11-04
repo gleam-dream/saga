@@ -112,6 +112,31 @@ pub fn define_rejects_invalid_timeout_test() {
   }
 }
 
+/// A step's own timeout must fit an Erlang timer (at most 4_294_967_295
+/// ms): `saga.timeout(step, 60 days)` is a definition error, found before
+/// any run, and the ceiling itself is accepted.
+pub fn define_rejects_an_over_long_timeout_test() {
+  let sixty_days = duration.hours(24 * 60)
+  let result =
+    saga.try_define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("a", fn(x: Int) { Ok(x) })
+        |> saga.timeout(sixty_days),
+      )
+    })
+  let assert Error([saga.InvalidTimeout(_, value)]) = result
+  value |> should.equal(sixty_days)
+  let assert Ok(_) =
+    saga.try_define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("a", fn(x: Int) { Ok(x) })
+        |> saga.timeout(duration.milliseconds(4_294_967_295)),
+      )
+    })
+}
+
 pub fn describe_lists_steps_and_dependencies_test() {
   let workflow =
     saga.define("checkout", fn(input) {

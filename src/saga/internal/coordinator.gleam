@@ -19,6 +19,11 @@
 /// in reverse completion order, undoing one entry at a time, bounded by
 /// `cleanup_timeout` per entry, retaining every undo failure.
 ///
+/// Every task body runs under `rescue`, and so does each of the
+/// coordinator's own steps (`guarded`): an internal raise becomes the
+/// terminal `CoordinatorCrashed` cause with redacted evidence, and the run
+/// still settles and rolls back (see `recover`).
+///
 /// `saga/telemetry` events are emitted after each corresponding state
 /// transition, from this process; a raising Sinal handler cannot change the
 /// run's outcome (`sinal.emit`'s own dispatch isolates handler failure).
@@ -84,6 +89,9 @@ pub type Cause(e) {
   RetrySuperseded(step: StepAddress, last: AttemptFailure(e))
   OutputCrashed(crash: node.Crash)
   DeadlineExceeded
+  /// The coordinator raised while handling a message: an internal defect.
+  /// `crash.reason` names only the exception kind and where it was raised.
+  CoordinatorCrashed(crash: node.Crash)
 }
 
 pub type CancelReason {
@@ -342,6 +350,13 @@ type RunState(o, e, u) {
     // Retry/Continue decision can let it proceed to a normal output) when
     // this needs to be remembered. See `Outcome`'s doc comment.
     unknown_effects: List(UnknownEffect),
+    // Whether the coordinator has already raised once in this run (see
+    // `recover`); a second raise ends the run without walking the journal.
+    crashed: Bool,
+    // The processes linked to this one before any worker was spawned: in a
+    // durable runner, its storage guard and claim heartbeat. A crash
+    // recovery never kills them (see `kill_untracked`).
+    baseline_links: List(Pid),
   )
 }
 
@@ -448,6 +463,7 @@ fn run(
   persistence: Option(Session(e, u)),
 ) -> Nil {
   process.trap_exits(True)
+  let baseline_links = ffi.links()
   let control = process.new_subject()
   let owner_monitor = process.monitor(owner)
   process.send(control_subject_out, control)
@@ -526,6 +542,8 @@ fn run(
       phase: PhaseRunning,
       start_time: start_time,
       unknown_effects: [],
+      crashed: False,
+      baseline_links: baseline_links,
     )
   emit_run_started(initial)
   let restored = case persistence {
@@ -542,14 +560,29 @@ fn run(
         Some(session) -> session.failed(reason)
         None -> Nil
       }
-    Ok(initial) -> {
-      let initial = case persistence {
-        Some(Session(cancelled: True, ..)) -> handle_cancel_request(initial)
-        _ -> initial
-      }
-      loop(admit(initial), fetch_output, deliver)
-    }
+    Ok(initial) ->
+      guarded(initial, fn() {
+        let initial = case persistence {
+          Some(Session(cancelled: True, ..)) -> handle_cancel_request(initial)
+          _ -> initial
+        }
+        Continue(admit(initial))
+      })
+      |> follow(fetch_output, deliver)
   }
+}
+
+/// What one coordinator step decided. The effects that end a run (delivery,
+/// suspension, detachment) happen in `follow`, outside the rescue, so a
+/// raise can never repeat them.
+type Next(o, e, u) {
+  /// Advance again: checkpoint, dispatch, and check for an outcome.
+  Continue(RunState(o, e, u))
+  /// Committed and dispatched; wait for the next message.
+  Wait(RunState(o, e, u))
+  Finish(RunState(o, e, u), Outcome(o, e, u))
+  Suspend(RunState(o, e, u), checkpoint.Failure)
+  Detach(RunState(o, e, u))
 }
 
 fn loop(
@@ -557,23 +590,28 @@ fn loop(
   fetch_output: fn(Store) -> ffi.RescueResult(o),
   deliver: fn(Outcome(o, e, u)) -> Nil,
 ) -> Nil {
-  case state.detached, state.persistence {
-    True, Some(session) -> {
-      stop_workers(state)
-      cancel_deadline_timer(state)
-      session.stopped()
-    }
-    _, _ -> loop_checkpointed(state, fetch_output, deliver)
-  }
+  guarded(state, fn() { advance(state, fetch_output) })
+  |> follow(fetch_output, deliver)
 }
 
-fn loop_checkpointed(
-  state: RunState(o, e, u),
+fn follow(
+  next: Next(o, e, u),
   fetch_output: fn(Store) -> ffi.RescueResult(o),
   deliver: fn(Outcome(o, e, u)) -> Nil,
 ) -> Nil {
-  case checkpoint(state) {
-    Error(reason) -> {
+  case next {
+    Continue(state) -> loop(state, fetch_output, deliver)
+    Wait(state) -> {
+      let message = process.selector_receive_forever(control_selector(state))
+      guarded(state, fn() { Continue(handle_control(state, message)) })
+      |> follow(fetch_output, deliver)
+    }
+    Finish(state, outcome) -> {
+      cancel_deadline_timer(state)
+      emit_run_stopped(state, outcome)
+      deliver(outcome)
+    }
+    Suspend(state, reason) -> {
       stop_workers(state)
       cancel_deadline_timer(state)
       case state.persistence {
@@ -581,71 +619,267 @@ fn loop_checkpointed(
         None -> Nil
       }
     }
-    Ok(Nil) -> {
-      let state = start_saved_timers(state)
-      list.each(state.dispatch, fn(permit) { process.send(permit, Nil) })
-      loop_committed(
-        RunState(..state, dispatch: [], pending_starts: []),
-        fetch_output,
-        deliver,
-      )
+    Detach(state) -> {
+      stop_workers(state)
+      cancel_deadline_timer(state)
+      case state.persistence {
+        Some(session) -> session.stopped()
+        None -> Nil
+      }
     }
   }
 }
 
-fn loop_committed(
+/// Commits `state` when the run is durable, releases the work that commit
+/// permits, and reports whether the run has ended.
+fn advance(
   state: RunState(o, e, u),
   fetch_output: fn(Store) -> ffi.RescueResult(o),
-  deliver: fn(Outcome(o, e, u)) -> Nil,
-) -> Nil {
-  case run_finished(state) {
-    Some(outcome) -> {
-      cancel_deadline_timer(state)
-      emit_run_stopped(state, outcome)
-      deliver(outcome)
-      Nil
-    }
-    None ->
-      case all_nodes_done(state) {
-        True ->
-          case fetch_output(state.store) {
-            ffi.Rescued(output) -> {
-              cancel_deadline_timer(state)
-              // `unknown_effects` is accumulated newest-first; reverse so
-              // callers see them in the order they occurred.
-              let unknown_effects = list.reverse(state.unknown_effects)
-              let outcome = case unknown_effects {
-                [] -> Completed(output)
-                _ -> CompletedWithUnknownEffects(output, unknown_effects)
+) -> Next(o, e, u) {
+  case state.detached, state.persistence {
+    True, Some(_) -> Detach(state)
+    _, _ ->
+      case checkpoint(state) {
+        Error(reason) -> Suspend(state, reason)
+        Ok(Nil) -> {
+          let state = start_saved_timers(state)
+          list.each(state.dispatch, fn(permit) { process.send(permit, Nil) })
+          let state = RunState(..state, dispatch: [], pending_starts: [])
+          case run_finished(state) {
+            Some(outcome) -> Finish(state, outcome)
+            None ->
+              case all_nodes_done(state) {
+                False -> Wait(state)
+                True ->
+                  case fetch_output(state.store) {
+                    ffi.Rescued(output) -> {
+                      // `unknown_effects` is accumulated newest-first;
+                      // reverse so callers see them in the order they
+                      // occurred.
+                      let unknown_effects = list.reverse(state.unknown_effects)
+                      Finish(state, case unknown_effects {
+                        [] -> Completed(output)
+                        _ ->
+                          CompletedWithUnknownEffects(output, unknown_effects)
+                      })
+                    }
+                    ffi.Raised(class, reason) ->
+                      Continue(begin_settling(
+                        state,
+                        TriggerFailure(OutputCrashed(node.Crash(class, reason))),
+                      ))
+                  }
               }
-              emit_run_stopped(state, outcome)
-              deliver(outcome)
-            }
-            ffi.Raised(class, reason) ->
-              begin_settling(
-                state,
-                TriggerFailure(OutputCrashed(node.Crash(class, reason))),
-              )
-              |> loop(fetch_output, deliver)
           }
-        False -> {
-          let selector =
-            process.new_selector()
-            |> process.select(state.control)
-            |> process.select_trapped_exits(fn(exit_message) {
-              TaskExited(exit_message.pid, exit_message.reason)
-            })
-            |> process.select_specific_monitor(state.owner_monitor, fn(down) {
-              case down {
-                process.ProcessDown(_, _, reason) -> OwnerDown(reason)
-                process.PortDown(_, _, reason) -> OwnerDown(reason)
-              }
-            })
-          let message = process.selector_receive_forever(selector)
-          let next = handle_control(state, message)
-          loop(next, fetch_output, deliver)
         }
       }
+  }
+}
+
+fn control_selector(
+  state: RunState(o, e, u),
+) -> process.Selector(Control(o, e, u)) {
+  process.new_selector()
+  |> process.select(state.control)
+  |> process.select_trapped_exits(fn(exit_message) {
+    TaskExited(exit_message.pid, exit_message.reason)
+  })
+  |> process.select_specific_monitor(state.owner_monitor, fn(down) {
+    case down {
+      process.ProcessDown(_, _, reason) -> OwnerDown(reason)
+      process.PortDown(_, _, reason) -> OwnerDown(reason)
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Coordinator crashes
+// ---------------------------------------------------------------------------
+
+/// Runs one coordinator step under a rescue. Every task body already runs
+/// under `rescue`; this extends the invariant to the coordinator's own
+/// transitions, so an internal defect cannot drop the journal unreported.
+/// `state` is the last state the coordinator fully computed: a raise
+/// discards only the step that raised.
+fn guarded(
+  state: RunState(o, e, u),
+  step: fn() -> Next(o, e, u),
+) -> Next(o, e, u) {
+  case ffi.rescue_redacted(step) {
+    ffi.Rescued(next) -> next
+    ffi.Raised(class, reason) -> recover(state, node.Crash(class, reason))
+  }
+}
+
+/// The coordinator raised while advancing `state`. The first raise is a
+/// terminal failure, `CoordinatorCrashed`: it starts settling exactly like
+/// a step failure (or joins `sibling_failures` when settling has already
+/// begun), and rollback undoes the known completions. The message whose
+/// handling raised is lost, so an action it concerned stays in flight
+/// until the settle window or its own bound ends it as unknown.
+///
+/// A second raise means the coordinator cannot be trusted to walk the
+/// journal: `abort` reports what remains instead of attempting it.
+fn recover(state: RunState(o, e, u), crash: node.Crash) -> Next(o, e, u) {
+  kill_untracked(state)
+  case state.crashed {
+    True -> abort(state, crash)
+    False -> {
+      let state = RunState(..state, crashed: True)
+      let cause = CoordinatorCrashed(crash)
+      let settled =
+        ffi.rescue_redacted(fn() {
+          case state.phase {
+            PhaseRunning -> begin_settling(state, TriggerFailure(cause))
+            PhaseSettling(..) | PhaseRollingBack(..) ->
+              update_settlement(state, fn(s) {
+                Settlement(
+                  ..s,
+                  sibling_failures: list.append(s.sibling_failures, [cause]),
+                )
+              })
+          }
+        })
+      case settled {
+        ffi.Rescued(state) -> Continue(state)
+        ffi.Raised(..) -> abort(state, crash)
+      }
+    }
+  }
+}
+
+/// A worker the raising step spawned but never recorded is killed. A local
+/// one runs unobserved; its effect is unknown, which `CoordinatorCrashed`
+/// already reports. A durable one waits for a permit that only a recorded
+/// admission receives, and would otherwise wait forever: a runner that
+/// ends normally does not stop a linked process.
+fn kill_untracked(state: RunState(o, e, u)) -> Nil {
+  let recorded =
+    dict.values(state.state)
+    |> list.filter_map(fn(node_state) {
+      case node_state {
+        NodeAttempting(_, _, pid, _, _)
+        | NodeCompensating(_, _, pid, _, _)
+        | NodeUndoing(_, pid, _, _) -> Ok(pid)
+        _ -> Error(Nil)
+      }
+    })
+  untracked_workers(
+    linked: ffi.links(),
+    baseline: state.baseline_links,
+    recorded: recorded,
+  )
+  |> list.each(process.kill)
+}
+
+/// The linked pids that are unrecorded workers: neither linked before the
+/// run started (a durable runner's storage guard and claim heartbeat) nor
+/// recorded in a node's state.
+pub fn untracked_workers(
+  linked linked: List(Pid),
+  baseline baseline: List(Pid),
+  recorded recorded: List(Pid),
+) -> List(Pid) {
+  let kept = set.from_list(list.append(baseline, recorded))
+  list.filter(linked, fn(pid) { !set.contains(kept, pid) })
+}
+
+/// Ends a run whose coordinator raised again, or raised while starting to
+/// settle. Each worker it kills gets the stop event the settle window or an
+/// undo crash would emit, so observers see every span closed. A durable run stops under its last checkpoint, which still holds
+/// the journal, as when its driver is lost. A local run kills its
+/// in-flight work, reported interrupted, and reports every journal entry it
+/// did not undo as `UndoCrashed` with the coordinator's crash: those
+/// effects stay in place.
+fn abort(state: RunState(o, e, u), crash: node.Crash) -> Next(o, e, u) {
+  case state.persistence {
+    Some(_) -> Detach(state)
+    None -> {
+      let cause = CoordinatorCrashed(crash)
+      let #(trigger, settlement) = case state.phase {
+        PhaseRunning -> #(TriggerFailure(cause), empty_settlement())
+        PhaseSettling(trigger, settlement, _, _)
+        | PhaseRollingBack(trigger, settlement) -> #(
+          trigger,
+          Settlement(
+            ..settlement,
+            sibling_failures: list.append(settlement.sibling_failures, [cause]),
+          ),
+        )
+      }
+      let state =
+        RunState(..state, phase: PhaseRollingBack(trigger, settlement))
+      let state =
+        list.fold(state.order, state, fn(acc, id) {
+          case dict.get(acc.state, id) {
+            Ok(NodeAttempting(_, attempt, pid, _, _)) ->
+              interrupt(acc, id, pid, StepAttempt(attempt))
+            Ok(NodeCompensating(_, attempt, pid, _, _)) ->
+              interrupt(acc, id, pid, StepCompensation(attempt))
+            Ok(NodeUndoing(_, pid, _, _)) -> {
+              process.kill(pid)
+              emit_undo_stopped(
+                acc,
+                node_address(acc, id),
+                telemetry.UndoCrashedKind,
+                duration_since_started(acc, id),
+              )
+              record_unknown_effect(acc, id, StepUndo, ActionInterrupted)
+              |> record_undo_failure(UndoCrashed(node_address(acc, id), crash))
+              |> fn(acc) {
+                RunState(
+                  ..acc,
+                  state: dict.insert(acc.state, id, NodeUndoFailedTerminal),
+                )
+              }
+            }
+            _ -> acc
+          }
+        })
+      let state =
+        list.fold(state.journal, state, fn(acc, entry) {
+          case entry.undo {
+            Some(_) ->
+              record_undo_failure(acc, UndoCrashed(entry.address, crash))
+            None -> record_not_undoable(acc, entry.address)
+          }
+        })
+      let state = RunState(..state, journal: [], running: 0, undoing: False)
+      Finish(state, final_outcome(state, trigger, settlement_of(state)))
+    }
+  }
+}
+
+fn interrupt(
+  state: RunState(o, e, u),
+  node_id: Int,
+  pid: Pid,
+  action: Action,
+) -> RunState(o, e, u) {
+  process.kill(pid)
+  let address = node_address(state, node_id)
+  // The same stop event the settle window emits for a worker it kills.
+  emit_step_stopped(
+    state,
+    address,
+    attempt_number_for(state, node_id),
+    telemetry.AttemptInterrupted,
+    duration_since_started(state, node_id),
+  )
+  record_unknown_effect(state, node_id, action, ActionInterrupted)
+  |> fn(state) {
+    RunState(..state, state: dict.insert(state.state, node_id, NodeInterrupted))
+  }
+  |> update_settlement(fn(s) {
+    Settlement(..s, interrupted: list.append(s.interrupted, [address]))
+  })
+}
+
+fn settlement_of(state: RunState(o, e, u)) -> Settlement(e, u) {
+  case state.phase {
+    PhaseSettling(_, settlement, _, _) | PhaseRollingBack(_, settlement) ->
+      settlement
+    PhaseRunning -> empty_settlement()
   }
 }
 
@@ -666,51 +900,54 @@ fn run_finished(state: RunState(o, e, u)) -> Option(Outcome(o, e, u)) {
     PhaseRollingBack(trigger, settlement) ->
       case rollback_complete(state) {
         False -> None
-        True -> {
-          // Every action that ended with an unknown effect during this run
-          // (regardless of when it happened, or what its recovery decision
-          // was) becomes `unknown_effects` here. Every step-timeout kill
-          // among them is also folded into `interrupted`, which reported
-          // them before `unknown_effects` existed. See `Outcome`'s doc
-          // comment for the parallel case where the run *did* complete.
-          //
-          // `undone`/`undo_failures`/`not_undoable`/`held` were all built
-          // newest-first (prepended, not appended — see
-          // `record_undone`/`record_undo_failure`/`record_not_undoable`/
-          // `record_held`'s own doc comment) precisely so accumulating them
-          // across up to N journal entries during rollback stays O(N) total
-          // instead of O(N^2); this is the one place they are reversed back
-          // into their documented (completion/processing) order, since this
-          // `Settlement` is now final and externally observed.
-          let unknown_effects = list.reverse(state.unknown_effects)
-          let timed_out_attempts =
-            list.filter_map(unknown_effects, fn(effect) {
-              case effect {
-                UnknownEffect(step, StepAttempt(_), ActionTimedOut) -> Ok(step)
-                _ -> Error(Nil)
-              }
-            })
-          let settlement =
-            Settlement(
-              ..settlement,
-              undone: list.reverse(settlement.undone),
-              undo_failures: list.reverse(settlement.undo_failures),
-              not_undoable: list.reverse(settlement.not_undoable),
-              held: list.reverse(settlement.held),
-              interrupted: list.append(
-                timed_out_attempts,
-                settlement.interrupted,
-              ),
-              unknown_effects: unknown_effects,
-            )
-          Some(case trigger {
-            TriggerFailure(cause) -> Failed(cause, settlement)
-            TriggerUnresolved(step, evidence) ->
-              Unresolved(step, evidence, settlement)
-            TriggerCancel(reason) -> Cancelled(reason, settlement)
-          })
-        }
+        True -> Some(final_outcome(state, trigger, settlement))
       }
+  }
+}
+
+/// The terminal outcome of a run whose rollback has ended.
+fn final_outcome(
+  state: RunState(o, e, u),
+  trigger: Trigger(e),
+  settlement: Settlement(e, u),
+) -> Outcome(o, e, u) {
+  // Every action that ended with an unknown effect during this run
+  // (regardless of when it happened, or what its recovery decision
+  // was) becomes `unknown_effects` here. Every step-timeout kill
+  // among them is also folded into `interrupted`, which reported
+  // them before `unknown_effects` existed. See `Outcome`'s doc
+  // comment for the parallel case where the run *did* complete.
+  //
+  // `undone`/`undo_failures`/`not_undoable`/`held` were all built
+  // newest-first (prepended, not appended — see
+  // `record_undone`/`record_undo_failure`/`record_not_undoable`/
+  // `record_held`'s own doc comment) precisely so accumulating them
+  // across up to N journal entries during rollback stays O(N) total
+  // instead of O(N^2); this is the one place they are reversed back
+  // into their documented (completion/processing) order, since this
+  // `Settlement` is now final and externally observed.
+  let unknown_effects = list.reverse(state.unknown_effects)
+  let timed_out_attempts =
+    list.filter_map(unknown_effects, fn(effect) {
+      case effect {
+        UnknownEffect(step, StepAttempt(_), ActionTimedOut) -> Ok(step)
+        _ -> Error(Nil)
+      }
+    })
+  let settlement =
+    Settlement(
+      ..settlement,
+      undone: list.reverse(settlement.undone),
+      undo_failures: list.reverse(settlement.undo_failures),
+      not_undoable: list.reverse(settlement.not_undoable),
+      held: list.reverse(settlement.held),
+      interrupted: list.append(timed_out_attempts, settlement.interrupted),
+      unknown_effects: unknown_effects,
+    )
+  case trigger {
+    TriggerFailure(cause) -> Failed(cause, settlement)
+    TriggerUnresolved(step, evidence) -> Unresolved(step, evidence, settlement)
+    TriggerCancel(reason) -> Cancelled(reason, settlement)
   }
 }
 
