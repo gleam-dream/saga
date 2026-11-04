@@ -90,7 +90,8 @@ schema(outcome) -> [{completed,[output]},{completed_with_unknown_effects,[output
     {failed,[cause,settlement]},{cancelled,[cancel,settlement]},{unresolved,[address,error,settlement]}];
 schema(cause) -> [{step_failed,[address,error]},{step_crashed,[address,crash]},
     {step_timed_out,[address]},{retry_limit_reached,[address,failure]},
-    {retry_superseded,[address,failure]},{output_crashed,[crash]},{deadline_exceeded,[]}];
+    {retry_superseded,[address,failure]},{output_crashed,[crash]},{deadline_exceeded,[]},
+    {coordinator_crashed,[crash]}];
 schema(failure) -> [{returned,[error]},{crashed,[crash]},{timed_out,[]}];
 schema(crash) -> [{crash,[crash_class,string]}];
 schema(crash_class) -> [{error_class,[]},{exit_class,[]},{throw_class,[]}];

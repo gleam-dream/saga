@@ -425,6 +425,13 @@ pub type Cause(e) {
   RetrySuperseded(step: saga.StepAddress, last: saga.AttemptFailure(e))
   OutputCrashed(crash: saga.Crash)
   DeadlineExceeded
+  /// The run's coordinator raised while handling one of its own messages:
+  /// an internal defect, not a step's failure. The run still settled and
+  /// rolled back from its last consistent state; work it had started but
+  /// not yet recorded was killed, so effects may be unknown beyond
+  /// `unknown_effects`. `crash.reason` names only the exception kind and
+  /// the functions it was raised in, never the values it was raised with.
+  CoordinatorCrashed(crash: saga.Crash)
 }
 
 /// One completed step's undo did not succeed, during rollback.
@@ -1137,6 +1144,8 @@ pub fn describe_cause(
     OutputCrashed(crash) ->
       "computing the workflow's output crashed: " <> crash.reason
     DeadlineExceeded -> "the run passed its deadline"
+    CoordinatorCrashed(crash) ->
+      "the run's coordinator crashed (an internal defect): " <> crash.reason
   }
 }
 
@@ -1219,6 +1228,8 @@ fn to_public_cause(cause: coordinator.Cause(e)) -> Cause(e) {
     coordinator.OutputCrashed(crash) ->
       OutputCrashed(saga.crash_from_node(crash))
     coordinator.DeadlineExceeded -> DeadlineExceeded
+    coordinator.CoordinatorCrashed(crash) ->
+      CoordinatorCrashed(saga.crash_from_node(crash))
   }
 }
 
