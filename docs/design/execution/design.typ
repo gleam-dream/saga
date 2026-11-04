@@ -291,7 +291,7 @@
     [Each compensation / undo], [5 seconds], [1 through 2^32−1 milliseconds; undo runs sequentially and is not retried.],
     [RetryAfter cap], [5 minutes], [0 through 2^32−1 milliseconds; requested larger delay clamps and is observed.],
     [Coordinator startup handshake], [5 seconds], [Not configurable; separate from the public control handshake.],
-    [Observation wait (await, progress, testing wait)], [Required caller Duration], [A timeout limits the caller's wait and never cancels the run.],
+    [Observation wait (await, progress, testing wait)], [Required caller Duration], [A timeout limits the caller's wait and never cancels the run; a longer one is capped to 2^32−1 milliseconds.],
     [Synchronous run], [Until an outcome or coordinator loss], [A caller needing a bound uses start and await.],
     [Receiver readiness], [5 seconds], [Proven prelaunch failure returns typed reporting error.],
     [Reporting rollback / notification], [Caller Duration], [1 through 2^32−1 milliseconds; each callback has this bound.],
@@ -299,7 +299,7 @@
   ))
   #points(
     [Every timeout, deadline, interval, and lease is a Duration; no public function takes milliseconds as an integer. A bound that may be lifted takes After(Duration) or an explicit Infinity, so unbounded is never implicit. The storage, checkpoint, and drive bounds belong to the #ctx("durability") context.],
-    [Every caller duration that reaches a timer or a receive bound is at most 2^32−1 milliseconds (about 49.7 days), the longest Erlang receive timeout. A longer run configuration is the typed DurationTooLong error, a longer step timeout is InvalidTimeout at definition, and neither starts work; a bound to be lifted uses Infinity. This is a behavior change: on OTP 29 send_after accepts up to about 292 years, so earlier releases ran timer-backed bounds between 49.7 days and that limit, which are now refused for one ceiling consistent with the receive limit and reporting.],
+    [Every caller duration that reaches a timer or a receive bound is held to 2^32−1 milliseconds (about 49.7 days), the longest Erlang receive timeout. A longer run configuration is the typed DurationTooLong error, a longer step timeout is InvalidTimeout at definition, and neither starts work; a bound to be lifted uses Infinity. A longer observation wait (await, progress) is capped to 2^32−1 milliseconds, since a timeout there only limits the caller's wait. This is a behavior change: on OTP 29 send_after accepts up to about 292 years, so earlier releases ran timer-backed bounds between 49.7 days and that limit, which are now refused for one ceiling consistent with the receive limit and reporting.],
   )
   #formula(id: "action-budget", title: "Conservative sequential action budget", notation: (
     ([$A_s$], [allowed attempts for step s]), ([$T_s$], [effective finite attempt timeout]),

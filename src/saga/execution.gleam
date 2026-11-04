@@ -301,6 +301,13 @@ fn non_negative_timer(
   }
 }
 
+// An observation wait in whole milliseconds, held to what a receive
+// accepts: a negative wait is 0, and one beyond `timer.max_milliseconds`
+// is capped to it rather than raising in the caller.
+fn wait_milliseconds(timeout: Duration) -> Int {
+  int.clamp(duration.to_milliseconds(timeout), 0, timer.max_milliseconds)
+}
+
 fn bound_milliseconds(bound: Timeout) -> Option(Int) {
   case bound {
     After(limit) -> Some(duration.to_milliseconds(limit))
@@ -971,6 +978,8 @@ fn exit_reason_to_string(reason: process.ExitReason) -> String {
 /// externally before it could report an outcome, whether that happened
 /// before this call started or during it (`execution.pid` lets
 /// applications monitor it themselves independently, for comparison).
+/// A `timeout` above 4_294_967_295 milliseconds (about 49.7 days, the
+/// longest Erlang receive timeout) waits that long instead.
 ///
 /// **Timing.** An `await` issued immediately after a previous `await`
 /// already returned `Ok` may still return `Error(AwaitTimedOut)` rather
@@ -991,7 +1000,7 @@ pub fn await(
   use #(monitor, result) <- awaited_by_self(execution)
   let #(fresh_monitor, selector) =
     await_selector(execution.pid, monitor, result)
-  case process.selector_receive(selector, duration.to_milliseconds(timeout)) {
+  case process.selector_receive(selector, wait_milliseconds(timeout)) {
     Ok(signal) -> await_signal(monitor, fresh_monitor, signal)
     Error(_) -> {
       process.demonitor_process(fresh_monitor)
@@ -1057,7 +1066,8 @@ type ProgressSignal {
 /// so without a monitor this would always time out rather than report
 /// `ExecutionEnded` promptly. A short-lived monitor (armed only for this
 /// one call, always demonitored with `[flush]` before returning) races the
-/// reply against the coordinator's exit instead.
+/// reply against the coordinator's exit instead. A `timeout` above
+/// 4_294_967_295 milliseconds waits that long instead.
 pub fn progress(
   execution: Execution(o, e, u),
   timeout timeout: Duration,
@@ -1072,7 +1082,7 @@ pub fn progress(
       ProgressCoordinatorDown
     })
   let outcome = case
-    process.selector_receive(selector, duration.to_milliseconds(timeout))
+    process.selector_receive(selector, wait_milliseconds(timeout))
   {
     Ok(GotProgress(progress)) -> Ok(to_public_progress(progress))
     Ok(ProgressCoordinatorDown) -> Error(ExecutionEnded)
