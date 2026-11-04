@@ -10,6 +10,8 @@ import gleeunit/should
 import saga
 import saga/execution
 import saga/internal/coordinator
+import saga/telemetry
+import sinal
 import support/probe
 
 @external(erlang, "coordinator_rescue_ffi", "control")
@@ -143,4 +145,113 @@ pub fn untracked_workers_exclude_baseline_and_recorded_pids_test() {
   )
   |> should.equal([orphan])
   list.each([guard, heartbeat, recorded, orphan], process.kill)
+}
+
+fn stop_events(events: process.Subject(String)) -> sinal.SubscriptionPlan {
+  sinal.subscriptions([
+    sinal.subscription(telemetry.step_started(), fn(_m, d) {
+      process.send(events, "step_start:" <> d.step)
+    }),
+    sinal.subscription(telemetry.step_stopped(), fn(_m, d) {
+      let result = case d.result {
+        telemetry.AttemptInterrupted -> "interrupted"
+        _ -> "other"
+      }
+      process.send(events, "step_stop:" <> d.step <> ":" <> result)
+    }),
+    sinal.subscription(telemetry.undo_stopped(), fn(_m, d) {
+      let result = case d.result {
+        telemetry.UndoCrashedKind -> "crashed"
+        _ -> "other"
+      }
+      process.send(events, "undo_stop:" <> d.step <> ":" <> result)
+    }),
+  ])
+}
+
+fn received(
+  events: process.Subject(String),
+  acc: List(String),
+) -> List(String) {
+  case process.receive(events, 0) {
+    Ok(event) -> received(events, [event, ..acc])
+    Error(Nil) -> list.reverse(acc)
+  }
+}
+
+/// A second raise kills the in-flight attempt and emits its `step_stopped`
+/// as `interrupted`, like the settle window does, so every started step
+/// span is closed.
+pub fn second_raise_closes_the_interrupted_attempt_span_test() {
+  let events = process.new_subject()
+  let gate = probe.new_gate()
+  let workflow =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("reserve", fn(x: Int) { Ok(x) })
+        |> saga.undo(fn(_request) { Ok(Nil) }),
+      )
+      |> saga.perform(
+        saga.step("ship", fn(x: Int) {
+          probe.enter(gate)
+          Ok(x)
+        }),
+      )
+    })
+  let config =
+    execution.config()
+    |> execution.with_settle_timeout(duration.seconds(30))
+  let assert Ok(sinal.SubscriptionCompletion(outcome, [])) =
+    sinal.with_subscriptions(stop_events(events), fn() {
+      let assert Ok(run) = execution.start(workflow, 7, config)
+      let assert Ok(_) = probe.wait_entered(gate, 2000)
+      let poison = coordinator.ProgressRequest(coerce(Nil))
+      process.send(control(run), poison)
+      process.send(control(run), poison)
+      execution.await(run, duration.seconds(5))
+    })
+  let assert Ok(execution.Failed(execution.CoordinatorCrashed(_), _)) = outcome
+  received(events, [])
+  |> should.equal([
+    "step_start:reserve", "step_stop:reserve:other", "step_start:ship",
+    "step_stop:ship:interrupted",
+  ])
+}
+
+/// A second raise during rollback kills the undo in flight and emits its
+/// `undo_stopped` as crashed, matching the `UndoCrashed` it reports.
+pub fn second_raise_closes_the_killed_undo_span_test() {
+  let events = process.new_subject()
+  let gate = probe.new_gate()
+  let workflow =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("reserve", fn(x: Int) { Ok(x) })
+        |> saga.undo(fn(_request) {
+          probe.enter(gate)
+          Ok(Nil)
+        }),
+      )
+      |> saga.perform(saga.step("charge", fn(_x: Int) { Error("declined") }))
+    })
+  let assert Ok(sinal.SubscriptionCompletion(outcome, [])) =
+    sinal.with_subscriptions(stop_events(events), fn() {
+      let assert Ok(run) = execution.start(workflow, 7, execution.config())
+      let assert Ok(_) = probe.wait_entered(gate, 2000)
+      let poison = coordinator.ProgressRequest(coerce(Nil))
+      process.send(control(run), poison)
+      process.send(control(run), poison)
+      execution.await(run, duration.seconds(5))
+    })
+  let assert Ok(execution.Failed(
+    execution.StepFailed(_, "declined"),
+    execution.Settlement(undo_failures: [execution.UndoCrashed(_, _)], ..),
+  )) = outcome
+  received(events, [])
+  |> should.equal([
+    "step_start:reserve", "step_stop:reserve:other", "step_start:charge",
+    "step_stop:charge:other", "undo_stop:reserve:crashed",
+  ])
 }

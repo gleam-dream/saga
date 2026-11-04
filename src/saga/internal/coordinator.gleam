@@ -785,7 +785,8 @@ pub fn untracked_workers(
 }
 
 /// Ends a run whose coordinator raised again, or raised while starting to
-/// settle. A durable run stops under its last checkpoint, which still holds
+/// settle. Each worker it kills gets the stop event the settle window or an
+/// undo crash would emit, so observers see every span closed. A durable run stops under its last checkpoint, which still holds
 /// the journal, as when its driver is lost. A local run kills its
 /// in-flight work, reported interrupted, and reports every journal entry it
 /// did not undo as `UndoCrashed` with the coordinator's crash: those
@@ -817,6 +818,12 @@ fn abort(state: RunState(o, e, u), crash: node.Crash) -> Next(o, e, u) {
               interrupt(acc, id, pid, StepCompensation(attempt))
             Ok(NodeUndoing(_, pid, _, _)) -> {
               process.kill(pid)
+              emit_undo_stopped(
+                acc,
+                node_address(acc, id),
+                telemetry.UndoCrashedKind,
+                duration_since_started(acc, id),
+              )
               record_unknown_effect(acc, id, StepUndo, ActionInterrupted)
               |> record_undo_failure(UndoCrashed(node_address(acc, id), crash))
               |> fn(acc) {
@@ -851,6 +858,14 @@ fn interrupt(
 ) -> RunState(o, e, u) {
   process.kill(pid)
   let address = node_address(state, node_id)
+  // The same stop event the settle window emits for a worker it kills.
+  emit_step_stopped(
+    state,
+    address,
+    attempt_number_for(state, node_id),
+    telemetry.AttemptInterrupted,
+    duration_since_started(state, node_id),
+  )
   record_unknown_effect(state, node_id, action, ActionInterrupted)
   |> fn(state) {
     RunState(..state, state: dict.insert(state.state, node_id, NodeInterrupted))
