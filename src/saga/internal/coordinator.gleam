@@ -353,6 +353,10 @@ type RunState(o, e, u) {
     // Whether the coordinator has already raised once in this run (see
     // `recover`); a second raise ends the run without walking the journal.
     crashed: Bool,
+    // The processes linked to this one before any worker was spawned: in a
+    // durable runner, its storage guard and claim heartbeat. A crash
+    // recovery never kills them (see `kill_untracked`).
+    baseline_links: List(Pid),
   )
 }
 
@@ -459,6 +463,7 @@ fn run(
   persistence: Option(Session(e, u)),
 ) -> Nil {
   process.trap_exits(True)
+  let baseline_links = ffi.links()
   let control = process.new_subject()
   let owner_monitor = process.monitor(owner)
   process.send(control_subject_out, control)
@@ -538,6 +543,7 @@ fn run(
       start_time: start_time,
       unknown_effects: [],
       crashed: False,
+      baseline_links: baseline_links,
     )
   emit_run_started(initial)
   let restored = case persistence {
@@ -742,31 +748,40 @@ fn recover(state: RunState(o, e, u), crash: node.Crash) -> Next(o, e, u) {
   }
 }
 
-/// A local worker the raising step spawned but never recorded runs
-/// unobserved, so it is killed; its effect is unknown, which
-/// `CoordinatorCrashed` already reports. A durable worker waits for a
-/// permit that only a recorded admission receives, and ends with the
-/// runner.
+/// A worker the raising step spawned but never recorded is killed. A local
+/// one runs unobserved; its effect is unknown, which `CoordinatorCrashed`
+/// already reports. A durable one waits for a permit that only a recorded
+/// admission receives, and would otherwise wait forever: a runner that
+/// ends normally does not stop a linked process.
 fn kill_untracked(state: RunState(o, e, u)) -> Nil {
-  case state.persistence {
-    Some(_) -> Nil
-    None -> {
-      let tracked =
-        dict.values(state.state)
-        |> list.filter_map(fn(node_state) {
-          case node_state {
-            NodeAttempting(_, _, pid, _, _)
-            | NodeCompensating(_, _, pid, _, _)
-            | NodeUndoing(_, pid, _, _) -> Ok(pid)
-            _ -> Error(Nil)
-          }
-        })
-        |> set.from_list
-      ffi.links()
-      |> list.filter(fn(pid) { !set.contains(tracked, pid) })
-      |> list.each(process.kill)
-    }
-  }
+  let recorded =
+    dict.values(state.state)
+    |> list.filter_map(fn(node_state) {
+      case node_state {
+        NodeAttempting(_, _, pid, _, _)
+        | NodeCompensating(_, _, pid, _, _)
+        | NodeUndoing(_, pid, _, _) -> Ok(pid)
+        _ -> Error(Nil)
+      }
+    })
+  untracked_workers(
+    linked: ffi.links(),
+    baseline: state.baseline_links,
+    recorded: recorded,
+  )
+  |> list.each(process.kill)
+}
+
+/// The linked pids that are unrecorded workers: neither linked before the
+/// run started (a durable runner's storage guard and claim heartbeat) nor
+/// recorded in a node's state.
+pub fn untracked_workers(
+  linked linked: List(Pid),
+  baseline baseline: List(Pid),
+  recorded recorded: List(Pid),
+) -> List(Pid) {
+  let kept = set.from_list(list.append(baseline, recorded))
+  list.filter(linked, fn(pid) { !set.contains(kept, pid) })
 }
 
 /// Ends a run whose coordinator raised again, or raised while starting to

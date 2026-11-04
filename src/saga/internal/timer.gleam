@@ -1,11 +1,14 @@
 //// The bound on every duration that reaches an Erlang timer.
 ////
-//// `erlang:send_after/3` and `receive ... after` accept at most
-//// 4_294_967_295 milliseconds (2^32 - 1, about 49.7 days) and raise
-//// `badarg` or `timeout_value` above it. A caller-supplied duration that
-//// reaches a timer is checked against this bound where it is configured, so
-//// an over-long value is a typed configuration error and never a raise
-//// inside a running coordinator.
+//// `receive ... after` accepts at most 4_294_967_295 milliseconds
+//// (2^32 - 1, about 49.7 days) and raises `timeout_value` above it.
+//// `erlang:send_after/3` accepts longer delays on OTP 29 (it raises
+//// `badarg` only beyond about 292 years), but every caller-supplied
+//// duration is held to the receive limit, the bound `saga/reporting`
+//// already applied, so one ceiling covers every timer and wait. It is
+//// checked where the duration is configured, so an over-long value is a
+//// typed configuration error and never a raise in a running coordinator or
+//// caller.
 
 import gleam/time/duration.{type Duration}
 

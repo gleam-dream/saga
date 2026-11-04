@@ -3,6 +3,7 @@
 //// redacted evidence, instead of losing the run and its undo journal.
 
 import gleam/erlang/process
+import gleam/list
 import gleam/string
 import gleam/time/duration
 import gleeunit/should
@@ -122,4 +123,24 @@ pub fn second_coordinator_raise_reports_the_journal_left_in_place_test() {
   )) = execution.await(run, duration.seconds(5))
   reserve |> should.equal(saga.StepAddress([], "reserve", 1))
   ship |> should.equal(saga.StepAddress([], "ship", 1))
+}
+
+/// After a raise, the coordinator kills every linked worker it never
+/// recorded. In a durable runner the processes linked before the run
+/// started (its storage guard and claim heartbeat) are not workers and are
+/// kept; a recorded worker is kept for settlement. The durable control
+/// subject is not reachable from tests, so this checks the selection the
+/// coordinator applies to its links.
+pub fn untracked_workers_exclude_baseline_and_recorded_pids_test() {
+  let guard = process.spawn_unlinked(fn() { process.sleep_forever() })
+  let heartbeat = process.spawn_unlinked(fn() { process.sleep_forever() })
+  let recorded = process.spawn_unlinked(fn() { process.sleep_forever() })
+  let orphan = process.spawn_unlinked(fn() { process.sleep_forever() })
+  coordinator.untracked_workers(
+    linked: [guard, recorded, heartbeat, orphan],
+    baseline: [guard, heartbeat],
+    recorded: [recorded],
+  )
+  |> should.equal([orphan])
+  list.each([guard, heartbeat, recorded, orphan], process.kill)
 }

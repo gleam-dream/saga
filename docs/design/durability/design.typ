@@ -74,6 +74,7 @@
     [Undo reconstruction must be pure and may run during validation and restoration. A Continue that carries undo cannot commit if declared reconstruction returns NoUndo.],
     [Codec attachment, undo/resolver configuration, and error mapping preserve recovery capabilities across modifier order. A Failed resolver added after error mapping needs a compensation decider in the mapped vocabulary or fails DeciderMissingAfterMapping.],
     [Checkpoint format 2 retains correlation. Format 1 opens with correlation.from_key(id); the next commit uses format 2. Earlier binaries cannot read the newer envelope; no automatic arbitrary-definition migration is implied.],
+    [The format 2 schema gained the CoordinatorCrashed cause without a version change. A checkpoint whose trigger, sibling failures, or outcome holds it reads as Malformed in an older saga build, including saga 0.1.0 on Hex; every other format 2 checkpoint stays readable both ways.],
   )
 ])
 
