@@ -296,6 +296,72 @@ pub fn sub_millisecond_bounds_are_refused_test() {
     )
 }
 
+/// An Erlang timer holds at most 4_294_967_295 ms (about 49.7 days); a
+/// longer bound would raise inside the coordinator after earlier steps had
+/// committed. Every timed setting is checked against that ceiling when the
+/// run starts, and the ceiling itself is accepted.
+pub fn over_long_timer_bounds_are_refused_test() {
+  let long = duration.milliseconds(4_294_967_296)
+  let config =
+    execution.config()
+    |> execution.with_deadline(execution.After(long))
+    |> execution.with_step_timeout(execution.After(long))
+    |> execution.with_settle_timeout(long)
+    |> execution.with_cleanup_timeout(long)
+    |> execution.with_max_retry_delay(long)
+  let assert Error(errors) = execution.settings(config, None)
+  errors
+  |> should.equal([
+    execution.DurationTooLong(execution.Deadline, long),
+    execution.DurationTooLong(execution.StepTimeout, long),
+    execution.DurationTooLong(execution.SettleTimeout, long),
+    execution.DurationTooLong(execution.CleanupTimeout, long),
+    execution.DurationTooLong(execution.MaxRetryDelay, long),
+  ])
+  let longest = duration.milliseconds(4_294_967_295)
+  let assert Ok(settings) =
+    execution.settings(
+      execution.config()
+        |> execution.with_deadline(execution.After(longest))
+        |> execution.with_step_timeout(execution.After(longest))
+        |> execution.with_settle_timeout(longest)
+        |> execution.with_cleanup_timeout(longest)
+        |> execution.with_max_retry_delay(longest),
+      None,
+    )
+  settings.deadline |> should.equal(Some(4_294_967_295))
+  settings.max_retry_delay |> should.equal(4_294_967_295)
+}
+
+/// A run whose step timeout is "practically unbounded" (60 days) starts no
+/// work: it is refused with the typed error instead of losing the run.
+pub fn sixty_day_step_timeout_starts_no_work_test() {
+  let calls = probe.new_counter()
+  let workflow =
+    saga.define("wf", fn(input) {
+      input
+      |> saga.perform(
+        saga.step("a", fn(x: Int) {
+          probe.counter_enter(calls)
+          Ok(x)
+        }),
+      )
+    })
+  let sixty_days = duration.hours(24 * 60)
+  let config =
+    execution.config()
+    |> execution.with_step_timeout(execution.After(sixty_days))
+  execution.run(workflow, 1, config)
+  |> should.equal(
+    Error(
+      execution.InvalidConfig([
+        execution.DurationTooLong(execution.StepTimeout, sixty_days),
+      ]),
+    ),
+  )
+  probe.total_entries(calls) |> should.equal(0)
+}
+
 /// A `RetryAfter` delay above the cap is shortened to the cap: with a cap of
 /// 10 ms, a requested hour-long backoff retries at once and the run ends.
 pub fn retry_after_delay_is_capped_test() {

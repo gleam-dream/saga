@@ -33,6 +33,7 @@
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/time/duration.{type Duration}
+import saga/internal/timer
 
 /// Why a storage operation failed. Later releases may add variants:
 /// describe them with `describe_error`.
@@ -241,9 +242,11 @@ pub fn with_renewal(
 /// Bounds each storage operation saga performs (default 5 seconds). A slower
 /// operation fails with `TimedOut`; a runner whose storage call times out
 /// stops and keeps its last committed checkpoint. A bound below 1
-/// millisecond is raised to 1 millisecond.
+/// millisecond is raised to 1 millisecond, and one above 4_294_967_295
+/// milliseconds (the longest Erlang timer) is lowered to it.
 pub fn with_call_timeout(storage: Storage, timeout: Duration) -> Storage {
-  let milliseconds = int.max(1, duration.to_milliseconds(timeout))
+  let milliseconds =
+    int.clamp(duration.to_milliseconds(timeout), 1, timer.max_milliseconds)
   Storage(..storage, call_timeout: duration.milliseconds(milliseconds))
 }
 

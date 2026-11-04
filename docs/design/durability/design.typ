@@ -169,11 +169,11 @@
 #section(title: "Durable time and capacity", lead: "Each durable bound limits one operation; none promises a total return time.", body: [
   #md-table(3, (
     [*Bound*], [*Default*], [*Ownership and limit*],
-    [Storage operation], [5 seconds, then TimedOut], [`with_call_timeout`; minimum one millisecond; a slow call suspends and stops the runner.],
+    [Storage operation], [5 seconds, then TimedOut], [`with_call_timeout`; held to 1 through 2^32−1 milliseconds; a slow call suspends and stops the runner.],
     [Memory adapter call], [5 seconds], [Not configurable.],
     [File adapter mutation lock], [5 seconds, then Busy], [Not configurable.],
     [Checkpoint bytes], [16 MiB (16 777 216 bytes)], [Whole saved snapshot; `with_max_checkpoint_bytes` changes it; an oversize snapshot returns CheckpointTooLarge.],
-    [Drive execution], [Required caller Duration], [Positive; after expiry, runner drain and claim release precede return.],
+    [Drive execution], [Required caller Duration], [1 through 2^32−1 milliseconds; after expiry, runner drain and claim release precede return.],
     [Drive caller exit], [Runner stops], [The checkpoint is kept and no cancellation is recorded.],
     [PostgreSQL claim lease], [30 seconds, renewed every 10 seconds], [Owned by the adapter's own layer.],
     [Conformance owner-loss window], [Declared by the adapter], [Passed to the #term("term-conformance-suite") as the owner-loss allowance.],

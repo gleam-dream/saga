@@ -74,6 +74,7 @@ import saga/internal/checkpoint
 import saga/internal/coordinator
 import saga/internal/ffi
 import saga/internal/node
+import saga/internal/timer
 import saga/storage.{type Storage}
 import sinal/correlation.{type Correlation}
 
@@ -104,7 +105,8 @@ pub type Error {
   SuspensionNotSaved(cause: Error, recording: Error)
   /// The run configuration is invalid.
   InvalidConfig(errors: List(execution.ConfigError))
-  /// `drive` was given a timeout below 1 millisecond.
+  /// `drive` was given a timeout below 1 millisecond or above
+  /// 4_294_967_295 milliseconds (the longest Erlang timer).
   InvalidTimeout(timeout: Duration)
   /// The runner process was killed or crashed before reporting, or the
   /// caller's exit stopped it. Its claim was released; `drive` again.
@@ -232,7 +234,9 @@ pub fn describe_error(error: Error) -> String {
       "invalid configuration: "
       <> string.join(list.map(errors, execution.describe_config_error), "; ")
     InvalidTimeout(timeout) ->
-      "the drive timeout must be at least 1 ms, got "
+      "the drive timeout must be between 1 and "
+      <> int.to_string(timer.max_milliseconds)
+      <> " ms, got "
       <> int.to_string(duration.to_milliseconds(timeout))
       <> " ms"
     RunnerLost -> "the runner process died"
@@ -725,7 +729,7 @@ pub fn drive(
   timeout timeout: Duration,
 ) -> Result(execution.Outcome(o, e, u), Error) {
   let timeout_ms = duration.to_milliseconds(timeout)
-  use _ <- result.try(case timeout_ms > 0 {
+  use _ <- result.try(case timer.valid_timer_duration(timeout) {
     True -> Ok(Nil)
     False -> Error(InvalidTimeout(timeout))
   })
@@ -1176,7 +1180,7 @@ fn heartbeat(
   renew: fn(storage.Claim) -> Result(Nil, storage.Error),
   on_lost: fn() -> Nil,
 ) -> Nil {
-  process.sleep(int.max(1, every))
+  process.sleep(int.clamp(every, 1, timer.max_milliseconds))
   // The storage's call timeout bounds a renewal too. A renewal that fails
   // with `Unavailable` or `TimedOut` is tried again; commits stay fenced by
   // the claim if the lease expires meanwhile.

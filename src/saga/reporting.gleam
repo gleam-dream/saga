@@ -23,6 +23,7 @@ import saga
 import saga/execution
 import saga/internal/ffi
 import saga/internal/reporting_startup
+import saga/internal/timer
 
 /// A failure to obtain an execution report. Workflow failures are retained in
 /// `Ok(execution.Outcome)`, including their native business and undo errors.
@@ -143,10 +144,16 @@ pub fn run_owned(
     Nil,
   rollback_within: Duration,
 ) -> Result(execution.Outcome(output, error, undo_error), Error) {
-  let milliseconds = duration.to_milliseconds(rollback_within)
-  case milliseconds >= 1 && milliseconds <= 4_294_967_295 {
+  case timer.valid_timer_duration(rollback_within) {
     False -> Error(InvalidRollbackBound(rollback_within))
-    True -> run(workflow, input, config, on_stopped, milliseconds)
+    True ->
+      run(
+        workflow,
+        input,
+        config,
+        on_stopped,
+        duration.to_milliseconds(rollback_within),
+      )
   }
 }
 

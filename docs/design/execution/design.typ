@@ -281,11 +281,11 @@
   #md-table(3, (
     [*Bound*], [*Default*], [*Ownership and limit*],
     [Concurrent attempts + compensation decisions], [Online scheduler count], [Per run; at least one; retries need slots.],
-    [Run deadline], [Infinity], [After(Duration) is opt-in; triggers settlement and rollback.],
-    [Attempt timeout], [60 seconds], [Step-specific timeout overrides default in either direction; Infinity opts out for undeclared steps.],
-    [Sibling settlement], [5 seconds], [Can be zero; no new admission; active siblings may finish.],
-    [Each compensation / undo], [5 seconds], [Positive; undo runs sequentially and is not retried.],
-    [RetryAfter cap], [5 minutes], [Nonnegative; requested larger delay clamps and is observed.],
+    [Run deadline], [Infinity], [After(Duration) is opt-in, 1 through 2^32−1 milliseconds; triggers settlement and rollback.],
+    [Attempt timeout], [60 seconds], [1 through 2^32−1 milliseconds, at the step or as the default; step-specific timeout overrides default in either direction; Infinity opts out for undeclared steps.],
+    [Sibling settlement], [5 seconds], [0 through 2^32−1 milliseconds; no new admission; active siblings may finish.],
+    [Each compensation / undo], [5 seconds], [1 through 2^32−1 milliseconds; undo runs sequentially and is not retried.],
+    [RetryAfter cap], [5 minutes], [0 through 2^32−1 milliseconds; requested larger delay clamps and is observed.],
     [Coordinator startup handshake], [5 seconds], [Not configurable; separate from the public control handshake.],
     [Observation wait (await, progress, testing wait)], [Required caller Duration], [A timeout limits the caller's wait and never cancels the run.],
     [Synchronous run], [Until an outcome or coordinator loss], [A caller needing a bound uses start and await.],
@@ -293,7 +293,10 @@
     [Reporting rollback / notification], [Caller Duration], [1 through 2^32−1 milliseconds; each callback has this bound.],
     [Sinal handlers], [Synchronous in the coordinator], [A slow handler delays coordinator processing; a forwarder route removes that coupling.],
   ))
-  #points([Every timeout, deadline, interval, and lease is a Duration; no public function takes milliseconds as an integer. A bound that may be lifted takes After(Duration) or an explicit Infinity, so unbounded is never implicit. The storage, checkpoint, and drive bounds belong to the #ctx("durability") context.])
+  #points(
+    [Every timeout, deadline, interval, and lease is a Duration; no public function takes milliseconds as an integer. A bound that may be lifted takes After(Duration) or an explicit Infinity, so unbounded is never implicit. The storage, checkpoint, and drive bounds belong to the #ctx("durability") context.],
+    [Every caller duration that reaches a timer or a receive bound is at most 2^32−1 milliseconds (about 49.7 days), the longest Erlang receive timeout. A longer run configuration is the typed DurationTooLong error, a longer step timeout is InvalidTimeout at definition, and neither starts work; a bound to be lifted uses Infinity.],
+  )
   #formula(id: "action-budget", title: "Conservative sequential action budget", notation: (
     ([$A_s$], [allowed attempts for step s]), ([$T_s$], [effective finite attempt timeout]),
     ([$C$], [cleanup timeout]), ([$R$], [retry-delay cap]), ([$S$], [settle timeout]),
