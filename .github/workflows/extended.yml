@@ -1,6 +1,7 @@
 name: Retained oracle and benchmark
 on:
   push:
+    branches: [main]
     paths: &relevant
       - "src/**"
       - "test/**"
