@@ -15,4 +15,4 @@ sinal = ">= 0.1.0 and < 0.2.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
-json_blueprint = ">= 2.0.0 and < 3.0.0"
+json_blueprint = ">= 2.2.0 and < 3.0.0"
