@@ -5,20 +5,12 @@
 # of coderabbit-config itself, and `repository` marks a rule beyond the catalog.
 #
 # Catalogs read:
-#   practice skills    879841a61c3f83cd809edca9229c4a6bb7f909f8
-#   gleam-agent-tools  6a9ea2f647e787a32d3c7fa88d9c58c5b81ae9d7
+#   practice catalog (not public)  a56636a4eed7a0d644b89f5bb7c7d7c9692e0887
+#   gleam-agent-tools  d7b541cb885b3edbf25563b06aee97b28b66074f
 #
 # Governing skills: coderabbit-config (policy), gleam, gleam-lib, gleam-ffi,
 # gleam-otp, saga, sinal, json-blueprint, gleam-sql, testing, elixir, design,
 # tracker, gate, git.
-#
-# Governing dependency versions: saga 0.2.0 (this package, gleam.toml; the saga
-# skill names 0.1.0, and every API its rules cite exists in 0.2.0).
-# Locked in manifest.toml: sinal 0.1.0, gleam_otp 1.3.0, gleam_erlang 1.3.0,
-# gleam_stdlib 1.0.5, gleam_json 3.1.0, gleeunit 1.11.0.
-# examples/order_consumer/manifest.toml: json_blueprint 2.2.0, sinal 0.1.0.
-# integrations/saga_postgres/manifest.toml: pog 4.1.0, saga 0.2.0 (Hex),
-# sinal 0.1.0. Oracle: Reactor 1.0.6 (oracle/reactor/mix.lock, docs/ORACLE.md).
 language: en-US
 tone_instructions: >-
   Literal and concise. Report only defects you can evidence from the diff, its
@@ -186,8 +178,8 @@ reviews:
 
     - path: "{src,examples/*/src,integrations/*/src}/**/*.gleam"
       instructions: |
-        Processes (gleam-otp; gleam_otp 1.3.0, gleam_erlang 1.3.0). Apply to a
-        module that imports `gleam/otp` or `gleam/erlang/process`.
+        Processes (gleam-otp). Apply to a module that imports `gleam/otp` or
+        `gleam/erlang/process`.
         - Flag an actor whose messages are not one explicit message type, and
           request/reply mechanics exposed instead of hidden behind public
           functions.
@@ -231,6 +223,12 @@ reviews:
         - Flag `await` on a `start_reporting` handle returning anything but
           `NotOwner`, and an owner-loss path that lets `rollback_within` bound
           total execution.
+        - Flag a `CoordinatorCrashed` cause reported as a known failure; it is
+          uncertain.
+        - Flag a `Config` or step bound beyond about 49.7 days accepted
+          instead of failing as `DurationTooLong`, or at `define` as
+          `InvalidTimeout`, and `execution.Infinity` lifting anything but the
+          run deadline and the default step timeout.
 
     - path: "{examples/*/src/**/*.gleam,bench/src/**/*.gleam,README.md}"
       instructions: |
@@ -244,7 +242,10 @@ reviews:
           as the provider's idempotency key, and a possibly completed failure
           without `unknown_when` and an explicit uncertainty policy.
         - Flag a refund, release or retry of a possibly completed effect
-          without evidence.
+          without evidence, and a `CoordinatorCrashed` cause treated as a
+          known failure.
+        - Flag `outcome.summary` used for a decision instead of display.
+        - Flag a `Config` or step bound beyond about 49.7 days.
         - Flag an unfinished `start` handle dropped without `cancel` and
           `await`, and a `start_reporting` caller that neither receives the
           terminal report nor monitors the coordinator.
@@ -270,7 +271,7 @@ reviews:
 
     - path: "{integrations/*/src/**/*.gleam,integrations/*/priv/migrations/*.sql}"
       instructions: |
-        PostgreSQL access (gleam-sql; pog 4.1.0).
+        PostgreSQL access (gleam-sql).
         - Flag a value interpolated into SQL text instead of bound as a
           parameter, and an identifier (the schema name) not fixed by trusted
           configuration.
@@ -288,8 +289,8 @@ reviews:
 
     - path: "examples/*/src/**/*.gleam"
       instructions: |
-        JSON Blueprint codecs (json-blueprint; json_blueprint 2.2.0). Apply to
-        a module that imports `json/blueprint`.
+        JSON Blueprint codecs (json-blueprint). Apply to a module that imports
+        `json/blueprint`.
         - Flag a change to a union envelope (`tag`/`value`) in a change that
           claims checkpoint compatibility.
         - Flag a callback passed to `field`, `optional_field`, `success` or a
@@ -302,13 +303,12 @@ reviews:
           `codec.check`, and a run-time enum built inside its field instead
           of once before the `use` chain.
         - Flag a union `match` that returns a value tagged by another union.
-        - Flag a codec stored with `term_to_binary` or kept across an upgrade
-          from 2.1.x; root and step codecs are rebuilt.
+        - Flag a codec stored with `term_to_binary` or kept across a hot code
+          upgrade; root and step codecs are rebuilt.
 
     - path: "{src,examples/*/src,integrations/*/src}/**/*.gleam"
       instructions: |
-        Telemetry (sinal; sinal 0.1.0). Apply to a module that imports
-        `sinal`.
+        Telemetry (sinal). Apply to a module that imports `sinal`.
         - Flag an event name, field key or route prefix built from run-time
           input; they become atoms. Step names and run ids go in metadata
           values.
