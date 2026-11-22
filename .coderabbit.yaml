@@ -437,20 +437,24 @@ reviews:
       - name: Breaking change is declared
         mode: warning
         instructions: |
-          Source: policy, gleam-lib. Warn if the diff removes or changes an
-          exported function, type, constructor, field or module path in a
-          module outside `saga/internal` or `saga_postgres/internal`, or a
-          stored checkpoint or row format, and the pull request description
-          does not call the change breaking and give its migration. Pass
-          otherwise.
+          Source: policy, gleam-lib. Consider only the published library
+          source: src/ outside `saga/internal`, and
+          integrations/saga_postgres/src outside `saga_postgres/internal`.
+          Warn if the diff removes or changes an exported function, type,
+          constructor, field or module path in that source, or a stored
+          checkpoint or row format, and the pull request description does not
+          call the change breaking and give its migration. Pass for changes to
+          tests, examples, benchmarks and other files.
       - name: Public API change reaches the consumer
         mode: warning
         instructions: |
-          Source: gleam-lib, AGENTS.md. Warn if the diff adds, removes or
-          changes an exported function, type, constructor or field in a
-          module outside `saga/internal` and changes nothing under
-          examples/order_consumer, and the pull request description does not
-          say why no usage example covers it. Pass otherwise.
+          Source: gleam-lib, AGENTS.md. Consider only src/ outside
+          `saga/internal`; examples/order_consumer depends on saga alone, not
+          on saga_postgres. Warn if the diff adds, removes or changes an
+          exported function, type, constructor or field in that source and
+          changes nothing under examples/order_consumer, and the pull request
+          description does not say why no usage example covers it. Pass for
+          changes to tests, examples, benchmarks and other files.
       - name: Problem-first description
         mode: warning
         instructions: |
