@@ -109,7 +109,7 @@
     #points(
       [A step callback receives one record. `step` receives the input only; `effect` receives the input and an opaque #term("term-effect-key"); `undo` receives UndoRequest(input, output, key); `compensate` receives FailedAttempt(input, failure, attempt, attempts_left, key). Callers read records by label and the key through its accessors (idempotency_key, attempt_number, attempt_key, correlation_of).],
       [The #term("term-correlation") of a run is mandatory and reaches every callback through its key. A local run takes a fresh unique correlation unless configured; a durable execution takes the saved one, or the key-derived default. A step's own clients attach it to join the run's observations.],
-      [A local key belongs to one run: its #term("term-idempotency-key") derives from the run id, which each local run creates anew. A durable execution derives its keys from its execution id, so they survive restart.],
+      [A local key belongs to one run: its #term("term-idempotency-key") derives from 128 random bits drawn at start, so no other run, VM start, or node repeats it; it is unique, not stable across a second submission of the same business operation. A durable execution derives its keys from its execution id, so they survive restart.],
       [`define` reports every definition defect together and panics naming the workflow and each offending step. `try_define` returns every DefinitionError for definitions built from runtime data, and `describe_definition_error` renders one. `map_errors` and `map_step_errors` adapt error vocabulary; no saga-owned error type is ever required.],
     )
   ]
@@ -168,7 +168,7 @@
     (id: "finished", description: [Retains one terminal outcome; coordinator exits.]),
   ))
   #entity(id: "execution", title: "Execution", description: [One input interpretation of a Workflow and its effect evidence.], kind: "aggregate", owner: "Saga coordinator", lifecycle: "stateful", domain: "workflow", tint: "violet")[
-    #attribute(name: "Run identity", type: "Local fresh run id or durable execution id", provenance: "derived")[Local id is fresh per start; the durable id is caller-chosen within one store.]
+    #attribute(name: "Run identity", type: "Local fresh run id or durable execution id", provenance: "derived")[Local id is fresh per start and counts within one VM, so it names a run in telemetry and never enters a key; the durable id is caller-chosen within one store.]
     #attribute(id: "phase", name: "Phase", type: "Execution phase", provenance: "derived", state-type: "execution-phase", state-machine: "execution-lifecycle")[Derived from accepted transitions; public progress exposes the three active phases only.]
     #attribute(name: "Primary trigger", type: "Failure, cancellation, or held evidence", provenance: "derived")[The original stopping cause remains separate from subsequently observed sibling and cleanup failures.]
     #attribute(name: "Action evidence", type: "Known results, journal, and unknown actions", provenance: "observed")[Accepted callback results record observations; recovery decisions supply explicit transition authority.]
