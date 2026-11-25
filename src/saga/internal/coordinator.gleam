@@ -165,7 +165,11 @@ pub type Outcome(o, e, u) {
   CompletedWithUnknownEffects(output: o, unknown_effects: List(UnknownEffect))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
-  Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
+  Unresolved(
+    step: StepAddress,
+    failure: AttemptFailure(e),
+    settlement: Settlement(e, u),
+  )
 }
 
 pub type StepState {
@@ -373,7 +377,7 @@ type RunPhase(e, u) {
 
 pub type Trigger(e) {
   TriggerFailure(cause: Cause(e))
-  TriggerUnresolved(step: StepAddress, evidence: e)
+  TriggerUnresolved(step: StepAddress, failure: AttemptFailure(e))
   TriggerCancel(reason: CancelReason)
 }
 
@@ -946,7 +950,7 @@ fn final_outcome(
     )
   case trigger {
     TriggerFailure(cause) -> Failed(cause, settlement)
-    TriggerUnresolved(step, evidence) -> Unresolved(step, evidence, settlement)
+    TriggerUnresolved(step, failure) -> Unresolved(step, failure, settlement)
     TriggerCancel(reason) -> Cancelled(reason, settlement)
   }
 }
@@ -1279,18 +1283,17 @@ fn handle_attempt_done(
                 ActionReturnedUnknown,
               )
           }
-          let assert Ok(n) = dict.get(state.nodes, node_id)
-          case recover, unknown, n.rolls_back_unknown, failure {
-            // An unknown effect with no decision grants no rollback
-            // authority unless the step opted in (`saga.on_unknown`).
-            None, True, False, Returned(error) ->
-              hold_terminal(state, node_id, error)
-            None, _, _, _ ->
-              fail_terminal(state, node_id, failure, case unknown {
-                True -> telemetry.AttemptUnknown
-                False -> attempt_result_kind(failure)
-              })
-            Some(prepare_recovery), _, _, _ ->
+          case recover, unknown {
+            None, True ->
+              end_unknown(state, node_id, failure, telemetry.AttemptUnknown)
+            None, False ->
+              fail_terminal(
+                state,
+                node_id,
+                failure,
+                attempt_result_kind(failure),
+              )
+            Some(prepare_recovery), _ ->
               start_recovery_from_returned(
                 state,
                 node_id,
@@ -1560,12 +1563,14 @@ fn handle_recovery_done(
           )
           |> record_compensation_failure(cleanup_failure)
         }
-        EHold(evidence), _ ->
+        EHold, _ -> {
+          let assert Ok(failure) = dict.get(state.last_failure, node_id)
           begin_unresolved(
             RunState(..state, running: state.running - 1),
             node_id,
-            evidence,
+            failure,
           )
+        }
       }
     }
   }
@@ -1576,7 +1581,7 @@ fn decision_kind(recovery: ErasedRecovery(e, u)) -> telemetry.DecisionKind {
     ERetry | ERetryAfter(_) -> telemetry.DecisionRetry
     EContinue(_) -> telemetry.DecisionContinue
     EAbort(_) | EAbortCleanup(_, _) -> telemetry.DecisionAbort
-    EHold(_) | node.EBlocked(_) -> telemetry.DecisionHold
+    EHold | node.EBlocked(_) -> telemetry.DecisionHold
   }
 }
 
@@ -1671,7 +1676,7 @@ fn handle_task_crashed(
             )
           case n.prepare_crash_recovery {
             None ->
-              fail_terminal(
+              end_unknown(
                 state,
                 node_id,
                 Crashed(crash),
@@ -1690,7 +1695,7 @@ fn handle_task_crashed(
             StepCompensation(attempt_number),
             ActionCrashed(crash),
           )
-          |> fail_terminal(node_id, Crashed(crash), telemetry.AttemptCrashed)
+          |> end_unknown(node_id, Crashed(crash), telemetry.AttemptCrashed)
           |> record_compensation_failure(compensation_failure)
         }
         _ -> state
@@ -1774,12 +1779,12 @@ fn handle_step_timeout_fired(
             )
           case n.prepare_crash_recovery {
             None ->
-              // No decider: `fail_terminal` below is this attempt's own
+              // No decider: `end_unknown` below is this attempt's own
               // terminal outcome, and it emits `step_stopped` using this
               // same attempt's real duration (its `started_at` was just
               // preserved above) — a single, correct event, so nothing
               // extra is needed here.
-              fail_terminal(state, node_id, TimedOut, telemetry.AttemptTimedOut)
+              end_unknown(state, node_id, TimedOut, telemetry.AttemptTimedOut)
             Some(prepare) -> {
               // A decider exists: the decision's own resolution
               // (`fail_terminal`/`commit_success`, from
@@ -1830,7 +1835,7 @@ fn handle_cleanup_timeout_fired(
             StepCompensation(attempt_number),
             ActionTimedOut,
           )
-          |> fail_terminal(node_id, TimedOut, telemetry.AttemptTimedOut)
+          |> end_unknown(node_id, TimedOut, telemetry.AttemptTimedOut)
           |> record_compensation_failure(compensation_failure)
         }
         _ -> state
@@ -1973,21 +1978,17 @@ fn fail_terminal_retry_limit(
   let address = node_address(state, node_id)
   let assert Ok(last) = dict.get(state.last_failure, node_id)
   let assert Ok(n) = dict.get(state.nodes, node_id)
+  let last_attempt = StepAttempt(attempt_number_for(state, node_id))
   let last_unknown =
-    list.contains(
-      state.unknown_effects,
-      UnknownEffect(
-        address,
-        StepAttempt(attempt_number_for(state, node_id)),
-        ActionReturnedUnknown,
-      ),
-    )
+    list.any(state.unknown_effects, fn(effect) {
+      effect.step == address && effect.action == last_attempt
+    })
   let state = RunState(..state, running: state.running - 1)
-  case last, last_unknown && !n.rolls_back_unknown {
+  case last_unknown && !n.rolls_back_unknown {
     // The decider asked for another attempt, not for rollback, and the
-    // last attempt's effect is unknown.
-    Returned(error), True -> begin_unresolved(state, node_id, error)
-    _, _ -> {
+    // last attempt's outcome is unknown.
+    True -> begin_unresolved(state, node_id, last)
+    False -> {
       let state =
         RunState(
           ..state,
@@ -1998,29 +1999,33 @@ fn fail_terminal_retry_limit(
   }
 }
 
-/// A step ended with an error that `saga.unknown_when` classified, with no
-/// decision about it: like a `Hold(error)` decision, the run ends
-/// `Unresolved` and nothing is undone.
-fn hold_terminal(
+/// A step's outcome is unknown (its attempt crashed, timed out, or returned
+/// an error that `saga.unknown_when` classified; or its decider crashed or
+/// timed out) and no decision settles it. The step's `saga.on_unknown`
+/// chooses: by default the run ends `Unresolved` like a `Hold` decision and
+/// nothing is undone; `RollBack` fails the run like a known failure. Like
+/// `fail_terminal`, decrements `running` for the task that just finished.
+fn end_unknown(
   state: RunState(o, e, u),
   node_id: Int,
-  error: e,
+  failure: AttemptFailure(e),
+  step_kind: telemetry.AttemptKind,
 ) -> RunState(o, e, u) {
-  let address = node_address(state, node_id)
-  let attempt_number = attempt_number_for(state, node_id)
-  let duration = duration_since_started(state, node_id)
-  emit_step_stopped(
-    state,
-    address,
-    attempt_number,
-    telemetry.AttemptUnknown,
-    duration,
-  )
-  begin_unresolved(
-    RunState(..state, running: state.running - 1),
-    node_id,
-    error,
-  )
+  let assert Ok(n) = dict.get(state.nodes, node_id)
+  case n.rolls_back_unknown {
+    True -> fail_terminal(state, node_id, failure, step_kind)
+    False -> {
+      let address = node_address(state, node_id)
+      let attempt_number = attempt_number_for(state, node_id)
+      let duration = duration_since_started(state, node_id)
+      emit_step_stopped(state, address, attempt_number, step_kind, duration)
+      begin_unresolved(
+        RunState(..state, running: state.running - 1),
+        node_id,
+        failure,
+      )
+    }
+  }
 }
 
 /// A `Hold` decision grants no rollback authority for its own step. If it
@@ -2033,7 +2038,7 @@ fn hold_terminal(
 fn begin_unresolved(
   state: RunState(o, e, u),
   node_id: Int,
-  evidence: e,
+  failure: AttemptFailure(e),
 ) -> RunState(o, e, u) {
   let address = node_address(state, node_id)
   let state =
@@ -2047,7 +2052,7 @@ fn begin_unresolved(
         Settlement(..s, held: [address, ..s.held])
       })
       |> maybe_finish_settling
-    False -> begin_settling(state, TriggerUnresolved(address, evidence))
+    False -> begin_settling(state, TriggerUnresolved(address, failure))
   }
 }
 

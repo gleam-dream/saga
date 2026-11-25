@@ -90,13 +90,9 @@ pub fn throw_reported_as_throw_class_test() {
       )
     })
 
-  let assert Ok(execution.Failed(cause, _settlement)) =
+  let assert Ok(execution.Unresolved(_step, saga.Crashed(crash), _settlement)) =
     execution.run(workflow, 0, execution.config())
-  case cause {
-    execution.StepCrashed(_step, crash) ->
-      crash.class |> should.equal(saga.ThrowClass)
-    _ -> panic as "expected StepCrashed"
-  }
+  crash.class |> should.equal(saga.ThrowClass)
 }
 
 // Note: `exit_reason_to_string`'s `Abnormal(reason)` branch now formats

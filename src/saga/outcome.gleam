@@ -35,11 +35,13 @@
 //// uncertain: work the coordinator started but had not recorded was
 //// killed, and no action names it.
 ////
-//// `Unresolved` carries the error the step held its effects on (the error
-//// `saga.unknown_when` marked, or a recovery decision's `Hold(evidence)`).
-//// The evidence renders it with `explain`, the application's own wording,
-//// after the held step, followed by the complete safe summary. The person
-//// who reconciles the call can associate the error with that step.
+//// `Unresolved` carries the failure the step held its effects on: a crash,
+//// a timeout, or a returned error (one `saga.unknown_when` marked, or one a
+//// decider chose to `Hold`). The evidence renders a returned error with
+//// `explain`, the application's own wording, and a crash or timeout by its
+//// kind only, after the held step, followed by the complete safe summary.
+//// The person who reconciles the call can associate the failure with that
+//// step.
 ////
 //// Saga's report (`summary`) names outcome kinds, actions and step
 //// addresses only: never a step's typed error, output, or crash reason,
@@ -72,12 +74,16 @@ pub fn classify(
   case outcome {
     execution.Completed(output) -> Ok(output)
     execution.CompletedWithUnknownEffects(..) -> Error(unknown(report))
-    execution.Unresolved(step, held_error, _) ->
+    execution.Unresolved(step, held, _) ->
       Error(Unknown(
         "the workflow's effects are not known: the workflow held the effects of step "
         <> saga.address_to_string(step)
         <> " unresolved: "
-        <> explain(held_error)
+        <> case held {
+          saga.Returned(error) -> explain(error)
+          saga.Crashed(_) -> "the attempt crashed"
+          saga.TimedOut -> "the attempt timed out"
+        }
         <> "; Saga reported "
         <> report,
       ))

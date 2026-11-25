@@ -547,7 +547,16 @@ pub type Outcome(o, e, u) {
   CompletedWithUnknownEffects(output: o, unknown_effects: List(UnknownEffect))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
-  Unresolved(step: saga.StepAddress, evidence: e, settlement: Settlement(e, u))
+  /// The run held `step` for reconciliation and undid nothing: the step's
+  /// outcome was unknown and its `saga.on_unknown` policy was `Reconcile`,
+  /// or its decider chose `Hold`. `failure` is what left the outcome
+  /// unknown or was held: the attempt's (or, when the decider itself crashed
+  /// or timed out, the decider's) crash, timeout or returned error.
+  Unresolved(
+    step: saga.StepAddress,
+    failure: saga.AttemptFailure(e),
+    settlement: Settlement(e, u),
+  )
 }
 
 /// The run's current admission phase: accepting new work, letting active
@@ -1197,10 +1206,10 @@ pub fn from_coordinator(
       )
     coordinator.Failed(cause, settlement) ->
       Failed(to_public_cause(cause), to_public_settlement(settlement))
-    coordinator.Unresolved(step, evidence, settlement) ->
+    coordinator.Unresolved(step, failure, settlement) ->
       Unresolved(
         saga.address_from_node(step),
-        evidence,
+        saga.failure_from_node(failure),
         to_public_settlement(settlement),
       )
     coordinator.Cancelled(reason, settlement) ->

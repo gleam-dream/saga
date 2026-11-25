@@ -732,6 +732,9 @@ pub fn parallel_rollback_covers_both_completed_branches_test() {
   memory.stop(store)
 }
 
+@external(erlang, "saga_legacy_fixture", "held_as_saved_before")
+fn held_as_saved_before(bytes: BitArray) -> BitArray
+
 @external(erlang, "saga_test_panic", "message")
 fn panic_message(body: fn() -> a) -> Result(String, Nil)
 
@@ -934,8 +937,8 @@ pub fn compensation_recovery_preserves_abort_and_cleanup_test() {
 }
 
 pub fn compensation_recovery_preserves_hold_test() {
-  let assert execution.Unresolved(_, "mapped evidence", _) =
-    resolve_interrupted(saga.Hold("evidence"), 2, False)
+  let assert execution.Unresolved(_, saga.Returned("mapped original"), _) =
+    resolve_interrupted(saga.Hold, 2, False)
 }
 
 pub fn compensation_recovery_cancellation_supersedes_retry_test() {
@@ -1542,7 +1545,11 @@ pub fn classified_resolver_failure_follows_on_unknown_test() {
     resumed
   }
   let assert Ok(held) = interrupt("held", saga.Reconcile)
-  let assert execution.Unresolved(step, "maybe charged", settlement) = held
+  let assert execution.Unresolved(
+    step,
+    saga.Returned("maybe charged"),
+    settlement,
+  ) = held
   step |> should.equal(at("charge"))
   settlement.held |> should.equal([at("reserve")])
   let assert [unknown] = execution.unknown_effects(held)
@@ -1551,6 +1558,23 @@ pub fn classified_resolver_failure_follows_on_unknown_test() {
   // The saved outcome survives a reconnect.
   durable.read(reconnect(make(True, saga.Reconcile), backend, "held"))
   |> should.equal(Ok(durable.Finished(held)))
+  // An earlier release saved a held outcome with an encoded error only; it
+  // reads as the returned failure it was.
+  let assert Ok(saved) = storage.do_load(memory.storage(store), "held")
+  let earlier = start_memory()
+  let assert Ok(_) =
+    storage.do_create(
+      memory.storage(earlier),
+      "held",
+      held_as_saved_before(storage.data(saved)),
+    )
+  durable.read(reconnect(
+    make(True, saga.Reconcile),
+    memory.storage(earlier),
+    "held",
+  ))
+  |> should.equal(Ok(durable.Finished(held)))
+  memory.stop(earlier)
   let assert Ok(rolled_back) = interrupt("rolled-back", saga.RollBack)
   let assert execution.Failed(
     execution.StepFailed(_, "maybe charged"),

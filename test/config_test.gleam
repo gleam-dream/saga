@@ -79,12 +79,9 @@ pub fn default_step_timeout_bounds_a_hung_step_test() {
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
-    let assert Ok(execution.Failed(cause, _settlement)) =
+    let assert Ok(execution.Unresolved(step, saga.TimedOut, _settlement)) =
       execution.await(exec, duration.seconds(10))
-    case cause {
-      execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
-      _ -> panic as "expected StepTimedOut(blocked) from the default timeout"
-    }
+    step.name |> should.equal("blocked")
   })
 }
 
@@ -113,12 +110,9 @@ pub fn step_timeout_overrides_default_when_shorter_test() {
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
-    let assert Ok(execution.Failed(cause, _settlement)) =
+    let assert Ok(execution.Unresolved(step, saga.TimedOut, _settlement)) =
       execution.await(exec, duration.seconds(2))
-    case cause {
-      execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
-      _ -> panic as "expected StepTimedOut(blocked) from the step's own timeout"
-    }
+    step.name |> should.equal("blocked")
   })
 }
 
@@ -490,12 +484,8 @@ pub fn killed_step_task_is_crash_test() {
     let assert Ok(task_pid) = probe.wait_entered(gate, 10_000)
     kill_process(task_pid)
 
-    let assert Ok(execution.Failed(cause, _settlement)) =
+    let assert Ok(execution.Unresolved(_step, saga.Crashed(_), _settlement)) =
       execution.await(exec, duration.seconds(10))
-    case cause {
-      execution.StepCrashed(_step, _crash) -> Nil
-      _ -> panic as "expected StepCrashed"
-    }
   })
 }
 

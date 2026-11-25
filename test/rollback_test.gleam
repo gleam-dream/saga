@@ -133,13 +133,11 @@ pub fn hold_leaves_completed_effects_unresolved_test() {
       a
       |> saga.perform(
         saga.step("b", fn(_x: Int) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
-          saga.Hold(Boom)
-        }),
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) { saga.Hold }),
       )
     })
 
-  let assert Ok(execution.Unresolved(step, Boom, settlement)) =
+  let assert Ok(execution.Unresolved(step, saga.Returned(Boom), settlement)) =
     execution.run(workflow, 0, execution.config())
 
   step.name |> should.equal("b")

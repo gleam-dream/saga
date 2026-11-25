@@ -25,8 +25,25 @@ decode(Bytes,O,E,U) ->
 
 %% Format 1 had no correlation: it reads as a format 1 envelope with none saved.
 upgrade({envelope,1,Ref,Stamp,Input,Snapshot,Outcome,Issue}) ->
-    {envelope,1,Ref,Stamp,Input,Snapshot,Outcome,Issue,none};
+    upgrade({envelope,1,Ref,Stamp,Input,Snapshot,Outcome,Issue,none});
+%% Earlier releases held a run on an encoded error only; it reads as the
+%% returned failure it was.
+upgrade({envelope,F,Ref,Stamp,Input,Snapshot,Outcome,Issue,Correlation}) ->
+    {envelope,F,Ref,Stamp,Input,upgrade_snapshot(Snapshot),upgrade_outcome(Outcome),Issue,Correlation};
 upgrade(Value) -> Value.
+
+upgrade_snapshot({some,{snapshot,Nodes,Journal,{Phase,Trigger,Settlement},Failures,Unknown,Deadline}})
+  when Phase=:=saved_settling;Phase=:=saved_rollback ->
+    {some,{snapshot,Nodes,Journal,{Phase,upgrade_held(Trigger),Settlement},Failures,Unknown,Deadline}};
+upgrade_snapshot(Snapshot) -> Snapshot.
+
+upgrade_outcome({some,{unresolved,Step,Error,Settlement}}) when is_binary(Error) ->
+    {some,{unresolved,Step,{returned,Error},Settlement}};
+upgrade_outcome(Outcome) -> Outcome.
+
+upgrade_held({trigger_unresolved,Step,Error}) when is_binary(Error) ->
+    {trigger_unresolved,Step,{returned,Error}};
+upgrade_held(Trigger) -> Trigger.
 
 boundary(output) -> run_output;
 boundary(error) -> run_error;
@@ -84,10 +101,10 @@ schema(progress) -> [{waiting,[]},{attempting,[natural]},{compensating,[natural]
     {retry_scheduled,[natural]},{succeeded,[]},{failed_step,[]},{interrupted,[]},
     {undoing,[]},{undone,[]},{undo_failed_step,[]},{skipped,[]}];
 schema(phase) -> [{saved_running,[]},{saved_settling,[trigger,settlement]},{saved_rollback,[trigger,settlement]}];
-schema(trigger) -> [{trigger_failure,[cause]},{trigger_unresolved,[address,error]},{trigger_cancel,[cancel]}];
+schema(trigger) -> [{trigger_failure,[cause]},{trigger_unresolved,[address,failure]},{trigger_cancel,[cancel]}];
 schema(cancel) -> [{cancel_requested,[]},{owner_exited,[]}];
 schema(outcome) -> [{completed,[output]},{completed_with_unknown_effects,[output,{list,unknown}]},
-    {failed,[cause,settlement]},{cancelled,[cancel,settlement]},{unresolved,[address,error,settlement]}];
+    {failed,[cause,settlement]},{cancelled,[cancel,settlement]},{unresolved,[address,failure,settlement]}];
 schema(cause) -> [{step_failed,[address,error]},{step_crashed,[address,crash]},
     {step_timed_out,[address]},{retry_limit_reached,[address,failure]},
     {retry_superseded,[address,failure]},{output_crashed,[crash]},{deadline_exceeded,[]},

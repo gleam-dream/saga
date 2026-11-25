@@ -299,7 +299,7 @@ pub fn an_unresolved_workflow_is_uncertain_test() {
     execution.Settlement(..clean(), undone: [], held: [at("charge")])
   let assert Error(verdict.Unknown(evidence)) =
     verdict.classify(
-      execution.Unresolved(at("charge"), "hold", settlement),
+      execution.Unresolved(at("charge"), saga.Returned("hold"), settlement),
       explain,
     )
   evidence
@@ -308,8 +308,8 @@ pub fn an_unresolved_workflow_is_uncertain_test() {
   )
 }
 
-/// A recovery decision's `Hold(evidence)` ends the run `Unresolved` with
-/// that evidence, which `explain` renders after the unknown effects.
+/// A held returned error ends the run `Unresolved` with that error, which
+/// `explain` renders after the unknown effects.
 pub fn a_held_decision_renders_its_evidence_test() {
   let settlement =
     execution.Settlement(
@@ -325,7 +325,11 @@ pub fn a_held_decision_renders_its_evidence_test() {
     )
   let assert Error(verdict.Unknown(evidence)) =
     verdict.classify(
-      execution.Unresolved(at("refund"), "provider timeout", settlement),
+      execution.Unresolved(
+        at("refund"),
+        saga.Returned("provider timeout"),
+        settlement,
+      ),
       explain,
     )
   string.contains(
@@ -340,7 +344,7 @@ pub fn a_held_decision_renders_its_evidence_test() {
   |> should.be_true
   verdict.summary(execution.Unresolved(
     at("refund"),
-    "provider timeout",
+    saga.Returned("provider timeout"),
     settlement,
   ))
   |> string.contains("provider timeout")
@@ -391,7 +395,7 @@ pub fn outcome_kind_and_held_steps_are_actionable_without_rendering_errors_test(
   let unresolved =
     execution.Unresolved(
       at("pay"),
-      "private error",
+      saga.Returned("private error"),
       execution.Settlement(..clean(), held: [at("pay")]),
     )
   verdict.kind(unresolved) |> should.equal(verdict.Unresolved)
@@ -442,7 +446,7 @@ pub fn every_stopped_outcome_describes_all_settlement_categories_test() {
   [
     execution.Failed(execution.StepFailed(at("cause"), secret), settlement),
     execution.Cancelled(execution.OwnerExited, settlement),
-    execution.Unresolved(at("held"), secret, settlement),
+    execution.Unresolved(at("held"), saga.Returned(secret), settlement),
   ]
   |> list.each(fn(report) {
     let text = verdict.summary(report)

@@ -69,7 +69,7 @@ pub type ErasedRecovery(e, u) {
   EContinue(commit: fn(Store) -> #(Store, Option(fn() -> Result(Nil, u))))
   EAbort(error: e)
   EAbortCleanup(error: e, cleanup_error: u)
-  EHold(evidence: e)
+  EHold
 }
 
 /// The outcome of running one attempt body, computed inside a task process
@@ -223,7 +223,7 @@ fn map_erased_recovery(
     EAbort(error) -> EAbort(map_error(error))
     EAbortCleanup(error, cleanup_error) ->
       EAbortCleanup(map_error(error), map_undo_error(cleanup_error))
-    EHold(evidence) -> EHold(map_error(evidence))
+    EHold -> EHold
   }
 }
 
@@ -263,8 +263,9 @@ fn map_attempt_result(
 /// attempt's closures happen to return at run time (kept for the static
 /// `StepDescriptor`, which must not run any step to answer).
 /// `rolls_back_unknown` is the step's `saga.on_unknown(RollBack)`: whether
-/// an error classified unknown, with no decision to settle it, rolls the
-/// run back instead of ending it unresolved.
+/// an unknown outcome (a crash, a timeout, or an error classified unknown)
+/// with no decision to settle it rolls the run back instead of ending it
+/// unresolved.
 pub type Node(e, u) {
   Node(
     id: Int,
