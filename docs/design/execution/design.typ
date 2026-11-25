@@ -109,7 +109,7 @@
     #points(
       [A step callback receives one record. `step` receives the input only; `effect` receives the input and an opaque #term("term-effect-key"); `undo` receives UndoRequest(input, output, key); `compensate` receives FailedAttempt(input, failure, attempt, attempts_left, key). Callers read records by label and the key through its accessors (idempotency_key, attempt_number, attempt_key, correlation_of).],
       [The #term("term-correlation") of a run is mandatory and reaches every callback through its key. A local run takes a fresh unique correlation unless configured; a durable execution takes the saved one, or the key-derived default. A step's own clients attach it to join the run's observations.],
-      [A local key belongs to one run: its #term("term-idempotency-key") derives from 128 random bits drawn at start, so no other run, VM start, or node repeats it; it is unique, not stable across a second submission of the same business operation. A durable execution derives its keys from its execution id, so they survive restart.],
+      [A local key belongs to one run: its #term("term-idempotency-key") derives from a random value drawn at start, so no other run, VM start, or node repeats it; it is unique, not stable across a second submission of the same business operation. A durable execution derives its keys from its execution id, so they survive restart.],
       [`define` reports every definition defect together and panics naming the workflow and each offending step. `try_define` returns every DefinitionError for definitions built from runtime data, and `describe_definition_error` renders one. `map_errors` and `map_step_errors` adapt error vocabulary; no saga-owned error type is ever required.],
     )
   ]
