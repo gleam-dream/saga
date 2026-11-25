@@ -624,7 +624,7 @@ pub fn start_or_reconnect(
 }
 
 /// Reconnects to the execution saved under `id`, for example one that
-/// `unfinished` listed, without knowing its input. Fails with
+/// `list` returned, without knowing its input. Fails with
 /// `StorageFailure(NotFound)` when there is none.
 pub fn reconnect(
   persistence: Persistence(i, o, e, u),

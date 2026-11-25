@@ -77,7 +77,7 @@ versions and interrupted-effect resolvers are described in the main Saga README.
 `durable.drive` returns the workflow's typed outcome or `durable.Error` with its
 recovery information; `durable.error_kind` selects the next action.
 The same storage supports `durable.read`, `durable.cancel`, `durable.reconnect`
-and `durable.unfinished`. Retain a pool connection handle for storage; a
+and `durable.list`. Retain a pool connection handle for storage; a
 transaction-scoped connection is unsuitable as a reusable store across runners.
 
 ## Configuration
@@ -102,6 +102,8 @@ the selected schema's advisory lock; a repeat skips applied versions.
 application migration tool, which runs them in a transaction with `search_path` set
 to the target schema. The raw up file is not repeat-idempotent. The packaged down
 section drops retained execution data, and package `migrate` never runs it.
+Migration 2 moves checkpoints into one row per record and discards checkpoints
+saved by earlier releases: drain unfinished executions before applying it.
 
 ## Development
 

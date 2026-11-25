@@ -71,7 +71,12 @@ missing capture metadata prevents an exact environment reproduction.
 
 `cd bench && gleam run -m durable_writes` drives a chain of N durable steps on the in-memory adapter and counts the checkpoint commits, the bytes those commits carry and the calls of the step output encoder. Each step saves a 1 KB input and a 1 KB output. The counts are exact for a given revision; the time column is observational.
 
-A durable run commits when its saved state changes: twice per step in a chain (admission with the encoded input, then the result), plus three for the run. Each commit still carries the whole checkpoint, so the bytes committed grow with the square of the step count: about 93 MB for 200 steps in this workload. A completed step's values are encoded once per drive.
+A durable run commits when its saved state changes: twice per step in a chain (admission with the encoded input, then the result), plus three for the run. A commit writes the run header and the records of the steps that changed, so the bytes committed grow with the step count: about 0.7 MB for 200 steps in this workload, against 93 MB when every commit carried the whole checkpoint. The run header still holds the completion journal, so it grows by a few bytes per completed step. A completed step's values are encoded once per drive.
+
+| Steps | Whole checkpoint per commit: bytes | Records per commit: bytes |
+| ----: | ---------------------------------: | ------------------------: |
+|    50 |                          6,055,383 |                   177,176 |
+|   200 |                         93,439,892 |                   735,129 |
 
 ## Limits
 
