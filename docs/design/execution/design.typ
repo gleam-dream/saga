@@ -323,7 +323,7 @@
 ])
 
 #section(title: "Local ownership and reporting", lead: "The starting process owns execution, while outcome delivery may belong to a survivor.", body: [
-  #answers(title: "Local execution port", responsibility: [Start one owner-bound coordinator and expose its outcome, cancellation, and progress.], interface: [`run`, `start`, `await`, `start_reporting`, `cancel`, `progress`, `pid`, and `run_id`.], interactions: [Monitors starting process; ordinary handle delivers to that owner, reporting handle delivers once to its Subject.], invariants: [Only the ordinary starter may await. Reporting handles cannot await; cancel/progress work from any process.], failure: [InvalidConfig starts no work; ExecutionLost cannot prove no effect started. Await distinguishes timeout, NotOwner, consumed outcome, and typed Lost evidence.])
+  #answers(title: "Local execution port", responsibility: [Start one owner-bound coordinator and expose its outcome, cancellation, and progress.], interface: [`run`, `start`, `await`, `start_reporting`, `cancel`, `progress`, `pid`, and `run_id`.], interactions: [Monitors starting process; ordinary handle delivers to that owner, reporting handle delivers once to its Subject.], invariants: [Only the ordinary starter may await. Reporting handles cannot await; cancel/progress work from any process.], failure: [InvalidConfig starts no work. A coordinator admits no step before its starter confirms the startup handshake; when the handshake fails the starter stops the coordinator, so ExecutionLost from a start proves no step started. ExecutionLost from `run` after a started coordinator was lost cannot prove no effect started. Await distinguishes timeout, NotOwner, consumed outcome, and typed Lost evidence.])
   #points(
     [A successful ordinary await consumes the outcome and drains its monitor. A second await may first time out while the coordinator is exiting; AlreadyAwaited is guaranteed only after exit.],
     [A dropped handle after a timed-out await can leave its terminal outcome or monitor message in the owner mailbox. Cancellation requires a subsequent await to consume completion.],
@@ -335,7 +335,7 @@
       [Use this boundary within a per-invocation worker. Repeated use from a long-lived actor retains one receiver per invocation until that actor exits.],
       [rollback_within bounds owner-loss waiting when no coordinator was reported and bounds the notification worker. Once a known coordinator exists, its configured settlement/cleanup govern completion; rollback_within is not a global execution deadline.],
       [Readiness failure closes the startup reply channel, removes monitors, and preserves unrelated mail before any workflow launch. Normal result return and admission failure remove the caller's receiver monitor.],
-      [NotStarted is proven only for rejected rollback/configuration or prelaunch receiver failure. Lost execution handshake, receiver loss, and coordinator loss are Unknown; typed run_error/exit_reason accessors retain causes and safe describe_error excludes crash payloads.],
+      [NotStarted is proven only for rejected rollback/configuration, prelaunch receiver failure, or a lost execution handshake, whose coordinator is stopped before it admits a step. Receiver loss and coordinator loss are Unknown; typed run_error/exit_reason accessors retain causes and safe describe_error excludes crash payloads.],
     )
   ]
 ])

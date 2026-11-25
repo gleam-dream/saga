@@ -396,15 +396,23 @@ pub type Settings {
   )
 }
 
-/// Spawns a coordinator for one run and returns once it is alive, with its
-/// pid and the run's id. `build_graph` calls `saga.for_run` for this one
-/// run: the workflow's already-built node graph (built once, at `define`)
-/// plus a fresh run-scoped `Store` and the output-fetch thunk. `owner` is
-/// monitored: its exit is treated as a cancellation with `OwnerExited`.
-/// `deliver` is called once, from the coordinator process, with the run's
-/// terminal outcome, just before the coordinator exits. It is the only path
-/// by which an outcome leaves this process, and it runs whether or not
-/// `owner` is still alive.
+/// Spawns a coordinator for one run and completes its startup handshake:
+/// the coordinator answers with its control subject, then waits for this
+/// function's go-ahead before it admits any step. `Ok` carries the pid, the
+/// run's id and the control subject. `Error(Nil)` means no answer arrived
+/// within `handshake_timeout` milliseconds; the coordinator never received
+/// the go-ahead, has been killed, and is gone when this function returns, so
+/// no step of the run started.
+///
+/// `build_graph` calls `saga.for_run` for this one run: the workflow's
+/// already-built node graph (built once, at `define`) plus a fresh
+/// run-scoped `Store` and the output-fetch thunk. `owner` is monitored: its
+/// exit is treated as a cancellation with `OwnerExited`, and an owner that
+/// exits before the go-ahead cancels the run before any step. `deliver` is
+/// called once, from the coordinator process, with the run's terminal
+/// outcome, just before the coordinator exits. It is the only path by which
+/// an outcome leaves this process, and it runs whether or not `owner` is
+/// still alive.
 pub fn start(
   workflow_name workflow_name: String,
   owner owner: Pid,
@@ -418,10 +426,10 @@ pub fn start(
       fn(Store) -> ffi.RescueResult(o),
     ),
   deliver deliver: fn(Outcome(o, e, u)) -> Nil,
-  control_subject_out control_subject_out: Subject(Subject(Control(o, e, u))),
-) -> #(Pid, Int) {
+  handshake_timeout handshake_timeout: Int,
+) -> Result(#(Pid, Int, Subject(Control(o, e, u))), Nil) {
   let run_id = ffi.unique_integer()
-  let ready = process.new_subject()
+  let handshake = process.new_subject()
   let pid =
     process.spawn_unlinked(fn() {
       run(
@@ -431,21 +439,54 @@ pub fn start(
         settings,
         build_graph,
         deliver,
-        control_subject_out,
-        ready,
+        Some(handshake),
         None,
       )
     })
-  // This wait is a startup smoke-check, not the caller's actual failure
-  // path: whether or not `ready` arrives in time, `saga/execution.start`
-  // separately waits on `control_subject_out` (with its own bounded
-  // timeout) before handing back a usable `Execution`, and reports
-  // `ExecutionLost` if the coordinator never gets that far. A timeout here
-  // is therefore not silently swallowed overall — it is handled one level
-  // up, where a `Result` can actually be returned (`#(Pid, Int)` here has
-  // no room for one).
-  let _ = process.receive(ready, 5000)
-  #(pid, run_id)
+  case process.receive(handshake, handshake_timeout) {
+    Ok(Handshake(control:, begin:)) -> {
+      process.send(begin, Nil)
+      Ok(#(pid, run_id, control))
+    }
+    Error(Nil) -> {
+      // The coordinator waits for a go-ahead that is never sent, so killing
+      // it here stops a run that has admitted nothing. Wait for its exit,
+      // then remove an answer that arrived after the wait ended.
+      let monitor = process.monitor(pid)
+      process.kill(pid)
+      process.new_selector()
+      |> process.select_specific_monitor(monitor, fn(_down) { Nil })
+      |> process.selector_receive_forever
+      let _ = process.receive(handshake, 0)
+      Error(Nil)
+    }
+  }
+}
+
+/// A new coordinator's answer to its starter: where to send control
+/// messages, and where to send the go-ahead it waits for.
+type Handshake(o, e, u) {
+  Handshake(control: Subject(Control(o, e, u)), begin: Subject(Nil))
+}
+
+/// Sends the handshake to the starter and waits for its go-ahead. `False`
+/// means `owner` exited first: the run then admits nothing, and the owner's
+/// exit, still in the mailbox for `owner_monitor`, cancels it.
+fn await_go_ahead(
+  handshake: Subject(Handshake(o, e, u)),
+  control: Subject(Control(o, e, u)),
+  owner: Pid,
+) -> Bool {
+  let begin = process.new_subject()
+  process.send(handshake, Handshake(control:, begin:))
+  let waiting = process.monitor(owner)
+  let begun =
+    process.new_selector()
+    |> process.select_map(begin, fn(_go) { True })
+    |> process.select_specific_monitor(waiting, fn(_down) { False })
+    |> process.selector_receive_forever
+  process.demonitor_process(waiting)
+  begun
 }
 
 fn run(
@@ -462,16 +503,17 @@ fn run(
       fn(Store) -> ffi.RescueResult(o),
     ),
   deliver: fn(Outcome(o, e, u)) -> Nil,
-  control_subject_out: Subject(Subject(Control(o, e, u))),
-  ready: Subject(Nil),
+  handshake: Option(Subject(Handshake(o, e, u))),
   persistence: Option(Session(e, u)),
 ) -> Nil {
   process.trap_exits(True)
   let baseline_links = ffi.links()
   let control = process.new_subject()
   let owner_monitor = process.monitor(owner)
-  process.send(control_subject_out, control)
-  process.send(ready, Nil)
+  let begun = case handshake {
+    Some(handshake) -> await_go_ahead(handshake, control, owner)
+    None -> True
+  }
   let #(nodes, order, dependents, run_store, fetch_output) = build_graph()
   let node_state =
     dict.map_values(nodes, fn(_id, n) { NodeWaiting(list.length(n.deps)) })
@@ -574,7 +616,10 @@ fn run(
           Some(Session(cancelled: True, ..)) -> handle_cancel_request(initial)
           _ -> initial
         }
-        Continue(admit(initial))
+        case begun {
+          True -> Continue(admit(initial))
+          False -> Wait(initial)
+        }
       })
       |> follow(fetch_output, deliver)
   }
@@ -2726,8 +2771,6 @@ pub fn execute_saved(
   session: Session(e, u),
   deliver: fn(Outcome(o, e, u)) -> Nil,
 ) -> Nil {
-  let control_out = process.new_subject()
-  let ready = process.new_subject()
   run(
     workflow_name,
     owner,
@@ -2735,13 +2778,9 @@ pub fn execute_saved(
     settings,
     build_graph,
     deliver,
-    control_out,
-    ready,
+    None,
     Some(session),
   )
-  let _ = process.receive(control_out, 0)
-  let _ = process.receive(ready, 0)
-  Nil
 }
 
 /// The stable key base of node `id` in this run: the run's key scope and the
