@@ -16,7 +16,7 @@ packages = [
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
   { name = "json_blueprint", version = "2.2.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_json", "gleam_stdlib"], otp_app = "json_blueprint", source = "hex", outer_checksum = "83D33F1E5413FDB17CA70B9202DCAD23396AEB5A3C2247F15A22D4D5249968E1" },
   { name = "saga", version = "0.2.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_json", "gleam_otp", "gleam_stdlib", "gleam_time", "sinal"], source = "local", path = "../.." },
-  { name = "sinal", version = "0.1.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib", "telemetry"], otp_app = "sinal", source = "hex", outer_checksum = "358D776FDFD6B0BE56E6FA63BBE3FA8D5A9A05C2DDD256270E54E133EB4A71FC" },
+  { name = "sinal", version = "0.1.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib", "telemetry"], source = "git", repo = "https://github.com/gleam-dream/sinal.git", commit = "29ea7a90bf820b3c91eb3f76e824abe0d034d78f" },
   { name = "telemetry", version = "1.4.2", build_tools = ["rebar3"], requirements = [], otp_app = "telemetry", source = "hex", outer_checksum = "928F6495066506077862C0D1646609EED891A4326BEE3126BA54B60AF61FEBB1" },
 ]
 
@@ -28,4 +28,4 @@ gleam_time = { version = ">= 1.11.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 json_blueprint = { version = ">= 2.2.0 and < 3.0.0" }
 saga = { path = "../.." }
-sinal = { version = ">= 0.1.0 and < 0.2.0" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "29ea7a90bf820b3c91eb3f76e824abe0d034d78f" }
