@@ -1050,17 +1050,19 @@ fn start_attempt(
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let seq = ffi.unique_integer()
   let attempt = attempt_context(state, node_id, attempt_number, n.max_attempts)
+  // Bind the control subject first: a closure that read `state.control`
+  // would capture, and copy into the worker, the whole run state.
+  let control = state.control
   let attempt =
     node.Attempt(..attempt, admit: fn(input) {
       let reply = process.new_subject()
-      process.send(state.control, InputPrepared(node_id, seq, input, reply))
+      process.send(control, InputPrepared(node_id, seq, input, reply))
       process.receive_forever(reply)
     })
   let body = case set.contains(state.resume_nodes, node_id), n.persistence {
     True, Some(p) -> p.resume(attempt, state.store)
     _, _ -> n.prepare_attempt(attempt, state.store)
   }
-  let control = state.control
   let #(pid, permits) =
     spawn_task(state, fn() {
       case ffi.rescue(body) {
