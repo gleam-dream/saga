@@ -1613,3 +1613,88 @@ fn drain(from: process.Subject(a), seen: List(a)) -> List(a) {
     Error(Nil) -> list.reverse(seen)
   }
 }
+
+/// The bytes a durable run commits grow with its step count, not with its
+/// square: a chain four times as long commits at most twice as many bytes
+/// per step.
+pub fn committed_bytes_per_step_do_not_grow_with_the_chain_test() {
+  let per_step = fn(steps: Int) {
+    let payload = string.repeat("x", 1024)
+    let workflow =
+      saga.define("chain", fn(input) {
+        list.fold(numbers(steps, []), input, fn(port, number) {
+          saga.perform(
+            port,
+            text_step("step-" <> string.inspect(number), fn(_) { Ok(payload) }),
+          )
+        })
+      })
+    let store = start_memory()
+    let backend = memory.storage(store)
+    let sizes = process.new_subject()
+    let counting =
+      stores.with_commit(backend, fn(owner, change) {
+        process.send(
+          sizes,
+          dict.fold(change.records, 0, fn(total, _, bytes) {
+            total + bit_array.byte_size(bytes)
+          }),
+        )
+        storage.do_commit(backend, owner, change)
+      })
+    let assert Ok(execution.Completed(_)) =
+      drive(start(prepare(workflow), counting, "chain"))
+    memory.stop(store)
+    list.fold(drain(sizes, []), 0, fn(total, size) { total + size }) / steps
+  }
+  let short = per_step(10)
+  let long = per_step(40)
+  #(long <= 2 * short, short, long) |> should.equal(#(True, short, long))
+}
+
+fn numbers(up_to: Int, acc: List(Int)) -> List(Int) {
+  case up_to {
+    0 -> acc
+    _ -> numbers(up_to - 1, [up_to, ..acc])
+  }
+}
+
+/// A commit writes a step's record only when the step's saved state
+/// changed since the record was last written.
+pub fn a_commit_writes_only_changed_records_test() {
+  let workflow =
+    saga.define("chain", fn(input) {
+      list.fold(numbers(8, []), input, fn(port, number) {
+        saga.perform(
+          port,
+          text_step("step-" <> string.inspect(number), fn(value) {
+            Ok(value <> "!")
+          }),
+        )
+      })
+    })
+  let store = start_memory()
+  let backend = memory.storage(store)
+  let writes = process.new_subject()
+  let recording =
+    stores.with_commit(backend, fn(owner, change) {
+      process.send(writes, change.records)
+      storage.do_commit(backend, owner, change)
+    })
+  let assert Ok(execution.Completed(_)) =
+    drive(start(prepare(workflow), recording, "chain"))
+  memory.stop(store)
+  let #(_, rewrites) =
+    list.fold(drain(writes, []), #(dict.new(), 0), fn(acc, records) {
+      let #(last, rewrites) = acc
+      let rewrites =
+        dict.fold(records, rewrites, fn(rewrites, key, bytes) {
+          case key != "run" && dict.get(last, key) == Ok(bytes) {
+            True -> rewrites + 1
+            False -> rewrites
+          }
+        })
+      #(dict.merge(last, records), rewrites)
+    })
+  rewrites |> should.equal(0)
+}
