@@ -19,7 +19,7 @@ gleam_json = ">= 3.0.0 and < 4.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 # Sinal is required: the coordinator emits saga/telemetry events on every
 # run. Pinned to Sinal's unreleased redesign until its next Hex release.
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "29ea7a90bf820b3c91eb3f76e824abe0d034d78f" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "02d386e070c6a99900225c613e8d273f3bebe3c2" }
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
