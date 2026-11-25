@@ -9,6 +9,7 @@
 import bench_ffi
 import counter
 import gleam/bit_array
+import gleam/dict
 import gleam/erlang/process
 import gleam/int
 import gleam/io
@@ -99,16 +100,21 @@ fn measure(steps: Int, run: Int) -> #(Int, Int, Int, Int) {
   let sizes = process.new_subject()
   let counting =
     storage.new(
-      create: fn(id, data) { storage.do_create(backend, id, data) },
+      create: fn(id, records) { storage.do_create(backend, id, records) },
       load: fn(id) { storage.do_load(backend, id) },
       claim: fn(id) { storage.do_claim(backend, id) },
       commit: fn(owner, change) {
-        process.send(sizes, bit_array.byte_size(change.data))
+        process.send(
+          sizes,
+          dict.fold(change.records, 0, fn(total, _, bytes) {
+            total + bit_array.byte_size(bytes)
+          }),
+        )
         storage.do_commit(backend, owner, change)
       },
       release: fn(owner) { storage.do_release(backend, owner) },
       cancel: fn(id) { storage.do_cancel(backend, id) },
-      unfinished: fn(limit) { storage.do_unfinished(backend, limit) },
+      list: fn(listing) { storage.do_list(backend, listing) },
     )
   let id = int.to_string(steps) <> "-" <> int.to_string(run)
   let assert Ok(started) =

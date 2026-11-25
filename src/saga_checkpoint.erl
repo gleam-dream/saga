@@ -1,26 +1,31 @@
 -module(saga_checkpoint).
--export([encode_header/4,encode_node/1,decode/4,header/1]).
+-export([encode_identity/1,encode_header/4,encode_node/1,decode/4,header/1]).
 
 %% A checkpoint is saved as named records, so that a commit writes only what
-%% changed: <<"run">> holds the envelope without its input and step nodes
-%% (`{header, NodeCount, Envelope}`), <<"input">> the encoded run input, and
-%% <<"step/N">> the saved node at position N.
+%% changed. Written once: <<"identity">> holds `{identity, Id, Stamp}` and
+%% <<"input">> the encoded run input. Written as they change: <<"run">> holds
+%% the envelope without identity, input and step nodes
+%% (`{header, NodeCount, Envelope}`), and <<"step/N">> the saved node at
+%% position N.
 
 header(Records) ->
-    try binary_to_term(maps:get(<<"run">>,Records),[safe]) of
-        {header,_,{envelope,3,Ref,Stamp,_,_,_,_,_}} when is_binary(Ref),is_binary(Stamp) -> {ok,{Ref,Stamp}};
+    try binary_to_term(maps:get(<<"identity">>,Records),[safe]) of
+        {identity,Ref,Stamp} when is_binary(Ref),is_binary(Stamp) -> {ok,{Ref,Stamp}};
         _ -> {error,nil}
     catch _:_ -> {error,nil} end.
+
+encode_identity({envelope,_,Ref,Stamp,_,_,_,_,_}) ->
+    term_to_binary({identity,Ref,Stamp}).
 
 %% The schema is the full wire contract, including every nested variant.
 %% Only application output/error fields cross the supplied checked codecs.
 %% Neither arbitrary native terms nor executable runtime state are accepted.
-encode_header({envelope,F,Ref,Stamp,_Input,Snapshot,Outcome,Issue,Correlation},O,E,U) ->
+encode_header({envelope,F,_Ref,_Stamp,_Input,Snapshot,Outcome,Issue,Correlation},O,E,U) ->
     {Count,Bare}=case Snapshot of
         {some,{snapshot,Nodes,J,P,Fs,Un,D}} -> {length(Nodes),{some,{snapshot,[],J,P,Fs,Un,D}}};
         none -> {0,none}
     end,
-    try walk({envelope,F,Ref,Stamp,<<>>,Bare,Outcome,Issue,Correlation},envelope,{encode,O,E,U}) of
+    try walk({envelope,F,<<>>,<<>>,<<>>,Bare,Outcome,Issue,Correlation},envelope,{encode,O,E,U}) of
         Encoded -> {ok,term_to_binary({header,Count,Encoded})}
     catch throw:{codec,Type,Reason} -> {error,{codec_failure,boundary(Type),Reason}}; _:_ -> {error,{invalid_state,malformed}} end.
 
@@ -31,8 +36,9 @@ encode_node(Node) ->
 
 decode(Records,O,E,U) ->
     try
-        {header,Count,{envelope,F,Ref,Stamp,_,Snapshot,Outcome,Issue,Correlation}}=
+        {header,Count,{envelope,F,_,_,_,Snapshot,Outcome,Issue,Correlation}}=
             binary_to_term(maps:get(<<"run">>,Records),[safe]),
+        {ok,{Ref,Stamp}}=header(Records),
         true=is_integer(Count) andalso Count>=0,
         Nodes=[binary_to_term(maps:get(<<"step/",(integer_to_binary(I))/binary>>,Records),[safe])
                || I <- lists:seq(0,Count-1)],

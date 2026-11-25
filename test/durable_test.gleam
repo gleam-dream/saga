@@ -1041,7 +1041,7 @@ pub fn checkpoint_error_categories_remain_distinct_test() {
         expected_revision: storage.revision(stored),
         observed_cancelled: storage.cancelled(stored),
         phase: storage.Pending,
-        records: dict.from_list([#("run", <<"not a checkpoint":utf8>>)]),
+        records: dict.from_list([#("identity", <<"not a checkpoint":utf8>>)]),
       ),
     )
   let assert Ok(Nil) = storage.do_release(backend, owner)

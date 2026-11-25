@@ -442,8 +442,9 @@ pub type Status(o, e, u) {
 }
 
 /// The saved checkpoint, format 3. `saga_checkpoint.erl` saves it as named
-/// records: the run header, the input, and one record per step node, so a
-/// commit writes only the records that changed. `correlation` is `None`
+/// records: the identity (id and stamp) and the input, written once, then
+/// the run header and one record per step node, so a commit writes only the
+/// records that changed. `correlation` is `None`
 /// only for an execution that no drive has claimed yet: the first drive
 /// saves the value it uses, and every later drive reads it back.
 type Envelope(o, e, u) {
@@ -1306,8 +1307,8 @@ fn saved_correlation(
 }
 
 /// The records that save `next` when `saved` was saved before (`None` for a
-/// new execution): the run header always, the input when it is new, and
-/// each step node that differs from the saved one. Returns them with the
+/// new execution): the run header always, the identity and input when the
+/// execution is new, and each step node that differs from the saved one. Returns them with the
 /// size of every record of the resulting checkpoint.
 fn changed_records(
   saved: Option(Envelope(o, e, u)),
@@ -1338,7 +1339,10 @@ fn changed_records_within(
   let records = dict.from_list([#("run", run)])
   let records = case saved {
     Some(_) -> records
-    None -> dict.insert(records, "input", bit_array.from_string(next.input))
+    None ->
+      records
+      |> dict.insert("identity", encode_identity(next))
+      |> dict.insert("input", bit_array.from_string(next.input))
   }
   use records <- result.try(changed_nodes(
     option.map(saved, saved_nodes) |> option.unwrap([]),
@@ -1385,6 +1389,9 @@ fn changed_nodes(
     }
   }
 }
+
+@external(erlang, "saga_checkpoint", "encode_identity")
+fn encode_identity(envelope: Envelope(o, e, u)) -> BitArray
 
 @external(erlang, "saga_checkpoint", "encode_header")
 fn encode_header(

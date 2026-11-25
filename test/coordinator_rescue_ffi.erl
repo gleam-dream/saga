@@ -26,5 +26,6 @@ cause_round_trips() ->
                 {some, {failed, Cause, Settlement}}, none, none},
     Same = fun(Value) -> {ok, Value} end,
     {ok, Run} = saga_checkpoint:encode_header(Envelope, Same, Same, Same),
-    Records = #{<<"run">> => Run, <<"input">> => <<"input">>},
+    Records = #{<<"identity">> => saga_checkpoint:encode_identity(Envelope),
+                <<"run">> => Run, <<"input">> => <<"input">>},
     {ok, Envelope} =:= saga_checkpoint:decode(Records, Same, Same, Same).
