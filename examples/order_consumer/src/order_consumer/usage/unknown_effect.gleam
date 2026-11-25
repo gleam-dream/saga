@@ -28,7 +28,7 @@ pub fn run() -> Nil {
   }
   let reserved = saga.StepAddress([], "reserve_inventory", 1)
   // By default the run holds the reservation for reconciliation.
-  let assert Ok(execution.Unresolved(_, MaybeCharged, settlement)) =
+  let assert Ok(execution.Unresolved(_, saga.Returned(MaybeCharged), settlement)) =
     execution.run(checkout(charge), "o-4", execution.config())
   let assert [held] = settlement.held
   let assert True = held == reserved

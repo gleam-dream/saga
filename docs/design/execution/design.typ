@@ -228,12 +228,11 @@
     [Continue(output, undo)], [Accept replacement output and its undo capability], [Replacement completion is known; original uncertain attempt remains unknown.],
     [Abort(error)], [Fail and permit reverse undo of known completions], [Native application cause plus earlier unknown effects.],
     [AbortAfterCleanupFailure(error, undo_error)], [Same rollback permission], [Separate compensation cleanup failure.],
-    [Hold(evidence)], [End Unresolved after siblings settle; do not undo], [Native held evidence and every completed step left in place.],
+    [Hold], [End Unresolved after siblings settle; do not undo], [The held attempt failure and every completed step left in place.],
   ))
   #points(
-    [`unknown_when` marks returned business errors whose external effect may have happened. Without a deciding compensation, default `on_unknown(Reconcile)` preserves completed reservations; explicit `RollBack` permits their undo.],
-    [Exhausted retry of a marked uncertain error follows the same Hold/RollBack policy. An explicit Abort permits rollback even after a marked error.],
-    [Crashes and timeouts without a decider fail and roll back known completions while retaining the crashed/timed-out action as unknown. A decider's Abort may produce StepFailed after a crash; the cause alone cannot establish known effects.],
+    [A step's outcome is unknown when its attempt crashes, times out, or returns a business error that `unknown_when` marks, and when its decider crashes or times out. One rule governs all of them: without a deciding compensation, default `on_unknown(Reconcile)` ends the run Unresolved with that failure and preserves completed reservations; explicit `RollBack` permits their undo.],
+    [Exhausted retry after an unknown last attempt follows the same Reconcile/RollBack policy. An explicit Abort permits rollback even after an unknown outcome; a decider's Abort may produce StepFailed after a crash, so the cause alone cannot establish known effects.],
     [Applications own downstream idempotency and reconciliation evidence. Passing an idempotency key alone never proves provider deduplication or exactly-once effects.],
   )
   #behavior(title: "An uncertain retry cannot become clean completion", area: "Unknown effects", level: "boundary")[
@@ -247,7 +246,7 @@
     #then[The outcome is Unresolved and completed steps remain held.]
     #then[No earlier completion is claimed as reversed.]
   ]
-  #points([The uncertainty and rollback decisions are recorded in #adr(3).])
+  #points([The uncertainty and rollback decisions are recorded in #adr(3); the single rule for unknown outcomes is #adr(16).])
 ])
 
 #section(title: "Outcome and settlement", lead: "One full typed report is the authority for application and operational evidence.", body: [
