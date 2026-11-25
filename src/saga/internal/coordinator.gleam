@@ -3172,9 +3172,13 @@ fn attempt_context(
     number,
     maximum - number,
     step_base(state, id),
-    case state.persistence {
-      Some(Session(cancelled: True, ..)) -> True
-      _ -> False
+    // A stopping run admits no new work: a recorded cancellation, or a
+    // phase past running, means an interrupted attempt proven absent stays
+    // absent.
+    case state.persistence, state.phase {
+      Some(Session(cancelled: True, ..)), _ -> True
+      _, PhaseSettling(..) | _, PhaseRollingBack(..) -> True
+      _, PhaseRunning -> False
     },
     option.is_some(state.persistence),
     dict.get(state.inputs, id) |> option.from_result,

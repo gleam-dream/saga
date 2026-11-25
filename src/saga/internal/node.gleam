@@ -25,13 +25,15 @@ pub type StepAddress {
 
 /// One attempt as the coordinator dispatches it. `base` is the step's stable
 /// key within its execution (`<bytes>:<execution>:<position>`), from which
-/// `saga` derives every public `EffectKey` of the step.
+/// `saga` derives every public `EffectKey` of the step. `stopping` is true
+/// when the run was cancelled or is settling or rolling back, so a resumed
+/// attempt proven absent must not start.
 pub type Attempt {
   Attempt(
     number: Int,
     remaining: Int,
     base: String,
-    cancelled: Bool,
+    stopping: Bool,
     persistent: Bool,
     saved_input: Option(String),
     admit: fn(String) -> Nil,

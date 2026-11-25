@@ -1428,7 +1428,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                 Ok(input) ->
                   case attempt.saved_input {
                     None ->
-                      case attempt.cancelled {
+                      case attempt.stopping {
                         True -> node.AttemptAbsent
                         False -> prepare_attempt(attempt, run_store)()
                       }
@@ -1443,7 +1443,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                             )),
                           )
                         ResumedNotSent ->
-                          case attempt.cancelled {
+                          case attempt.stopping {
                             True -> node.AttemptAbsent
                             False -> prepare_attempt(attempt, run_store)()
                           }

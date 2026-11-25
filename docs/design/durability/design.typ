@@ -89,6 +89,7 @@
     [Compensation admitted without decision], [Compensation resolver], [Some applies original-budget decision; None suspends; never repeats original decider.],
     [Marked uncertain returned error], [Retain unknown evidence and saved decision], [Uncommitted attempt uses effect resolver; interrupted decision uses compensation resolver.],
     [Cancellation already recorded], [Reconcile admitted actions before rollback], [NotSent does not start a new effect during cancellation.],
+    [Failure or deadline already settling], [Reconcile admitted actions before rollback], [NotSent, or an attempt with no saved input, does not start a new effect while the run settles.],
   ))
   #behavior(title: "A saved success is reused after runner loss", area: "Recovery", level: "boundary")[
     #given[A step's successful output was committed before the runner stopped.]

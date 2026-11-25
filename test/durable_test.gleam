@@ -1560,3 +1560,81 @@ pub fn classified_resolver_failure_follows_on_unknown_test() {
   process.receive(released, 1000) |> should.equal(Ok(Nil))
   memory.stop(store)
 }
+
+/// A sibling fails while `effect` is in flight, the run starts settling, and
+/// the runner is lost. The resolver then proves `effect` was never sent. A
+/// settling run admits no new work, so the next drive must not send it.
+pub fn settling_resume_does_not_start_a_proven_unsent_effect_test() {
+  let entered = process.new_subject()
+  let failing = process.new_subject()
+  let owner = process.new_subject()
+  let commits = process.new_subject()
+  let effect =
+    saga.step("effect", fn(value) {
+      process.send(entered, Nil)
+      process.sleep_forever()
+      Ok(value)
+    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.NotSent },
+    )
+  let fail =
+    text_step("fail", fn(_) {
+      let release = process.new_subject()
+      process.send(failing, release)
+      process.receive_forever(release)
+      Error("boom")
+    })
+  let workflow =
+    saga.define("settling-resume", fn(input) {
+      saga.both(saga.perform(input, effect), saga.perform(input, fail))
+      |> saga.map(fn(pair) { pair.0 <> pair.1 })
+    })
+  let persistence =
+    durable.new(
+      workflow,
+      input: codec.text(),
+      output: codec.text(),
+      error: codec.text(),
+      undo_error: codec.text(),
+    )
+    |> durable.with_config(
+      execution.config()
+      |> execution.with_step_timeout(execution.Infinity)
+      |> execution.with_settle_timeout(duration.seconds(2)),
+    )
+  let store = start_memory()
+  let watched = stores.watched(memory.storage(store), owner)
+  let backend =
+    stores.with_commit(watched, fn(claim, change) {
+      let saved = storage.do_commit(watched, claim, change)
+      process.send(commits, Nil)
+      saved
+    })
+  let run = start(persistence, backend, "settling-resume")
+  let result = drive_later(run)
+  let assert Ok(pid) = process.receive(owner, 1000)
+  let assert Ok(Nil) = process.receive(entered, 1000)
+  let assert Ok(release) = process.receive(failing, 1000)
+  // Both steps run, so every admission is committed. The next commit saves
+  // the failure and the settling phase.
+  let _ = drain(commits, [])
+  process.send(release, Nil)
+  let assert Ok(Nil) = process.receive(commits, 1000)
+  kill_and_wait(pid)
+  let _ = process.receive(result, 1000)
+  let assert Ok(execution.Failed(execution.StepFailed(_, "boom"), _)) =
+    drive(reconnect(persistence, backend, "settling-resume"))
+  process.receive(entered, 0) |> should.equal(Error(Nil))
+  memory.stop(store)
+}
+
+fn drain(from: process.Subject(a), seen: List(a)) -> List(a) {
+  case process.receive(from, 0) {
+    Ok(value) -> drain(from, [value, ..seen])
+    Error(Nil) -> list.reverse(seen)
+  }
+}
