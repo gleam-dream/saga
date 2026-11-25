@@ -17,9 +17,10 @@
 //// step a stable `EffectKey` to send downstream as an idempotency key.
 //// `undo` registers the action that reverses a completed step when a later
 //// step fails; `compensate` decides, after a failed attempt, whether to
-//// retry, continue with a substitute output, abort, or hold; `unknown_when`
-//// names the returned errors after which the step's effect is unknown, and
-//// such an error holds the run for reconciliation unless `on_unknown`
+//// retry, continue with a substitute output, abort, or hold. A step's
+//// outcome is unknown when its attempt crashes, times out, or returns an
+//// error that `unknown_when` names; with no decision to settle it, an
+//// unknown outcome holds the run for reconciliation unless `on_unknown`
 //// opts into rollback.
 //// `embed` and `map_errors` compose one workflow into another.
 //// `saga/durable` adds what a step needs to recover after a restart.
@@ -266,15 +267,16 @@ pub fn failure_from_node(failure: node.AttemptFailure(e)) -> AttemptFailure(e) {
 /// `execution.with_max_retry_delay`); `Continue` accepts a replacement
 /// output with its own undo; `Abort` fails the run and permits rollback of
 /// completed steps; `AbortAfterCleanupFailure` additionally records a
-/// cleanup error that happened while deciding; `Hold` leaves prior effects
-/// unresolved with no rollback authority. The union is closed.
+/// cleanup error that happened while deciding; `Hold` ends the run
+/// `execution.Unresolved` with the decided attempt's failure, leaving prior
+/// effects in place with no rollback authority. The union is closed.
 pub type Recovery(o, e, u) {
   Retry
   RetryAfter(delay: Duration)
   Continue(output: o, undo: Undo(u))
   Abort(error: e)
   AbortAfterCleanupFailure(error: e, cleanup_error: u)
-  Hold(evidence: e)
+  Hold
 }
 
 /// Whether a successful (or `Continue`d) output has an undo action.
@@ -493,7 +495,8 @@ pub fn undo(
 
 /// Attaches an explicit recovery decision for a *failing* attempt (an
 /// application error, a crash, or a timeout), with a total attempt budget.
-/// With no `compensate`, a failure aborts after exactly one attempt.
+/// With no `compensate`, a step has exactly one attempt: a known failure
+/// fails the run, and an unknown outcome follows `on_unknown`.
 ///
 /// **A crash stays visible whatever `decide` returns.** `decide` receives
 /// `Crashed`/`TimedOut` for an attempt that never returned, whose effect may
@@ -547,21 +550,13 @@ pub fn compensate(
 
 /// Marks the returned errors after which the step's effect is unknown: a
 /// timeout or connection loss after the request may have been sent, for
-/// example. The attempt is named in the outcome's
-/// `execution.unknown_effects` with `execution.ActionReturnedUnknown`, so a
-/// retried success becomes `CompletedWithUnknownEffects`. Calling it twice
-/// marks the errors either classifier matches.
-///
-/// A matching error still reaches the `compensate` decider as
-/// `Returned(error)`, and the decider's decision applies: `Abort` rolls the
-/// run back, `Hold` ends it `Unresolved`. When the step has no decider, or
-/// its decider asked for a retry the attempt budget no longer allows, the
-/// step ends as `on_unknown` says: by default (`Reconcile`) the run ends
-/// `execution.Unresolved` with the error as evidence and undoes nothing, so
-/// an uncertain payment never releases the stock reserved before it.
-/// `on_unknown(RollBack)` fails the run and undoes the completed steps
-/// instead. Durable runs apply the same rule to an error that a recovery
-/// resolver reports after a restart.
+/// example. Such an error is an unknown outcome, like an attempt that
+/// crashed or timed out, and follows the same rule (see `on_unknown`). The
+/// attempt is named in the outcome's `execution.unknown_effects` with
+/// `execution.ActionReturnedUnknown`, so a retried success becomes
+/// `CompletedWithUnknownEffects`. Calling it twice marks the errors either
+/// classifier matches. Durable runs apply the same rule to an error that a
+/// recovery resolver reports after a restart.
 pub fn unknown_when(
   step: Step(i, o, e, u),
   classify: fn(e) -> Bool,
@@ -590,20 +585,28 @@ pub fn unknown_when(
   )
 }
 
-/// What a run does when a step ends with an error that `unknown_when`
-/// classified and no `compensate` decision settles it. The union is closed.
+/// What a run does when a step's outcome is unknown and no `compensate`
+/// decision settles it. An outcome is unknown when an attempt crashes (or
+/// its process exits), outlives its timeout, or returns an error that
+/// `unknown_when` classified, and when the step's `compensate` decider
+/// itself crashes or times out. No decision settles it when the step has no
+/// decider, when the decider crashed or timed out, or when the decider
+/// asked for a retry the attempt budget no longer allows. A decider's
+/// explicit decision always applies: `Abort` rolls the run back, `Hold`
+/// holds it. The union is closed.
 pub type OnUnknown {
-  /// End the run `execution.Unresolved` with the error as evidence and undo
-  /// nothing, so the effect can be reconciled first. The default.
+  /// End the run `execution.Unresolved` with the attempt's failure and undo
+  /// nothing, so the effect can be reconciled first: an uncertain payment
+  /// never releases the stock reserved before it. The default.
   Reconcile
-  /// Fail the run with `execution.StepFailed` (or `RetryLimitReached`) and
-  /// undo the completed steps, as for a known error.
+  /// Fail the run (`execution.StepFailed`, `StepCrashed`, `StepTimedOut`
+  /// or `RetryLimitReached`) and undo the completed steps, as for a known
+  /// error.
   RollBack
 }
 
-/// Sets what the run does when this step ends with an error that
-/// `unknown_when` classified (default `Reconcile`); see `unknown_when`.
-/// Crashes and timeouts are not affected.
+/// Sets what the run does when this step's outcome is unknown and no
+/// decision settles it (default `Reconcile`); see `OnUnknown`.
 pub fn on_unknown(
   step: Step(i, o, e, u),
   policy: OnUnknown,
@@ -737,7 +740,7 @@ fn map_recovery(
     Abort(error) -> Abort(map_error(error))
     AbortAfterCleanupFailure(error, cleanup_error) ->
       AbortAfterCleanupFailure(map_error(error), map_undo_error(cleanup_error))
-    Hold(evidence) -> Hold(map_error(evidence))
+    Hold -> Hold
   }
 }
 
@@ -1120,7 +1123,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
       Abort(error) -> node.EAbort(error)
       AbortAfterCleanupFailure(error, cleanup_error) ->
         node.EAbortCleanup(error, cleanup_error)
-      Hold(evidence) -> node.EHold(evidence)
+      Hold -> node.EHold
     }
   }
 

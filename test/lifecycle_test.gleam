@@ -109,12 +109,9 @@ pub fn step_timeout_reports_timed_out_test() {
 
   probe.with_run(workflow, 0, execution.config(), fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
-    let assert Ok(execution.Failed(cause, _settlement)) =
+    let assert Ok(execution.Unresolved(step, saga.TimedOut, _settlement)) =
       execution.await(exec, duration.seconds(10))
-    case cause {
-      execution.StepTimedOut(step) -> step.name |> should.equal("blocked")
-      _ -> panic as "expected StepTimedOut(blocked)"
-    }
+    step.name |> should.equal("blocked")
   })
 }
 
@@ -239,9 +236,9 @@ pub fn undo_timeout_recorded_and_rollback_continues_test() {
   })
 }
 
-/// A compensation decider's `cleanup_timeout` fires: it is killed, recorded
-/// as `CompensationTimedOut`, and the step's own failure is still the
-/// terminal cause.
+/// A compensation decider's `cleanup_timeout` fires: it is killed and
+/// recorded as `CompensationTimedOut`. Its outcome is unknown, so by default
+/// the run holds the step.
 pub fn compensation_timeout_recorded_test() {
   let gate = probe.new_gate()
   let workflow =
@@ -262,12 +259,9 @@ pub fn compensation_timeout_recorded_test() {
 
   probe.with_run(workflow, 0, config, fn(exec) {
     let assert Ok(_pid) = probe.wait_entered(gate, 10_000)
-    let assert Ok(execution.Failed(cause, settlement)) =
+    let assert Ok(execution.Unresolved(step, saga.TimedOut, settlement)) =
       execution.await(exec, duration.seconds(10))
-    case cause {
-      execution.StepTimedOut(step) -> step.name |> should.equal("s")
-      _ -> panic as "expected StepTimedOut(s) from the killed compensation"
-    }
+    step.name |> should.equal("s")
     case settlement.compensation_failures {
       [execution.CompensationTimedOut(step)] -> step.name |> should.equal("s")
       _ -> panic as "expected a single CompensationTimedOut(s)"

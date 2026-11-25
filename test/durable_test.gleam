@@ -935,8 +935,8 @@ pub fn compensation_recovery_preserves_abort_and_cleanup_test() {
 }
 
 pub fn compensation_recovery_preserves_hold_test() {
-  let assert execution.Unresolved(_, "mapped evidence", _) =
-    resolve_interrupted(saga.Hold("evidence"), 2, False)
+  let assert execution.Unresolved(_, saga.Returned("mapped original"), _) =
+    resolve_interrupted(saga.Hold, 2, False)
 }
 
 pub fn compensation_recovery_cancellation_supersedes_retry_test() {
@@ -1557,7 +1557,11 @@ pub fn classified_resolver_failure_follows_on_unknown_test() {
     resumed
   }
   let assert Ok(held) = interrupt("held", saga.Reconcile)
-  let assert execution.Unresolved(step, "maybe charged", settlement) = held
+  let assert execution.Unresolved(
+    step,
+    saga.Returned("maybe charged"),
+    settlement,
+  ) = held
   step |> should.equal(at("charge"))
   settlement.held |> should.equal([at("reserve")])
   let assert [unknown] = execution.unknown_effects(held)

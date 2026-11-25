@@ -106,7 +106,7 @@ fn payment_workflow(
       case failed.failure {
         saga.Returned(MaybeCharged) -> saga.Retry
         saga.Returned(error) -> saga.Abort(error)
-        saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
+        saga.Crashed(_) | saga.TimedOut -> saga.Hold
       }
     })
     |> durable.restore_undo(fn(_undo) { saga.NoUndo })

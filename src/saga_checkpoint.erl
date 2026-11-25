@@ -108,10 +108,10 @@ schema(progress) -> [{waiting,[]},{attempting,[natural]},{compensating,[natural]
     {retry_scheduled,[natural]},{succeeded,[]},{failed_step,[]},{interrupted,[]},
     {undoing,[]},{undone,[]},{undo_failed_step,[]},{skipped,[]}];
 schema(phase) -> [{saved_running,[]},{saved_settling,[trigger,settlement]},{saved_rollback,[trigger,settlement]}];
-schema(trigger) -> [{trigger_failure,[cause]},{trigger_unresolved,[address,error]},{trigger_cancel,[cancel]}];
+schema(trigger) -> [{trigger_failure,[cause]},{trigger_unresolved,[address,failure]},{trigger_cancel,[cancel]}];
 schema(cancel) -> [{cancel_requested,[]},{owner_exited,[]}];
 schema(outcome) -> [{completed,[output]},{completed_with_unknown_effects,[output,{list,unknown}]},
-    {failed,[cause,settlement]},{cancelled,[cancel,settlement]},{unresolved,[address,error,settlement]}];
+    {failed,[cause,settlement]},{cancelled,[cancel,settlement]},{unresolved,[address,failure,settlement]}];
 schema(cause) -> [{step_failed,[address,error]},{step_crashed,[address,crash]},
     {step_timed_out,[address]},{retry_limit_reached,[address,failure]},
     {retry_superseded,[address,failure]},{output_crashed,[crash]},{deadline_exceeded,[]},
