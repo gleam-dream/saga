@@ -96,10 +96,14 @@ pub type StepAddress {
 ///   step passes it on to the clients it calls, for example
 ///   `http_gun.with_correlation`, so their events join the run's.
 ///
-/// A local run derives the idempotency key from its run id, which is new for
-/// every `execution.run`; a durable execution derives it from the id given
-/// to `durable.start_or_reconnect`, so it survives restarts. The text of a
-/// key is opaque: compare and store it, never parse it.
+/// A local run derives the idempotency key from 128 random bits drawn when
+/// the run starts, so no other run produces it, in this VM, after a restart
+/// or on another node. The key is unique, not stable: running the same
+/// business operation again is a new run with new keys, and a provider will
+/// not recognise it as a repeat. A durable execution derives the key from the
+/// id given to `durable.start_or_reconnect`, so it survives restarts and
+/// identifies the business operation. The text of a key is opaque: compare
+/// and store it, never parse it.
 ///
 /// `saga.step` receives only the step's input: use `saga.effect` for a step
 /// that needs the context. `undo` and `compensate` receive it as `key`.

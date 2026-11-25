@@ -135,7 +135,7 @@ pub fn checkout() {
 
 <!-- prettier-ignore-end -->
 
-Only a known successful step enters the undo journal, and each undo callback is attempted once. Saga cannot reverse a provider request or a committed database write on its own. Use the `EffectKey` idempotency key with the external provider, and make recovery decisions from authoritative application evidence.
+Only a known successful step enters the undo journal, and each undo callback is attempted once. Saga cannot reverse a provider request or a committed database write on its own. Use the `EffectKey` idempotency key with the external provider, and make recovery decisions from authoritative application evidence. A local run's key is random per run: it is the same for every attempt inside that run and is never repeated by another run, a restarted VM or another node. Submitting the same order again starts a new run with new keys, so use `saga/durable` with a stable execution id when a repeat of the business operation must deduplicate.
 
 ## Configure and run
 

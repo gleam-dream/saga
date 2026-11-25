@@ -7,6 +7,10 @@ licenses = ["Apache-2.0"]
 description = "A strongly-typed saga/DAG orchestrator for Gleam: typed dependency graphs instead of dynamic step maps."
 repository = { type = "github", user = "gleam-dream", repo = "saga" }
 
+[erlang]
+# A local run draws its idempotency key scope from `crypto`.
+extra_applications = ["crypto"]
+
 [dependencies]
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"

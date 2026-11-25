@@ -289,6 +289,10 @@ type RunState(o, e, u) {
     deadline_at: Option(Int),
     workflow_name: String,
     run_id: Int,
+    // What every stable key of this run starts from: the durable execution
+    // id, or 128 random bits drawn for this local run. `run_id` is a counter
+    // of this VM and restarts with it, so it names the run in telemetry only.
+    key_scope: String,
     control: Subject(Control(o, e, u)),
     nodes: Dict(Int, Node(e, u)),
     order: List(Int),
@@ -517,6 +521,10 @@ fn run(
       deadline_at: option.map(deadline, fn(ms) { ffi.system_time() + ms }),
       workflow_name: workflow_name,
       run_id: run_id,
+      key_scope: case persistence {
+        Some(session) -> session.execution_id
+        None -> ffi.random_token()
+      },
       control: control,
       nodes: nodes,
       order: order,
@@ -2736,13 +2744,11 @@ pub fn execute_saved(
   Nil
 }
 
-/// The stable key base of node `id` in this run: the durable execution id,
-/// or the local run id, and the node's position in the checked definition.
+/// The stable key base of node `id` in this run: the run's key scope and the
+/// node's position in the checked definition. A local scope is random, so no
+/// other run, VM start or node produces the same base.
 fn step_base(state: RunState(o, e, u), id: Int) -> String {
-  let execution = case state.persistence {
-    Some(session) -> session.execution_id
-    None -> int.to_string(state.run_id)
-  }
+  let execution = state.key_scope
   let position = dict.get(state.positions, id) |> result.unwrap(-1)
   int.to_string(string.byte_size(execution))
   <> ":"

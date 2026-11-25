@@ -5,6 +5,7 @@
     rescue_redacted/5,
     schedulers_online/0,
     unique_integer/0,
+    random_token/0,
     monotonic_time/0,
     system_time/0,
     identity/1,
@@ -73,6 +74,9 @@ schedulers_online() ->
 
 unique_integer() ->
     erlang:unique_integer([positive, monotonic]).
+
+random_token() ->
+    binary:encode_hex(crypto:strong_rand_bytes(16), lowercase).
 
 monotonic_time() ->
     erlang:monotonic_time(millisecond).

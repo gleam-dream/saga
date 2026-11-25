@@ -67,7 +67,14 @@ pub fn links() -> List(process.Pid)
 @external(erlang, "saga_ffi", "schedulers_online")
 pub fn schedulers_online() -> Int
 
-/// A fresh, monotonically increasing positive integer. Used for node ids and
+/// 128 bits from the operating system's cryptographic random source, as 32
+/// lowercase hexadecimal characters. Unlike `unique_integer`, the value does
+/// not repeat after a VM restart or on another node.
+@external(erlang, "saga_ffi", "random_token")
+pub fn random_token() -> String
+
+/// A fresh, monotonically increasing positive integer of this VM, which starts
+/// again from 1 at every boot. Used for node ids and
 /// per-attempt correlation sequences.
 @external(erlang, "saga_ffi", "unique_integer")
 pub fn unique_integer() -> Int
