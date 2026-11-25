@@ -36,9 +36,11 @@ import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
+import gleam/string
 import saga/internal/ffi
 import saga/storage.{type Claim, type Storage, type Stored}
 
@@ -49,17 +51,21 @@ pub opaque type Memory {
 
 /// The store's messages; only this module sends them.
 pub opaque type Message {
-  Create(id: String, data: BitArray, reply: Subject(Result(Stored, Error)))
+  Create(
+    id: String,
+    records: Dict(String, BitArray),
+    reply: Subject(Result(Nil, Error)),
+  )
   Load(id: String, reply: Subject(Result(Stored, Error)))
   Take(id: String, from: Pid, reply: Subject(Result(#(Claim, Stored), Error)))
   Commit(
     claim: Claim,
     commit: storage.Commit,
-    reply: Subject(Result(Stored, Error)),
+    reply: Subject(Result(Nil, Error)),
   )
   Release(claim: Claim, reply: Subject(Result(Nil, Error)))
   Cancel(id: String, reply: Subject(Result(Nil, Error)))
-  Unfinished(limit: Int, reply: Subject(Result(List(String), Error)))
+  List(listing: storage.Listing, reply: Subject(Result(List(String), Error)))
   OwnerDown(down: process.Down)
   Shutdown
 }
@@ -73,18 +79,17 @@ type Owner {
 
 type Entry {
   Entry(
-    order: Int,
     revision: Int,
     generation: Int,
     cancelled: Bool,
     phase: storage.Phase,
-    data: BitArray,
+    records: Dict(String, BitArray),
     owner: Option(Owner),
   )
 }
 
 type State {
-  State(entries: Dict(String, Entry), next: Int)
+  State(entries: Dict(String, Entry))
 }
 
 /// Starts a store linked to the calling process.
@@ -119,7 +124,7 @@ fn builder(
         process.new_selector()
         |> process.select(subject)
         |> process.select_monitors(OwnerDown)
-      actor.initialised(State(dict.new(), 0))
+      actor.initialised(State(dict.new()))
       |> actor.selecting(selector)
       |> actor.returning(Memory(subject))
       |> Ok
@@ -134,13 +139,13 @@ fn builder(
 /// The `Storage` operations of this store.
 pub fn storage(memory: Memory) -> Storage {
   storage.new(
-    create: fn(id, data) { request(memory, Create(id, data, _)) },
+    create: fn(id, records) { request(memory, Create(id, records, _)) },
     load: fn(id) { request(memory, Load(id, _)) },
     claim: fn(id) { request(memory, Take(id, process.self(), _)) },
     commit: fn(claim, commit) { request(memory, Commit(claim, commit, _)) },
     release: fn(claim) { request(memory, Release(claim, _)) },
     cancel: fn(id) { request(memory, Cancel(id, _)) },
-    unfinished: fn(limit) { request(memory, Unfinished(limit, _)) },
+    list: fn(listing) { request(memory, List(listing, _)) },
   )
 }
 
@@ -175,26 +180,22 @@ fn stored(entry: Entry) -> Stored {
     revision: entry.revision,
     generation: entry.generation,
     cancelled: entry.cancelled,
-    data: entry.data,
+    records: entry.records,
   )
 }
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
-    Create(id, data, reply) ->
+    Create(id, records, reply) ->
       case dict.get(state.entries, id) {
         Ok(_) -> {
           process.send(reply, Error(storage.AlreadyExists))
           actor.continue(state)
         }
         Error(Nil) -> {
-          let entry =
-            Entry(state.next, 0, 0, False, storage.Pending, data, None)
-          process.send(reply, Ok(stored(entry)))
-          actor.continue(State(
-            dict.insert(state.entries, id, entry),
-            state.next + 1,
-          ))
+          let entry = Entry(0, 0, False, storage.Pending, records, None)
+          process.send(reply, Ok(Nil))
+          actor.continue(put(state, id, entry))
         }
       }
     Load(id, reply) -> {
@@ -250,9 +251,9 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
                   ..entry,
                   revision: entry.revision + 1,
                   phase: commit.phase,
-                  data: commit.data,
+                  records: dict.merge(entry.records, commit.records),
                 )
-              process.send(reply, Ok(stored(entry)))
+              process.send(reply, Ok(Nil))
               actor.continue(put(state, storage.claim_id(claim), entry))
             }
           }
@@ -286,16 +287,22 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
           actor.continue(put(state, id, Entry(..entry, cancelled: True)))
         }
       }
-    Unfinished(limit, reply) -> {
+    List(storage.Listing(phase:, after:, limit:), reply) -> {
       let ids =
         dict.to_list(state.entries)
-        |> list.filter(fn(pair) {
-          let entry = pair.1
-          entry.owner == None && entry.phase != storage.Finished
+        |> list.filter_map(fn(pair) {
+          let #(id, entry) = pair
+          let later = case after {
+            Some(after) -> string.compare(id, after) == order.Gt
+            None -> True
+          }
+          case later && entry.owner == None && entry.phase == phase {
+            True -> Ok(id)
+            False -> Error(Nil)
+          }
         })
-        |> list.sort(fn(a, b) { int.compare({ a.1 }.order, { b.1 }.order) })
+        |> list.sort(string.compare)
         |> list.take(limit)
-        |> list.map(fn(pair) { pair.0 })
       process.send(reply, Ok(ids))
       actor.continue(state)
     }
@@ -308,7 +315,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
             _ -> entry
           }
         })
-      actor.continue(State(..state, entries: entries))
+      actor.continue(State(entries: entries))
     }
     OwnerDown(process.PortDown(..)) -> actor.continue(state)
     Shutdown -> actor.stop()
@@ -331,5 +338,5 @@ fn owned(state: State, claim: Claim) -> Result(Entry, Error) {
 }
 
 fn put(state: State, id: String, entry: Entry) -> State {
-  State(..state, entries: dict.insert(state.entries, id, entry))
+  State(entries: dict.insert(state.entries, id, entry))
 }

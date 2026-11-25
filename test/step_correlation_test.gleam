@@ -1,9 +1,10 @@
 //// A step reads its run's correlation from the `EffectKey` it already
 //// receives, in `effect`, `undo`, `compensate` and the durable resolvers.
 
+import gleam/dict
 import gleam/erlang/process
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option, Some}
 import gleam/string
 import gleam/time/duration
 import gleeunit/should
@@ -511,48 +512,10 @@ pub fn the_first_drive_saves_the_default_test() {
     )
   receive(seen) |> should.equal(Ok(correlation.from_key("saved-3")))
   let assert Ok(stored) = storage.do_load(backend, "saved-3")
-  shape(storage.data(stored)) |> should.equal(#(2, Some("saved-3")))
+  let assert Ok(run_record) = dict.get(storage.records(stored), "run")
+  shape(run_record) |> should.equal(#(3, Some("saved-3")))
   memory.stop(store)
 }
 
-@external(erlang, "saga_legacy_fixture", "downgrade")
-fn downgrade(bytes: BitArray) -> BitArray
-
-@external(erlang, "saga_legacy_fixture", "shape")
-fn shape(bytes: BitArray) -> #(Int, Option(String))
-
-/// An execution saved in format 1, before the correlation was recorded,
-/// reads as `from_key(id)`: a supplied correlation is ignored, and the next
-/// commit saves the value in format 2.
-pub fn a_format_1_record_reads_as_the_execution_id_test() {
-  let seen = process.new_subject()
-  let assert Ok(scratch) = memory.start()
-  let assert Ok(fresh) =
-    durable.start_or_reconnect(
-      gated(seen, True),
-      memory.storage(scratch),
-      id: "legacy-1",
-      input: "x",
-    )
-  let assert Ok(written) = storage.do_load(memory.storage(scratch), "legacy-1")
-  durable.id(fresh) |> should.equal("legacy-1")
-  shape(storage.data(written)) |> should.equal(#(2, None))
-  let legacy = downgrade(storage.data(written))
-  shape(legacy) |> should.equal(#(1, None))
-  memory.stop(scratch)
-
-  let assert Ok(store) = memory.start()
-  let backend = memory.storage(store)
-  let assert Ok(_) = storage.do_create(backend, "legacy-1", legacy)
-  let handle =
-    reconnect(gated(seen, True), backend, "legacy-1")
-    |> durable.with_correlation(order())
-  let assert Ok(execution.Completed("x")) = drive(handle)
-  receive(seen) |> should.equal(Ok(correlation.from_key("legacy-1")))
-  let assert Ok(stored) = storage.do_load(backend, "legacy-1")
-  shape(storage.data(stored)) |> should.equal(#(2, Some("legacy-1")))
-  // A finished legacy record still reads.
-  let assert Ok(durable.Finished(execution.Completed("x"))) =
-    durable.read(reconnect(gated(seen, True), backend, "legacy-1"))
-  memory.stop(store)
-}
+@external(erlang, "saga_checkpoint_fixture", "shape")
+fn shape(run_record: BitArray) -> #(Int, Option(String))

@@ -69,9 +69,12 @@ fn start(persistence: Persistence, store: Storage, id: String) {
   run
 }
 
+/// Whether a driver listing pending or suspended executions finds `id`.
 fn listed(store: Storage, id: String) -> Bool {
-  let assert Ok(ids) = durable.unfinished(store, limit: 1000)
-  list.contains(ids, id)
+  list.any([storage.Pending, storage.Suspended], fn(phase) {
+    let assert Ok(ids) = durable.list(store, phase:, after: None, limit: 1000)
+    list.contains(ids, id)
+  })
 }
 
 /// The same storage, reporting the process that claims (the runner) to
@@ -91,7 +94,7 @@ fn watched_releasing(
 ) -> Storage {
   let rebuilt =
     storage.new(
-      create: fn(id, data) { storage.do_create(backend, id, data) },
+      create: fn(id, records) { storage.do_create(backend, id, records) },
       load: fn(id) { storage.do_load(backend, id) },
       claim: fn(id) {
         let result = storage.do_claim(backend, id)
@@ -104,7 +107,7 @@ fn watched_releasing(
       commit: fn(claim, change) { storage.do_commit(backend, claim, change) },
       release: release,
       cancel: fn(id) { storage.do_cancel(backend, id) },
-      unfinished: fn(limit) { storage.do_unfinished(backend, limit) },
+      list: fn(listing) { storage.do_list(backend, listing) },
     )
   case storage.renewal(backend) {
     Some(#(every, renew)) -> storage.with_renewal(rebuilt, every:, renew:)

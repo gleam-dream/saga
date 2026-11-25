@@ -53,13 +53,14 @@
 //// last checkpoint stays the recovery authority, so the next `drive`
 //// resumes. Only the loss of the runner's VM leaves the claim to the
 //// storage's own expiry, such as a lease. Only `cancel` cancels.
-//// Waking a runner after a restart is the caller's job: `unfinished` lists
-//// the executions that wait for one.
+//// Waking a runner after a restart is the caller's job: `list` pages
+//// through the executions that wait for one.
 ////
 //// See the durability design (`docs/design/durability/design.typ`) for the storage
 //// contract and recovery rules.
 
 import gleam/bit_array
+import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Pid, type Subject}
 import gleam/int
 import gleam/list
@@ -440,10 +441,12 @@ pub type Status(o, e, u) {
   Finished(outcome: execution.Outcome(o, e, u))
 }
 
-/// The saved record. `format` is 2; format 1 had no `correlation`, and `open`
-/// reads it as `correlation.from_key(id)`. `correlation` is `None` only for
-/// an execution that no drive has claimed yet: the first drive saves the
-/// value it uses, and every later drive reads it back.
+/// The saved checkpoint, format 3. `saga_checkpoint.erl` saves it as named
+/// records: the identity (id and stamp) and the input, written once, then
+/// the run header and one record per step node, so a commit writes only the
+/// records that changed. `correlation` is `None`
+/// only for an execution that no drive has claimed yet: the first drive
+/// saves the value it uses, and every later drive reads it back.
 type Envelope(o, e, u) {
   Envelope(
     format: Int,
@@ -568,8 +571,9 @@ pub fn with_config(
   Persistence(..persistence, config: config)
 }
 
-/// Bounds the size of one saved checkpoint (default 16 MiB). Every commit
-/// rewrites the whole checkpoint; a larger one suspends the execution with
+/// Bounds the size of one saved checkpoint, all its records together
+/// (default 16 MiB). A commit writes only the records that changed, but a
+/// checkpoint that grows past the bound suspends the execution with
 /// `CheckpointTooLarge`.
 pub fn with_max_checkpoint_bytes(
   persistence: Persistence(i, o, e, u),
@@ -596,12 +600,17 @@ pub fn start_or_reconnect(
   )
   let run = Run(persistence, storage, id, persistence.config)
   let envelope =
-    Envelope(2, id, persistence.stamp, encoded, None, None, None, None)
-  use bytes <- result.try(
-    encode(envelope, persistence)
+    Envelope(3, id, persistence.stamp, encoded, None, None, None, None)
+  use #(records, _sizes) <- result.try(
+    changed_records(
+      None,
+      envelope,
+      persistence,
+      Some(persistence.max_checkpoint_bytes),
+    )
     |> result.map_error(from_checkpoint(unsaved_correlation(run), _)),
   )
-  case call(storage, fn() { storage.do_create(storage, id, bytes) }) {
+  case call(storage, fn() { storage.do_create(storage, id, records) }) {
     Ok(_) -> Ok(run)
     Error(storage.AlreadyExists) -> {
       use existing <- result.try(load(run))
@@ -615,7 +624,7 @@ pub fn start_or_reconnect(
 }
 
 /// Reconnects to the execution saved under `id`, for example one that
-/// `unfinished` listed, without knowing its input. Fails with
+/// `list` returned, without knowing its input. Fails with
 /// `StorageFailure(NotFound)` when there is none.
 pub fn reconnect(
   persistence: Persistence(i, o, e, u),
@@ -674,17 +683,29 @@ pub fn cancel(run: Run(i, o, e, u)) -> Result(Nil, Error) {
   }
 }
 
-/// The ids of up to `limit` executions that are pending or suspended and
-/// that no live runner owns: the executions that wait for a `drive`.
+/// The ids of up to `limit` executions in `phase` that no live runner
+/// owns, in ascending id order, starting after the id `after` (from the
+/// first when `None`). `storage.Pending` lists the executions that wait for
+/// a `drive`; `storage.Suspended` those that wait until their unknown
+/// effect is established; `storage.Finished` those that are done.
 /// Reconnect to each with `reconnect`. Saga itself never drives them.
-pub fn unfinished(
+///
+/// To page, pass the last id of one page as `after` of the next; a page
+/// shorter than `limit` is the last. A recovery loop that lists pending and
+/// suspended executions separately is never held up by executions that
+/// stay suspended.
+pub fn list(
   storage: Storage,
+  phase phase: storage.Phase,
+  after after: Option(String),
   limit limit: Int,
 ) -> Result(List(String), Error) {
   case limit > 0 {
     False -> Ok([])
     True ->
-      call(storage, fn() { storage.do_unfinished(storage, limit) })
+      call(storage, fn() {
+        storage.do_list(storage, storage.Listing(phase:, after:, limit:))
+      })
       |> result.map_error(StorageFailure)
   }
 }
@@ -888,7 +909,7 @@ fn drive_claimed(
   stored: storage.Stored,
 ) -> Result(execution.Outcome(o, e, u), Error) {
   let persistence = run.persistence
-  use envelope <- result.try(open(run, storage.data(stored)))
+  use envelope <- result.try(open(run, storage.records(stored)))
   case envelope.outcome, envelope.correlation {
     Some(outcome), _ -> Ok(execution.from_coordinator(outcome))
     None, None -> {
@@ -900,9 +921,9 @@ fn drive_claimed(
           correlation: Some(correlation.to_string(settings.correlation)),
         )
       let written =
-        encode_within(saved, persistence, None)
+        changed_records(Some(envelope), saved, persistence, None)
         |> result.map_error(from_checkpoint(settings.correlation, _))
-      use bytes <- result.try(written)
+      use #(records, _sizes) <- result.try(written)
       let commit =
         guarded(guard, fn() {
           storage.do_commit(
@@ -912,14 +933,12 @@ fn drive_claimed(
               expected_revision: storage.revision(stored),
               observed_cancelled: storage.cancelled(stored),
               phase: storage.Pending,
-              data: bytes,
+              records: records,
             ),
           )
         })
       case commit {
-        Ok(written) ->
-          drive_claimed(run, settings, caller, guard, claim, written)
-        Error(storage.CancellationChanged) ->
+        Ok(Nil) | Error(storage.CancellationChanged) ->
           case guarded(guard, fn() { storage.do_load(run.storage, run.id) }) {
             Ok(current) ->
               drive_claimed(run, settings, caller, guard, claim, current)
@@ -939,14 +958,22 @@ fn drive_claimed(
         |> result.map_error(CodecFailure(RunInput, _)),
       )
       let cancelled = storage.cancelled(stored)
-      // The last committed revision and envelope, owned by this runner.
+      // The last committed revision, envelope and record sizes, owned by
+      // this runner.
       let committed = process.new_subject()
-      process.send(committed, #(storage.revision(stored), envelope))
+      process.send(committed, #(
+        storage.revision(stored),
+        envelope,
+        dict.map_values(storage.records(stored), fn(_, bytes) {
+          bit_array.byte_size(bytes)
+        }),
+      ))
       let commit = fn(
         change: fn(Envelope(o, e, u)) -> Envelope(o, e, u),
         phase: storage.Phase,
       ) {
-        let assert Ok(#(revision, current)) = process.receive(committed, 0)
+        let assert Ok(#(revision, current, sizes)) =
+          process.receive(committed, 0)
         let next = change(current)
         let written = {
           // A suspension record may pass the size limit by its reason, so
@@ -956,7 +983,13 @@ fn drive_claimed(
             storage.Pending | storage.Finished ->
               Some(persistence.max_checkpoint_bytes)
           }
-          use bytes <- result.try(encode_within(next, persistence, limit))
+          use #(records, sizes) <- result.try(changed_records_within(
+            Some(current),
+            next,
+            persistence,
+            sizes,
+            limit,
+          ))
           guarded(guard, fn() {
             storage.do_commit(
               run.storage,
@@ -965,19 +998,20 @@ fn drive_claimed(
                 expected_revision: revision,
                 observed_cancelled: cancelled,
                 phase: phase,
-                data: bytes,
+                records: records,
               ),
             )
           })
+          |> result.map(fn(_) { sizes })
           |> result.map_error(checkpoint.StorageFailure)
         }
         case written {
-          Ok(saved) -> {
-            process.send(committed, #(storage.revision(saved), next))
+          Ok(sizes) -> {
+            process.send(committed, #(revision + 1, next, sizes))
             Ok(Nil)
           }
           Error(failure) -> {
-            process.send(committed, #(revision, current))
+            process.send(committed, #(revision, current, sizes))
             Error(failure)
           }
         }
@@ -989,12 +1023,21 @@ fn drive_claimed(
           snapshot: envelope.snapshot,
           cancelled: cancelled,
           save: fn(snapshot) {
-            commit(
-              fn(current) {
-                Envelope(..current, snapshot: Some(snapshot), issue: None)
-              },
-              storage.Pending,
-            )
+            // A coordinator message that changed nothing saved (a finished
+            // worker's exit, a timer that lost its race) writes nothing.
+            let assert Ok(#(revision, current, sizes)) =
+              process.receive(committed, 0)
+            process.send(committed, #(revision, current, sizes))
+            case current.snapshot == Some(snapshot) && current.issue == None {
+              True -> Ok(Nil)
+              False ->
+                commit(
+                  fn(current) {
+                    Envelope(..current, snapshot: Some(snapshot), issue: None)
+                  },
+                  storage.Pending,
+                )
+            }
           },
           failed: fn(reason) {
             // Keep the last committed checkpoint: admissions that were not
@@ -1209,16 +1252,16 @@ fn load(run: Run(i, o, e, u)) -> Result(Envelope(o, e, u), Error) {
     call(run.storage, fn() { storage.do_load(run.storage, run.id) })
     |> result.map_error(StorageFailure),
   )
-  open(run, storage.data(stored))
+  open(run, storage.records(stored))
 }
 
 fn open(
   run: Run(i, o, e, u),
-  bytes: BitArray,
+  records: Dict(String, BitArray),
 ) -> Result(Envelope(o, e, u), Error) {
   let persistence = run.persistence
   use #(saved_id, saved_stamp) <- result.try(
-    header(bytes) |> result.replace_error(InvalidCheckpoint(Malformed)),
+    header(records) |> result.replace_error(InvalidCheckpoint(Malformed)),
   )
   use _ <- result.try(
     case saved_id == run.id, saved_stamp == persistence.stamp {
@@ -1229,30 +1272,20 @@ fn open(
   )
   use envelope <- result.try(
     decode_envelope(
-      bytes,
+      records,
       fn(value) { codec.decode(persistence.output, value) },
       fn(value) { codec.decode(persistence.error, value) },
       fn(value) { codec.decode(persistence.undo_error, value) },
     )
     |> result.map_error(from_checkpoint(unsaved_correlation(run), _)),
   )
-  case envelope.format, envelope.correlation {
-    // Format 1 saved no correlation: its executions read as `from_key(id)`,
-    // and the next commit saves it.
-    1, _ ->
-      Ok(
-        Envelope(
-          ..envelope,
-          format: 2,
-          correlation: Some(correlation.to_string(correlation.from_key(run.id))),
-        ),
-      )
-    _, Some(saved) ->
+  case envelope.correlation {
+    Some(saved) ->
       case correlation.from_string(saved) {
         Ok(_) -> Ok(envelope)
         Error(_) -> Error(InvalidCheckpoint(Malformed))
       }
-    _, None -> Ok(envelope)
+    None -> Ok(envelope)
   }
 }
 
@@ -1273,51 +1306,116 @@ fn saved_correlation(
   }
 }
 
-fn encode(
-  envelope: Envelope(o, e, u),
-  persistence: Persistence(i, o, e, u),
-) -> Result(BitArray, checkpoint.Failure) {
-  encode_within(envelope, persistence, Some(persistence.max_checkpoint_bytes))
-}
-
-fn encode_within(
-  envelope: Envelope(o, e, u),
+/// The records that save `next` when `saved` was saved before (`None` for a
+/// new execution): the run header always, the identity and input when the
+/// execution is new, and each step node that differs from the saved one. Returns them with the
+/// size of every record of the resulting checkpoint.
+fn changed_records(
+  saved: Option(Envelope(o, e, u)),
+  next: Envelope(o, e, u),
   persistence: Persistence(i, o, e, u),
   limit: Option(Int),
-) -> Result(BitArray, checkpoint.Failure) {
-  use bytes <- result.try(
-    encode_envelope(
-      envelope,
+) -> Result(#(Dict(String, BitArray), Dict(String, Int)), checkpoint.Failure) {
+  changed_records_within(saved, next, persistence, dict.new(), limit)
+}
+
+/// `changed_records` given the sizes of the saved records, so that `limit`
+/// bounds the whole checkpoint, not only the records written.
+fn changed_records_within(
+  saved: Option(Envelope(o, e, u)),
+  next: Envelope(o, e, u),
+  persistence: Persistence(i, o, e, u),
+  sizes: Dict(String, Int),
+  limit: Option(Int),
+) -> Result(#(Dict(String, BitArray), Dict(String, Int)), checkpoint.Failure) {
+  use run <- result.try(
+    encode_header(
+      next,
       fn(value) { codec.encode(persistence.output, value) },
       fn(value) { codec.encode(persistence.error, value) },
       fn(value) { codec.encode(persistence.undo_error, value) },
     ),
   )
-  let size = bit_array.byte_size(bytes)
+  let records = dict.from_list([#("run", run)])
+  let records = case saved {
+    Some(_) -> records
+    None ->
+      records
+      |> dict.insert("identity", encode_identity(next))
+      |> dict.insert("input", bit_array.from_string(next.input))
+  }
+  use records <- result.try(changed_nodes(
+    option.map(saved, saved_nodes) |> option.unwrap([]),
+    saved_nodes(next),
+    0,
+    records,
+  ))
+  let sizes =
+    dict.fold(records, sizes, fn(sizes, key, bytes) {
+      dict.insert(sizes, key, bit_array.byte_size(bytes))
+    })
+  let size = dict.fold(sizes, 0, fn(total, _, size) { total + size })
   case limit {
     Some(limit) if size > limit -> Error(checkpoint.TooLarge(size, limit))
-    _ -> Ok(bytes)
+    _ -> Ok(#(records, sizes))
   }
 }
 
-@external(erlang, "saga_checkpoint", "encode")
-fn encode_envelope(
+fn saved_nodes(envelope: Envelope(o, e, u)) -> List(coordinator.SavedNode) {
+  case envelope.snapshot {
+    Some(snapshot) -> snapshot.nodes
+    None -> []
+  }
+}
+
+/// Adds a record for each node of `next` that differs from the node saved
+/// at the same position. A completed node keeps the same encoded values
+/// from commit to commit, so the comparison is cheap.
+fn changed_nodes(
+  saved: List(coordinator.SavedNode),
+  next: List(coordinator.SavedNode),
+  position: Int,
+  records: Dict(String, BitArray),
+) -> Result(Dict(String, BitArray), checkpoint.Failure) {
+  case saved, next {
+    _, [] -> Ok(records)
+    [old, ..saved], [new, ..next] if old == new ->
+      changed_nodes(saved, next, position + 1, records)
+    _, [new, ..next] -> {
+      use bytes <- result.try(encode_node(new))
+      let records =
+        dict.insert(records, "step/" <> int.to_string(position), bytes)
+      changed_nodes(list.drop(saved, 1), next, position + 1, records)
+    }
+  }
+}
+
+@external(erlang, "saga_checkpoint", "encode_identity")
+fn encode_identity(envelope: Envelope(o, e, u)) -> BitArray
+
+@external(erlang, "saga_checkpoint", "encode_header")
+fn encode_header(
   envelope: Envelope(o, e, u),
   output: fn(o) -> Result(String, codec.CodecError),
   error: fn(e) -> Result(String, codec.CodecError),
   undo: fn(u) -> Result(String, codec.CodecError),
 ) -> Result(BitArray, checkpoint.Failure)
 
+@external(erlang, "saga_checkpoint", "encode_node")
+fn encode_node(
+  node: coordinator.SavedNode,
+) -> Result(BitArray, checkpoint.Failure)
+
 @external(erlang, "saga_checkpoint", "decode")
 fn decode_envelope(
-  bytes: BitArray,
+  records: Dict(String, BitArray),
   output: fn(String) -> Result(o, codec.CodecError),
   error: fn(String) -> Result(e, codec.CodecError),
   undo: fn(String) -> Result(u, codec.CodecError),
 ) -> Result(Envelope(o, e, u), checkpoint.Failure)
 
 @external(erlang, "saga_checkpoint", "header")
-fn header(bytes: BitArray) -> Result(#(String, String), Nil)
+fn header(records: Dict(String, BitArray)) -> Result(#(String, String), Nil)
 
 fn frame(parts: List(String)) -> String {
   list.map(parts, fn(part) {

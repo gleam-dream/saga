@@ -3,19 +3,25 @@
 ////
 //// Use this module to write a storage adapter, or to name its errors. One
 //// `Storage` value serves a whole store, such as a database pool, and every
-//// operation names the execution it acts on:
+//// operation names the execution it acts on.
 ////
-//// - `create(id, bytes)` saves an execution's first checkpoint, once;
-//// - `load(id)` reads its latest checkpoint;
+//// An execution's checkpoint is a set of named records: byte strings under
+//// keys that saga chooses, such as one record per step. A commit writes only
+//// the records that changed, so the bytes a run writes grow with what it
+//// does, not with the square of its step count. The operations:
+////
+//// - `create(id, records)` saves an execution's first records, once;
+//// - `load(id)` reads every record of its latest checkpoint;
 //// - `claim(id)` takes exclusive ownership and advances the ownership
 ////   generation, returning a `Claim`;
-//// - `commit(claim, commit)` saves new bytes only while `claim` is the
+//// - `commit(claim, commit)` writes the commit's records, replacing those
+////   with the same key and keeping the others, only while `claim` is the
 ////   current owner, the expected revision matches and the caller has seen
 ////   the current cancellation flag;
 //// - `release(claim)` gives ownership up;
 //// - `cancel(id)` records cancellation without overwriting progress;
-//// - `unfinished(limit)` lists executions that are pending or suspended and
-////   that no live claim holds, for a future driver to pick up.
+//// - `list(listing)` pages through the executions in one phase that no live
+////   claim holds, in id order, for a driver to pick up.
 ////
 //// Ownership is the `Claim` value, not the calling process: any process
 //// holding the current claim may commit or release, and a claim rebuilt
@@ -30,6 +36,7 @@
 //// package implement the contract, and `saga/storage/conformance` checks
 //// an adapter against it.
 
+import gleam/dict.{type Dict}
 import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/time/duration.{type Duration}
@@ -108,19 +115,24 @@ pub fn claim_token(claim: Claim) -> String {
 
 /// One saved execution, as an adapter returns it: its revision (the number
 /// of commits), its ownership generation (the number of claims), its
-/// cancellation flag and its checkpoint bytes.
+/// cancellation flag and every record of its checkpoint.
 pub opaque type Stored {
-  Stored(revision: Int, generation: Int, cancelled: Bool, data: BitArray)
+  Stored(
+    revision: Int,
+    generation: Int,
+    cancelled: Bool,
+    records: Dict(String, BitArray),
+  )
 }
 
-/// Builds the record an adapter returns.
+/// Builds the execution an adapter returns.
 pub fn stored(
   revision revision: Int,
   generation generation: Int,
   cancelled cancelled: Bool,
-  data data: BitArray,
+  records records: Dict(String, BitArray),
 ) -> Stored {
-  Stored(revision:, generation:, cancelled:, data:)
+  Stored(revision:, generation:, cancelled:, records:)
 }
 
 /// The number of commits saved.
@@ -138,12 +150,12 @@ pub fn cancelled(stored: Stored) -> Bool {
   stored.cancelled
 }
 
-/// The checkpoint bytes.
-pub fn data(stored: Stored) -> BitArray {
-  stored.data
+/// The checkpoint's records, by key.
+pub fn records(stored: Stored) -> Dict(String, BitArray) {
+  stored.records
 }
 
-/// Where an execution stands, for `unfinished`: still running or waiting to
+/// Where an execution stands, for `list`: still running or waiting to
 /// run, suspended until an operator establishes an unknown effect, or
 /// finished. The union is closed.
 pub type Phase {
@@ -153,27 +165,36 @@ pub type Phase {
 }
 
 /// One write: the revision the committer read, the cancellation flag it
-/// observed, the execution's phase after the write, and the new bytes.
-/// Read fields by label; later releases may add fields.
+/// observed, the execution's phase after the write, and the records that
+/// changed. A record replaces the saved record with the same key; saved
+/// records with other keys stay. Read fields by label; later releases may
+/// add fields.
 pub type Commit {
   Commit(
     expected_revision: Int,
     observed_cancelled: Bool,
     phase: Phase,
-    data: BitArray,
+    records: Dict(String, BitArray),
   )
+}
+
+/// One page of a `list`: the executions in `phase` whose id sorts after
+/// `after` (from the first id when `None`), at most `limit` of them. To
+/// read the next page, pass the last id of this one as `after`.
+pub type Listing {
+  Listing(phase: Phase, after: Option(String), limit: Int)
 }
 
 /// A store's operations, built by an adapter with `new`.
 pub opaque type Storage {
   Storage(
-    create: fn(String, BitArray) -> Result(Stored, Error),
+    create: fn(String, Dict(String, BitArray)) -> Result(Nil, Error),
     load: fn(String) -> Result(Stored, Error),
     claim: fn(String) -> Result(#(Claim, Stored), Error),
-    commit: fn(Claim, Commit) -> Result(Stored, Error),
+    commit: fn(Claim, Commit) -> Result(Nil, Error),
     release: fn(Claim) -> Result(Nil, Error),
     cancel: fn(String) -> Result(Nil, Error),
-    unfinished: fn(Int) -> Result(List(String), Error),
+    list: fn(Listing) -> Result(List(String), Error),
     renewal: Option(#(Duration, fn(Claim) -> Result(Nil, Error))),
     call_timeout: Duration,
   )
@@ -181,32 +202,35 @@ pub opaque type Storage {
 
 /// Builds a storage from an adapter's operations:
 ///
-/// - `create` saves revision 0, generation 0, not cancelled, phase
-///   `Pending`, or fails with `AlreadyExists`;
-/// - `load` fails with `NotFound` for an unknown id;
+/// - `create` saves the records at revision 0, generation 0, not
+///   cancelled, phase `Pending`, or fails with `AlreadyExists`;
+/// - `load` returns every record, or fails with `NotFound` for an unknown
+///   id;
 /// - `claim` fails with `Busy` while another live claim owns the
-///   execution, and otherwise advances the generation;
+///   execution, and otherwise advances the generation and returns every
+///   record;
 /// - `commit` succeeds only for the current claim, the current revision
-///   and the current cancellation flag, increments the revision and keeps
-///   ownership; it fails with `StaleOwner`, `CancellationChanged` or
-///   `Conflict`, in that order of precedence;
+///   and the current cancellation flag; it writes the commit's records and
+///   its phase and increments the revision in one atomic step, and keeps
+///   ownership. It fails with `StaleOwner`, `CancellationChanged` or
+///   `Conflict`, in that order of precedence, and then writes nothing;
 /// - `release` fails with `StaleOwner` unless `claim` is the current owner;
-/// - `cancel` sets the flag idempotently, keeping revision and bytes;
-/// - `unfinished(limit)` returns up to `limit` ids whose phase is `Pending`
-///   or `Suspended` and that no live claim holds, oldest first where the
-///   store can tell.
+/// - `cancel` sets the flag idempotently, keeping revision and records;
+/// - `list(listing)` returns, in ascending id order (byte order of the
+///   UTF-8 text), up to `listing.limit` ids whose phase is `listing.phase`,
+///   whose id sorts after `listing.after`, and that no live claim holds.
 ///
 /// Each operation must finish within the call timeout (5 seconds by
 /// default, `with_call_timeout`); saga gives up on a slower one with
 /// `TimedOut`.
 pub fn new(
-  create create: fn(String, BitArray) -> Result(Stored, Error),
+  create create: fn(String, Dict(String, BitArray)) -> Result(Nil, Error),
   load load: fn(String) -> Result(Stored, Error),
   claim claim: fn(String) -> Result(#(Claim, Stored), Error),
-  commit commit: fn(Claim, Commit) -> Result(Stored, Error),
+  commit commit: fn(Claim, Commit) -> Result(Nil, Error),
   release release: fn(Claim) -> Result(Nil, Error),
   cancel cancel: fn(String) -> Result(Nil, Error),
-  unfinished unfinished: fn(Int) -> Result(List(String), Error),
+  list list: fn(Listing) -> Result(List(String), Error),
 ) -> Storage {
   Storage(
     create:,
@@ -215,7 +239,7 @@ pub fn new(
     commit:,
     release:,
     cancel:,
-    unfinished:,
+    list:,
     renewal: None,
     call_timeout: duration.seconds(5),
   )
@@ -253,8 +277,12 @@ pub fn with_call_timeout(storage: Storage, timeout: Duration) -> Storage {
 // The operations, for `saga/durable` and `saga/storage/conformance`.
 
 @internal
-pub fn do_create(storage: Storage, id: String, data: BitArray) {
-  storage.create(id, data)
+pub fn do_create(
+  storage: Storage,
+  id: String,
+  records: Dict(String, BitArray),
+) {
+  storage.create(id, records)
 }
 
 @internal
@@ -283,8 +311,8 @@ pub fn do_cancel(storage: Storage, id: String) {
 }
 
 @internal
-pub fn do_unfinished(storage: Storage, limit: Int) {
-  storage.unfinished(limit)
+pub fn do_list(storage: Storage, listing: Listing) {
+  storage.list(listing)
 }
 
 @internal

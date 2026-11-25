@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
@@ -1040,7 +1041,7 @@ pub fn checkpoint_error_categories_remain_distinct_test() {
         expected_revision: storage.revision(stored),
         observed_cancelled: storage.cancelled(stored),
         phase: storage.Pending,
-        data: <<"not a checkpoint":utf8>>,
+        records: dict.from_list([#("identity", <<"not a checkpoint":utf8>>)]),
       ),
     )
   let assert Ok(Nil) = storage.do_release(backend, owner)
@@ -1320,7 +1321,10 @@ pub fn checkpoint_size_is_bounded_test() {
   let backend = memory.storage(store)
   let _ = start(prepare(workflow), backend, "roomy")
   let assert Ok(saved) = storage.do_load(backend, "roomy")
-  let initial = bit_array.byte_size(storage.data(saved))
+  let initial =
+    dict.fold(storage.records(saved), 0, fn(total, _, bytes) {
+      total + bit_array.byte_size(bytes)
+    })
   // The first checkpoint fits; the next one, with the admitted input, not.
   let tight = prepare(workflow) |> durable.with_max_checkpoint_bytes(initial)
   let tight_run = reconnect(tight, backend, "roomy")
@@ -1367,7 +1371,7 @@ pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
 
 /// `unfinished` lists executions that wait for a driver; finished ones and
 /// ones a live runner owns are left out.
-pub fn unfinished_lists_executions_waiting_for_a_driver_test() {
+pub fn list_pages_executions_waiting_for_a_driver_test() {
   let entered = process.new_subject()
   let store = start_memory()
   let backend = memory.storage(store)
@@ -1378,8 +1382,19 @@ pub fn unfinished_lists_executions_waiting_for_a_driver_test() {
   let busy = start(prepare(blocking_workflow(entered, False)), backend, "busy")
   let running = drive_later(busy)
   let assert Ok(_) = process.receive(entered, 1000)
-  durable.unfinished(backend, limit: 10) |> should.equal(Ok(["waiting"]))
-  durable.unfinished(backend, limit: 0) |> should.equal(Ok([]))
+  durable.list(backend, phase: storage.Pending, after: None, limit: 10)
+  |> should.equal(Ok(["waiting"]))
+  durable.list(backend, phase: storage.Finished, after: None, limit: 10)
+  |> should.equal(Ok(["finished"]))
+  durable.list(
+    backend,
+    phase: storage.Pending,
+    after: Some("waiting"),
+    limit: 10,
+  )
+  |> should.equal(Ok([]))
+  durable.list(backend, phase: storage.Pending, after: None, limit: 0)
+  |> should.equal(Ok([]))
   let assert Ok(Nil) = durable.cancel(busy)
   let _ = running
   memory.stop(store)
@@ -1632,6 +1647,37 @@ pub fn settling_resume_does_not_start_a_proven_unsent_effect_test() {
   memory.stop(store)
 }
 
+/// Every commit a durable run makes carries a checkpoint that differs from
+/// the one it last wrote: a coordinator message that changes nothing saved
+/// (a finished worker's exit, a timer that lost its race) writes nothing.
+pub fn unchanged_checkpoint_is_not_rewritten_test() {
+  let workflow =
+    saga.define("chain", fn(input) {
+      input
+      |> saga.perform(text_step("a", fn(value) { Ok(value <> "a") }))
+      |> saga.perform(text_step("b", fn(value) { Ok(value <> "b") }))
+      |> saga.perform(text_step("c", fn(value) { Ok(value <> "c") }))
+      |> saga.perform(text_step("d", fn(value) { Ok(value <> "d") }))
+    })
+  let store = start_memory()
+  let backend = memory.storage(store)
+  let writes = process.new_subject()
+  let recording =
+    stores.with_commit(backend, fn(owner, change) {
+      process.send(writes, change.records)
+      storage.do_commit(backend, owner, change)
+    })
+  drive(start(prepare(workflow), recording, "chain"))
+  |> should.equal(Ok(execution.Completed("xabcd")))
+  let written = drain(writes, [])
+  let repeats =
+    list.window_by_2(written)
+    |> list.filter(fn(pair) { pair.0 == pair.1 })
+    |> list.length
+  #(repeats, list.length(written) > 4) |> should.equal(#(0, True))
+  memory.stop(store)
+}
+
 fn drain(from: process.Subject(a), seen: List(a)) -> List(a) {
   case process.receive(from, 0) {
     Ok(value) -> drain(from, [value, ..seen])
@@ -1681,3 +1727,88 @@ fn chain_numbers(up_to: Int, acc: List(Int)) -> List(Int) {
 
 @external(erlang, "saga_test_heap", "total_heap_words")
 fn total_heap_words() -> Int
+
+/// The bytes a durable run commits grow with its step count, not with its
+/// square: a chain four times as long commits at most twice as many bytes
+/// per step.
+pub fn committed_bytes_per_step_do_not_grow_with_the_chain_test() {
+  let per_step = fn(steps: Int) {
+    let payload = string.repeat("x", 1024)
+    let workflow =
+      saga.define("chain", fn(input) {
+        list.fold(numbers(steps, []), input, fn(port, number) {
+          saga.perform(
+            port,
+            text_step("step-" <> string.inspect(number), fn(_) { Ok(payload) }),
+          )
+        })
+      })
+    let store = start_memory()
+    let backend = memory.storage(store)
+    let sizes = process.new_subject()
+    let counting =
+      stores.with_commit(backend, fn(owner, change) {
+        process.send(
+          sizes,
+          dict.fold(change.records, 0, fn(total, _, bytes) {
+            total + bit_array.byte_size(bytes)
+          }),
+        )
+        storage.do_commit(backend, owner, change)
+      })
+    let assert Ok(execution.Completed(_)) =
+      drive(start(prepare(workflow), counting, "chain"))
+    memory.stop(store)
+    list.fold(drain(sizes, []), 0, fn(total, size) { total + size }) / steps
+  }
+  let short = per_step(10)
+  let long = per_step(40)
+  #(long <= 2 * short, short, long) |> should.equal(#(True, short, long))
+}
+
+fn numbers(up_to: Int, acc: List(Int)) -> List(Int) {
+  case up_to {
+    0 -> acc
+    _ -> numbers(up_to - 1, [up_to, ..acc])
+  }
+}
+
+/// A commit writes a step's record only when the step's saved state
+/// changed since the record was last written.
+pub fn a_commit_writes_only_changed_records_test() {
+  let workflow =
+    saga.define("chain", fn(input) {
+      list.fold(numbers(8, []), input, fn(port, number) {
+        saga.perform(
+          port,
+          text_step("step-" <> string.inspect(number), fn(value) {
+            Ok(value <> "!")
+          }),
+        )
+      })
+    })
+  let store = start_memory()
+  let backend = memory.storage(store)
+  let writes = process.new_subject()
+  let recording =
+    stores.with_commit(backend, fn(owner, change) {
+      process.send(writes, change.records)
+      storage.do_commit(backend, owner, change)
+    })
+  let assert Ok(execution.Completed(_)) =
+    drive(start(prepare(workflow), recording, "chain"))
+  memory.stop(store)
+  let #(_, rewrites) =
+    list.fold(drain(writes, []), #(dict.new(), 0), fn(acc, records) {
+      let #(last, rewrites) = acc
+      let rewrites =
+        dict.fold(records, rewrites, fn(rewrites, key, bytes) {
+          case key != "run" && dict.get(last, key) == Ok(bytes) {
+            True -> rewrites + 1
+            False -> rewrites
+          }
+        })
+      #(dict.merge(last, records), rewrites)
+    })
+  rewrites |> should.equal(0)
+}

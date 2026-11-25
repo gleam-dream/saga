@@ -179,8 +179,8 @@ pub fn migrate(config: Config) -> Result(Nil, MigrateError) {
   })
 }
 
-/// The `saga/storage.Storage` of this configuration, over the table
-/// `saga_executions` in its schema. Run `migrate` first. Saga owns the
+/// The `saga/storage.Storage` of this configuration, over the tables
+/// `saga_executions` and `saga_records` in its schema. Run `migrate` first. Saga owns the
 /// heartbeat declared through `storage.with_renewal`, every third of the lease.
 ///
 /// Each pool-backed query attempt has a 4.5-second budget and reports
@@ -192,7 +192,7 @@ pub fn migrate(config: Config) -> Result(Nil, MigrateError) {
 pub fn storage(config: Config) -> Storage {
   store.new(
     config.connection,
-    quoted(config.schema) <> ".saga_executions",
+    quoted(config.schema),
     duration.to_milliseconds(config.lease),
   )
 }

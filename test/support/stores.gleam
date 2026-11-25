@@ -16,7 +16,7 @@ pub fn with_claim(
 
 pub fn with_commit(
   backend: Storage,
-  commit: fn(Claim, Commit) -> Result(Stored, storage.Error),
+  commit: fn(Claim, Commit) -> Result(Nil, storage.Error),
 ) -> Storage {
   rebuild(backend, fn(id) { storage.do_claim(backend, id) }, commit)
 }
@@ -39,7 +39,7 @@ pub fn watched(
 fn rebuild(
   backend: Storage,
   claim: fn(String) -> Result(#(Claim, Stored), storage.Error),
-  commit: fn(Claim, Commit) -> Result(Stored, storage.Error),
+  commit: fn(Claim, Commit) -> Result(Nil, storage.Error),
 ) -> Storage {
   let rebuilt = rebuild_operations(backend, claim, commit)
   let rebuilt =
@@ -54,15 +54,15 @@ fn rebuild(
 fn rebuild_operations(
   backend: Storage,
   claim: fn(String) -> Result(#(Claim, Stored), storage.Error),
-  commit: fn(Claim, Commit) -> Result(Stored, storage.Error),
+  commit: fn(Claim, Commit) -> Result(Nil, storage.Error),
 ) -> Storage {
   storage.new(
-    create: fn(id, data) { storage.do_create(backend, id, data) },
+    create: fn(id, records) { storage.do_create(backend, id, records) },
     load: fn(id) { storage.do_load(backend, id) },
     claim: claim,
     commit: commit,
     release: fn(owner) { storage.do_release(backend, owner) },
     cancel: fn(id) { storage.do_cancel(backend, id) },
-    unfinished: fn(limit) { storage.do_unfinished(backend, limit) },
+    list: fn(listing) { storage.do_list(backend, listing) },
   )
 }

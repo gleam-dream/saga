@@ -2,9 +2,12 @@
 //// refused commit's reasons, renewal of a claim, the stored phase, and
 //// the query timeout.
 
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
-import gleam/option.{Some}
+import gleam/list
+import gleam/option.{None, Some}
+import gleam/result
 import gleam/time/duration
 import gleeunit/should
 import pog
@@ -34,19 +37,26 @@ fn commit(
       expected_revision: revision,
       observed_cancelled: cancelled,
       phase:,
-      data: <<"next":utf8>>,
+      records: dict.from_list([#("checkpoint", <<"next":utf8>>)]),
     ),
   )
-  |> result_revision
+  |> result.try(fn(_) {
+    storage.do_load(store, storage.claim_id(claim))
+    |> result.map(storage.revision)
+  })
 }
 
-fn result_revision(
-  result: Result(storage.Stored, storage.Error),
-) -> Result(Int, storage.Error) {
-  case result {
-    Ok(stored) -> Ok(storage.revision(stored))
-    Error(error) -> Error(error)
-  }
+/// The pending and suspended executions that no live claim holds.
+fn unfinished(store: Storage) -> Result(List(String), storage.Error) {
+  use pending <- result.try(storage.do_list(
+    store,
+    storage.Listing(storage.Pending, None, 10),
+  ))
+  use suspended <- result.try(storage.do_list(
+    store,
+    storage.Listing(storage.Suspended, None, 10),
+  ))
+  Ok(list.append(pending, suspended))
 }
 
 fn phase(connection: pog.Connection, schema: String, id: String) -> String {
@@ -68,7 +78,7 @@ pub fn a_refused_commit_names_ownership_then_cancellation_then_revision_test() {
   let schema = support.schema()
   let store = fresh(connection, schema)
   let id = support.id()
-  let assert Ok(_) = storage.do_create(store, id, <<>>)
+  let assert Ok(_) = storage.do_create(store, id, dict.new())
   let assert Ok(#(owner, _)) = storage.do_claim(store, id)
   let assert Ok(Nil) = storage.do_cancel(store, id)
   let forged =
@@ -98,12 +108,12 @@ pub fn a_commit_or_release_of_an_unknown_execution_is_not_found_test() {
   support.drop(connection, schema)
 }
 
-pub fn commits_store_the_phase_that_unfinished_reads_test() {
+pub fn commits_store_the_phase_that_list_reads_test() {
   use connection <- support.using_pool(2)
   let schema = support.schema()
   let store = fresh(connection, schema)
   let id = support.id()
-  let assert Ok(_) = storage.do_create(store, id, <<>>)
+  let assert Ok(_) = storage.do_create(store, id, dict.new())
   phase(connection, schema, id) |> should.equal("pending")
   let assert Ok(#(owner, _)) = storage.do_claim(store, id)
   commit(store, owner, 0, False, storage.Suspended) |> should.equal(Ok(1))
@@ -111,8 +121,11 @@ pub fn commits_store_the_phase_that_unfinished_reads_test() {
   commit(store, owner, 1, False, storage.Finished) |> should.equal(Ok(2))
   phase(connection, schema, id) |> should.equal("finished")
   let assert Ok(Nil) = storage.do_release(store, owner)
-  storage.do_unfinished(store, 10) |> should.equal(Ok([]))
-  storage.do_unfinished(store, 0) |> should.equal(Ok([]))
+  unfinished(store) |> should.equal(Ok([]))
+  storage.do_list(store, storage.Listing(storage.Finished, None, 10))
+  |> should.equal(Ok([id]))
+  storage.do_list(store, storage.Listing(storage.Finished, None, 0))
+  |> should.equal(Ok([]))
   support.drop(connection, schema)
 }
 
@@ -129,7 +142,7 @@ pub fn renewal_keeps_only_the_current_claim_test() {
     ))
   let assert Some(#(_, renew)) = storage.renewal(store)
   let id = support.id()
-  let assert Ok(_) = storage.do_create(store, id, <<>>)
+  let assert Ok(_) = storage.do_create(store, id, dict.new())
   let assert Ok(#(first, _)) = storage.do_claim(store, id)
   // Renewed past its lease, the claim still excludes another.
   process.sleep(300)
@@ -160,7 +173,7 @@ pub fn a_blocked_query_times_out_below_the_call_timeout_test() {
   let schema = support.schema()
   let store = fresh(connection, schema)
   let id = support.id()
-  let assert Ok(_) = storage.do_create(store, id, <<>>)
+  let assert Ok(_) = storage.do_create(store, id, dict.new())
   let locked = process.new_subject()
   process.spawn(fn() {
     pog.transaction(connection, fn(connection) {
@@ -196,12 +209,12 @@ pub fn an_expired_claim_commits_until_it_is_replaced_test() {
       duration.milliseconds(100),
     ))
   let id = support.id()
-  let assert Ok(_) = storage.do_create(store, id, <<>>)
+  let assert Ok(_) = storage.do_create(store, id, dict.new())
   let assert Ok(#(owner, _)) = storage.do_claim(store, id)
   process.sleep(300)
-  storage.do_unfinished(store, 10) |> should.equal(Ok([id]))
+  unfinished(store) |> should.equal(Ok([id]))
   commit(store, owner, 0, False, storage.Pending) |> should.equal(Ok(1))
-  storage.do_unfinished(store, 10) |> should.equal(Ok([]))
+  unfinished(store) |> should.equal(Ok([]))
   process.sleep(300)
   let assert Ok(#(_successor, _)) = storage.do_claim(store, id)
   commit(store, owner, 1, False, storage.Pending)

@@ -22,8 +22,10 @@ cause_round_trips() ->
     Settlement = {settlement, [], [], [], [], [], [], [Cause], []},
     Snapshot = {snapshot, [], [], {saved_settling, {trigger_failure, Cause}, Settlement},
                 [], [], none},
-    Envelope = {envelope, 2, <<"id">>, <<"stamp">>, <<"input">>, {some, Snapshot},
+    Envelope = {envelope, 3, <<"id">>, <<"stamp">>, <<"input">>, {some, Snapshot},
                 {some, {failed, Cause, Settlement}}, none, none},
     Same = fun(Value) -> {ok, Value} end,
-    {ok, Bytes} = saga_checkpoint:encode(Envelope, Same, Same, Same),
-    {ok, Envelope} =:= saga_checkpoint:decode(Bytes, Same, Same, Same).
+    {ok, Run} = saga_checkpoint:encode_header(Envelope, Same, Same, Same),
+    Records = #{<<"identity">> => saga_checkpoint:encode_identity(Envelope),
+                <<"run">> => Run, <<"input">> => <<"input">>},
+    {ok, Envelope} =:= saga_checkpoint:decode(Records, Same, Same, Same).

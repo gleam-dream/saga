@@ -2,6 +2,8 @@
 
 <a id="adr-0002"></a>
 
+The single checkpoint column is superseded by [0006-store-checkpoint-records-as-rows.md](0006-store-checkpoint-records-as-rows.md); the rest remains in force.
+
 ## Decision
 
 - Represent each execution as one row containing opaque checkpoint bytes and independent revision, ownership, cancellation, and discovery state.
