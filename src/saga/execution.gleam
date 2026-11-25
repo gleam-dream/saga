@@ -391,8 +391,11 @@ pub fn settings(
 }
 
 /// Why `run`/`start` could not return an execution or report.
-/// `InvalidConfig` starts no work. `ExecutionLost` does not prove that no
-/// work started: a coordinator may act before its startup handshake is lost.
+/// `InvalidConfig` starts no work. `ExecutionLost` from `start` or
+/// `start_reporting` means the startup handshake failed: the coordinator was
+/// stopped before it admitted any step, so no work started. `ExecutionLost`
+/// from `run` can also mean the coordinator was lost after it started, which
+/// does not prove that no work started.
 pub type RunError {
   InvalidConfig(errors: List(ConfigError))
   ExecutionLost(crash: saga.Crash)
@@ -717,7 +720,10 @@ pub fn run(
 /// coordinator process fails to complete its startup handshake within 5
 /// seconds (it should not normally take anywhere near that long; this
 /// guards against a wedged or unschedulable coordinator rather than
-/// reporting it as a caller configuration error).
+/// reporting it as a caller configuration error). A coordinator admits no
+/// step until the handshake completes, and one whose handshake failed is
+/// killed before this function returns: the lost run performed no step and
+/// leaves no process behind.
 pub fn start(
   workflow: Workflow(i, o, e, u),
   input: i,
@@ -796,25 +802,24 @@ fn launch(
     Ok(validated) -> Ok(validated)
     Error(errors) -> Error(InvalidConfig(errors))
   })
-  let control_subject_out = process.new_subject()
-  let #(pid, run_id) =
+  case
     coordinator.start(
       workflow_name: saga.name(workflow),
       owner: process.self(),
       settings: validated,
       build_graph: fn() { saga.for_run(workflow, input) },
       deliver: deliver,
-      control_subject_out: control_subject_out,
+      handshake_timeout: 5000,
     )
-  case process.receive(control_subject_out, 5000) {
-    Error(_) ->
+  {
+    Error(Nil) ->
       Error(
         ExecutionLost(saga.Crash(
           saga.ExitClass,
-          "coordinator did not complete its startup handshake within 5000ms",
+          "coordinator did not complete its startup handshake within 5000ms; it was stopped before any step started",
         )),
       )
-    Ok(control) -> Ok(#(pid, run_id, control))
+    Ok(started) -> Ok(started)
   }
 }
 
