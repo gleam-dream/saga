@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/dict
 import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
@@ -1040,7 +1041,7 @@ pub fn checkpoint_error_categories_remain_distinct_test() {
         expected_revision: storage.revision(stored),
         observed_cancelled: storage.cancelled(stored),
         phase: storage.Pending,
-        data: <<"not a checkpoint":utf8>>,
+        records: dict.from_list([#("run", <<"not a checkpoint":utf8>>)]),
       ),
     )
   let assert Ok(Nil) = storage.do_release(backend, owner)
@@ -1320,7 +1321,10 @@ pub fn checkpoint_size_is_bounded_test() {
   let backend = memory.storage(store)
   let _ = start(prepare(workflow), backend, "roomy")
   let assert Ok(saved) = storage.do_load(backend, "roomy")
-  let initial = bit_array.byte_size(storage.data(saved))
+  let initial =
+    dict.fold(storage.records(saved), 0, fn(total, _, bytes) {
+      total + bit_array.byte_size(bytes)
+    })
   // The first checkpoint fits; the next one, with the admitted input, not.
   let tight = prepare(workflow) |> durable.with_max_checkpoint_bytes(initial)
   let tight_run = reconnect(tight, backend, "roomy")
@@ -1367,7 +1371,7 @@ pub fn renewal_keeps_the_claim_and_detects_a_takeover_test() {
 
 /// `unfinished` lists executions that wait for a driver; finished ones and
 /// ones a live runner owns are left out.
-pub fn unfinished_lists_executions_waiting_for_a_driver_test() {
+pub fn list_pages_executions_waiting_for_a_driver_test() {
   let entered = process.new_subject()
   let store = start_memory()
   let backend = memory.storage(store)
@@ -1378,8 +1382,19 @@ pub fn unfinished_lists_executions_waiting_for_a_driver_test() {
   let busy = start(prepare(blocking_workflow(entered, False)), backend, "busy")
   let running = drive_later(busy)
   let assert Ok(_) = process.receive(entered, 1000)
-  durable.unfinished(backend, limit: 10) |> should.equal(Ok(["waiting"]))
-  durable.unfinished(backend, limit: 0) |> should.equal(Ok([]))
+  durable.list(backend, phase: storage.Pending, after: None, limit: 10)
+  |> should.equal(Ok(["waiting"]))
+  durable.list(backend, phase: storage.Finished, after: None, limit: 10)
+  |> should.equal(Ok(["finished"]))
+  durable.list(
+    backend,
+    phase: storage.Pending,
+    after: Some("waiting"),
+    limit: 10,
+  )
+  |> should.equal(Ok([]))
+  durable.list(backend, phase: storage.Pending, after: None, limit: 0)
+  |> should.equal(Ok([]))
   let assert Ok(Nil) = durable.cancel(busy)
   let _ = running
   memory.stop(store)
@@ -1578,7 +1593,7 @@ pub fn unchanged_checkpoint_is_not_rewritten_test() {
   let writes = process.new_subject()
   let recording =
     stores.with_commit(backend, fn(owner, change) {
-      process.send(writes, change.data)
+      process.send(writes, change.records)
       storage.do_commit(backend, owner, change)
     })
   drive(start(prepare(workflow), recording, "chain"))

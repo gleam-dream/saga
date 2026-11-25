@@ -6,7 +6,8 @@
 //// values (any holder may commit; a rebuilt claim with another token is
 //// refused), revision and generation checks, cancellation races, release,
 //// that a live owner keeps its claim, that a lost owner's claim ends within
-//// `owner_loss_within`, the `unfinished` listing, and that a
+//// `owner_loss_within`, that a commit replaces only the records it names,
+//// the paged `list` by phase, and that a
 //// `saga/durable` drive whose runner is killed frees the execution at once
 //// for the next drive, which resumes from the checkpoint. One
 //// fixture may serve several executions, as a database pool does. The
@@ -36,11 +37,13 @@
 //// an owner is gone: near zero for the memory adapter, which watches the
 //// claiming process, and the lease duration for a lease-based adapter.
 
+import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
+import gleam/string
 import gleam/time/duration.{type Duration}
 import saga
 import saga/codec
@@ -103,7 +106,8 @@ pub fn run(
       cancellation_race,
       owner_loss,
       live_owner_keeps_claim,
-      unfinished_listing,
+      records_merge,
+      listing,
       killed_runner,
     ],
     fn(check) {
@@ -151,29 +155,41 @@ fn ok(value: Result(a, storage.Error), label: String) -> Result(a, Failure) {
   result.map_error(value, fn(_) { UnexpectedResult(label) })
 }
 
-fn view(stored: Stored) -> #(Int, Int, Bool, BitArray) {
+/// Records from `#(key, text)` pairs.
+fn records(pairs: List(#(String, String))) -> Dict(String, BitArray) {
+  list.map(pairs, fn(pair) { #(pair.0, <<pair.1:utf8>>) }) |> dict.from_list
+}
+
+/// A checkpoint of one record.
+fn one(text: String) -> Dict(String, BitArray) {
+  records([#("checkpoint", text)])
+}
+
+fn view(stored: Stored) -> #(Int, Int, Bool, Dict(String, BitArray)) {
   #(
     storage.revision(stored),
     storage.generation(stored),
     storage.cancelled(stored),
-    storage.data(stored),
+    storage.records(stored),
   )
 }
 
 fn loaded(
   s: Storage,
   id: String,
-) -> Result(#(Int, Int, Bool, BitArray), storage.Error) {
+) -> Result(#(Int, Int, Bool, Dict(String, BitArray)), storage.Error) {
   storage.do_load(s, id) |> result.map(view)
 }
 
+/// Commits `records` and, when the commit succeeds, reads the execution
+/// back.
 fn commit(
   s: Storage,
   claim: Claim,
   revision: Int,
   cancelled: Bool,
-  data: BitArray,
-) -> Result(#(Int, Int, Bool, BitArray), storage.Error) {
+  records: Dict(String, BitArray),
+) -> Result(#(Int, Int, Bool, Dict(String, BitArray)), storage.Error) {
   storage.do_commit(
     s,
     claim,
@@ -181,10 +197,10 @@ fn commit(
       expected_revision: revision,
       observed_cancelled: cancelled,
       phase: storage.Pending,
-      data: data,
+      records: records,
     ),
   )
-  |> result.map(view)
+  |> result.try(fn(_) { loaded(s, storage.claim_id(claim)) })
 }
 
 fn stop(pid: process.Pid) -> Nil {
@@ -256,31 +272,28 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
     Error(storage.NotFound),
     "cancel missing",
   ))
-  use initial <- result.try(ok(
-    storage.do_create(s, id, <<"initial":utf8>>),
-    "create",
-  ))
+  use _ <- result.try(ok(storage.do_create(s, id, one("initial")), "create"))
   use _ <- result.try(equal(
-    view(initial),
-    #(0, 0, False, <<"initial":utf8>>),
+    loaded(s, id),
+    Ok(#(0, 0, False, one("initial"))),
     "initial record",
   ))
   use _ <- result.try(equal(
-    storage.do_create(s, id, <<"replacement":utf8>>) |> result.map(view),
+    storage.do_create(s, id, one("replacement")),
     Error(storage.AlreadyExists),
     "duplicate create",
   ))
   use _ <- result.try(equal(
     loaded(s, id),
-    Ok(view(initial)),
-    "duplicate create preserves data",
+    Ok(#(0, 0, False, one("initial"))),
+    "duplicate create preserves records",
   ))
   use #(owner, claimed) <- result.try(ok(storage.do_claim(s, id), "claim"))
   let generation = storage.generation(claimed)
   use _ <- result.try(equal(generation > 0, True, "claim advances generation"))
   use _ <- result.try(equal(
     #(storage.claim_id(owner), storage.claim_generation(owner), view(claimed)),
-    #(id, generation, #(0, generation, False, <<"initial":utf8>>)),
+    #(id, generation, #(0, generation, False, one("initial"))),
     "claim preserves record",
   ))
   use _ <- result.try(equal(
@@ -300,7 +313,7 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
       token: storage.claim_token(owner) <> "-forged",
     )
   use _ <- result.try(equal(
-    commit(s, forged, 0, False, <<>>),
+    commit(s, forged, 0, False, one("")),
     Error(storage.StaleOwner),
     "a generation alone grants no ownership",
   ))
@@ -316,12 +329,12 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
       token: storage.claim_token(owner),
     )
   use _ <- result.try(equal(
-    commit(s, later, 0, False, <<>>),
+    commit(s, later, 0, False, one("")),
     Error(storage.StaleOwner),
     "wrong generation",
   ))
   use _ <- result.try(equal(
-    commit(s, owner, 99, False, <<>>),
+    commit(s, owner, 99, False, one("")),
     Error(storage.Conflict),
     "wrong revision",
   ))
@@ -336,12 +349,12 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
     "refused mutations preserve record",
   ))
   use _ <- result.try(equal(
-    elsewhere(fn() { commit(s, owner, 0, False, <<"next":utf8>>) }),
-    Ok(#(1, generation, False, <<"next":utf8>>)),
+    elsewhere(fn() { commit(s, owner, 0, False, one("next")) }),
+    Ok(#(1, generation, False, one("next"))),
     "a claim is a value: another process commits with it",
   ))
   use _ <- result.try(equal(
-    commit(s, owner, 0, False, <<>>),
+    commit(s, owner, 0, False, one("")),
     Error(storage.Conflict),
     "old revision",
   ))
@@ -353,32 +366,32 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
   use _ <- result.try(equal(storage.do_cancel(s, id), Ok(Nil), "cancel twice"))
   use _ <- result.try(equal(
     loaded(s, id),
-    Ok(#(1, generation, True, <<"next":utf8>>)),
+    Ok(#(1, generation, True, one("next"))),
     "cancel preserves progress",
   ))
   use _ <- result.try(equal(
-    commit(s, owner, 1, False, <<>>),
+    commit(s, owner, 1, False, one("")),
     Error(storage.CancellationChanged),
     "unobserved cancellation",
   ))
   use _ <- result.try(equal(
-    commit(s, owner, 99, False, <<>>),
+    commit(s, owner, 99, False, one("")),
     Error(storage.CancellationChanged),
     "an unobserved cancellation takes precedence over a wrong revision",
   ))
   use _ <- result.try(equal(
-    commit(s, forged, 99, False, <<>>),
+    commit(s, forged, 99, False, one("")),
     Error(storage.StaleOwner),
     "a stale claim takes precedence over every other refusal",
   ))
   use _ <- result.try(equal(
-    commit(s, owner, 1, True, <<"cancelled":utf8>>),
-    Ok(#(2, generation, True, <<"cancelled":utf8>>)),
+    commit(s, owner, 1, True, one("cancelled")),
+    Ok(#(2, generation, True, one("cancelled"))),
     "commit observed cancellation",
   ))
   use _ <- result.try(equal(storage.do_release(s, owner), Ok(Nil), "release"))
   use _ <- result.try(equal(
-    commit(s, owner, 2, True, <<>>),
+    commit(s, owner, 2, True, one("")),
     Error(storage.StaleOwner),
     "released claim fenced",
   ))
@@ -389,7 +402,7 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
     "reclaim advances generation",
   ))
   use _ <- result.try(equal(
-    commit(s, owner, 2, True, <<>>),
+    commit(s, owner, 2, True, one("")),
     Error(storage.StaleOwner),
     "previous generation fenced",
   ))
@@ -405,7 +418,7 @@ fn lifecycle(s: Storage, _within: Int) -> Result(Nil, Failure) {
   ))
   use _ <- result.try(equal(
     loaded(s, id),
-    Ok(#(2, storage.claim_generation(next), True, <<"cancelled":utf8>>)),
+    Ok(#(2, storage.claim_generation(next), True, one("cancelled"))),
     "stale owner cannot overwrite successor",
   ))
   equal(storage.do_release(s, next), Ok(Nil), "release successor")
@@ -415,12 +428,16 @@ fn concurrent_create(s: Storage, _within: Int) -> Result(Nil, Failure) {
   let id = fresh_id()
   let ready = process.new_subject()
   let replies = process.new_subject()
-  list.each([<<"a":utf8>>, <<"b":utf8>>], fn(bytes) {
+  list.each([one("a"), one("b")], fn(created) {
     process.spawn(fn() {
       let go = process.new_subject()
       process.send(ready, go)
       process.receive_forever(go)
-      process.send(replies, storage.do_create(s, id, bytes) |> result.map(view))
+      process.send(
+        replies,
+        storage.do_create(s, id, created)
+          |> result.map(fn(_) { #(0, 0, False, created) }),
+      )
     })
   })
   let a = process.receive_forever(ready)
@@ -439,15 +456,12 @@ fn concurrent_create(s: Storage, _within: Int) -> Result(Nil, Failure) {
     "losing create reports AlreadyExists",
   ))
   let assert [winner] = winners
-  equal(loaded(s, id), Ok(winner), "winning create data survives")
+  equal(loaded(s, id), Ok(winner), "winning create records survive")
 }
 
 fn cancellation_race(s: Storage, _within: Int) -> Result(Nil, Failure) {
   let id = fresh_id()
-  use _ <- result.try(ok(
-    storage.do_create(s, id, <<"before":utf8>>),
-    "race create",
-  ))
+  use _ <- result.try(ok(storage.do_create(s, id, one("before")), "race create"))
   use #(owner, _) <- result.try(ok(storage.do_claim(s, id), "race claim"))
   let generation = storage.claim_generation(owner)
   let ready = process.new_subject()
@@ -459,16 +473,16 @@ fn cancellation_race(s: Storage, _within: Int) -> Result(Nil, Failure) {
     process.send(reply, storage.do_cancel(s, id))
   })
   process.send(process.receive_forever(ready), Nil)
-  let committed = commit(s, owner, 0, False, <<"after":utf8>>)
+  let committed = commit(s, owner, 0, False, one("after"))
   use _ <- result.try(equal(
     process.receive_forever(reply),
     Ok(Nil),
     "racing cancel succeeds",
   ))
   use expected <- result.try(case committed {
-    Ok(_) -> Ok(#(1, generation, True, <<"after":utf8>>))
+    Ok(_) -> Ok(#(1, generation, True, one("after")))
     Error(storage.CancellationChanged) ->
-      Ok(#(0, generation, True, <<"before":utf8>>))
+      Ok(#(0, generation, True, one("before")))
     _ -> Error(UnexpectedResult("cancel/commit must linearize"))
   })
   use _ <- result.try(equal(
@@ -482,7 +496,7 @@ fn cancellation_race(s: Storage, _within: Int) -> Result(Nil, Failure) {
 fn owner_loss(s: Storage, within: Int) -> Result(Nil, Failure) {
   let id = fresh_id()
   use _ <- result.try(ok(
-    storage.do_create(s, id, <<"survives":utf8>>),
+    storage.do_create(s, id, one("survives")),
     "owner-loss create",
   ))
   let reply = process.new_subject()
@@ -507,12 +521,16 @@ fn owner_loss(s: Storage, within: Int) -> Result(Nil, Failure) {
     "owner loss advances generation",
   ))
   use _ <- result.try(equal(
-    #(storage.revision(after), storage.cancelled(after), storage.data(after)),
-    #(storage.revision(before), storage.cancelled(before), storage.data(before)),
+    #(storage.revision(after), storage.cancelled(after), storage.records(after)),
+    #(
+      storage.revision(before),
+      storage.cancelled(before),
+      storage.records(before),
+    ),
     "owner loss preserves progress",
   ))
   use _ <- result.try(equal(
-    commit(s, lost, 0, False, <<>>),
+    commit(s, lost, 0, False, one("")),
     Error(storage.StaleOwner),
     "lost owner's claim fenced",
   ))
@@ -521,7 +539,7 @@ fn owner_loss(s: Storage, within: Int) -> Result(Nil, Failure) {
 
 fn live_owner_keeps_claim(s: Storage, within: Int) -> Result(Nil, Failure) {
   let id = fresh_id()
-  use _ <- result.try(ok(storage.do_create(s, id, <<>>), "live-owner create"))
+  use _ <- result.try(ok(storage.do_create(s, id, one("")), "live-owner create"))
   let #(owner, claimed) = holder(s, id)
   use _ <- result.try(claimed)
   let until = ffi.monotonic_time() + 2 * within
@@ -535,24 +553,62 @@ fn live_owner_keeps_claim(s: Storage, within: Int) -> Result(Nil, Failure) {
   equal(storage.do_release(s, successor), Ok(Nil), "live-owner release")
 }
 
-fn unfinished_listing(s: Storage, _within: Int) -> Result(Nil, Failure) {
-  let #(free, held, finished, suspended) = #(
-    fresh_id(),
-    fresh_id(),
-    fresh_id(),
-    fresh_id(),
-  )
+/// A commit replaces the records it names and keeps every other record; a
+/// refused commit writes none of its records.
+fn records_merge(s: Storage, _within: Int) -> Result(Nil, Failure) {
+  let id = fresh_id()
+  use _ <- result.try(ok(
+    storage.do_create(s, id, records([#("a", "1"), #("b", "2")])),
+    "merge create",
+  ))
+  use #(owner, _) <- result.try(ok(storage.do_claim(s, id), "merge claim"))
+  let generation = storage.claim_generation(owner)
+  use _ <- result.try(equal(
+    commit(s, owner, 0, False, records([#("b", "3"), #("c", "4")])),
+    Ok(#(1, generation, False, records([#("a", "1"), #("b", "3"), #("c", "4")]))),
+    "a commit replaces only the records it names",
+  ))
+  use _ <- result.try(equal(
+    commit(s, owner, 0, False, records([#("a", "lost"), #("d", "lost")])),
+    Error(storage.Conflict),
+    "merge conflict",
+  ))
+  use _ <- result.try(equal(
+    loaded(s, id),
+    Ok(#(1, generation, False, records([#("a", "1"), #("b", "3"), #("c", "4")]))),
+    "a refused commit writes none of its records",
+  ))
+  use _ <- result.try(equal(
+    commit(s, owner, 1, False, dict.new()),
+    Ok(#(2, generation, False, records([#("a", "1"), #("b", "3"), #("c", "4")]))),
+    "a commit with no records advances the revision",
+  ))
+  equal(storage.do_release(s, owner), Ok(Nil), "merge release")
+}
+
+/// `list` returns unowned executions of one phase in id order, page by
+/// page.
+fn listing(s: Storage, within: Int) -> Result(Nil, Failure) {
+  // One prefix per run keeps ids in order and apart from other scenarios.
+  let prefix = fresh_id() <> "-"
+  let id = fn(name) { prefix <> name }
   use _ <- result.try(
-    list.try_each([free, held, finished, suspended], fn(id) {
-      ok(storage.do_create(s, id, <<>>), "listing create")
-      |> result.replace(Nil)
-    }),
+    list.try_each(
+      ["a", "b", "c", "d", "held", "finished", "suspended"],
+      fn(name) {
+        ok(storage.do_create(s, id(name), one("")), "listing create")
+        |> result.replace(Nil)
+      },
+    ),
   )
-  let #(holder_pid, claimed) = holder(s, held)
+  let #(holder_pid, claimed) = holder(s, id("held"))
   use _ <- result.try(claimed)
   use _ <- result.try(
     list.try_each(
-      [#(finished, storage.Finished), #(suspended, storage.Suspended)],
+      [
+        #(id("finished"), storage.Finished),
+        #(id("suspended"), storage.Suspended),
+      ],
       fn(pair) {
         use #(claim, _) <- result.try(ok(
           storage.do_claim(s, pair.0),
@@ -566,7 +622,7 @@ fn unfinished_listing(s: Storage, _within: Int) -> Result(Nil, Failure) {
               expected_revision: 0,
               observed_cancelled: False,
               phase: pair.1,
-              data: <<>>,
+              records: dict.new(),
             ),
           ),
           "listing commit",
@@ -575,20 +631,75 @@ fn unfinished_listing(s: Storage, _within: Int) -> Result(Nil, Failure) {
       },
     ),
   )
-  use listed <- result.try(ok(storage.do_unfinished(s, 100_000), "unfinished"))
+  let mine = fn(listed: List(String)) {
+    list.filter(listed, fn(listed) { string.starts_with(listed, prefix) })
+  }
+  let page = fn(phase, after, limit) {
+    storage.do_list(s, storage.Listing(phase:, after:, limit:))
+    |> result.map(mine)
+  }
   use _ <- result.try(equal(
-    #(
-      list.contains(listed, free),
-      list.contains(listed, suspended),
-      list.contains(listed, held),
-      list.contains(listed, finished),
-    ),
-    #(True, True, False, False),
-    "unfinished lists unowned pending and suspended executions only",
+    page(storage.Pending, Some(prefix), 2),
+    Ok([id("a"), id("b")]),
+    "list returns the first page of pending executions in id order",
   ))
-  use limited <- result.try(ok(storage.do_unfinished(s, 1), "unfinished limit"))
+  use _ <- result.try(equal(
+    page(storage.Pending, Some(id("b")), 2),
+    Ok([id("c"), id("d")]),
+    "list continues after the given id",
+  ))
+  use _ <- result.try(equal(
+    page(storage.Pending, Some(id("d")), 10),
+    Ok([]),
+    "list skips an execution that a live claim holds",
+  ))
+  use _ <- result.try(equal(
+    page(storage.Suspended, Some(prefix), 10),
+    Ok([id("suspended")]),
+    "list filters by phase: suspended",
+  ))
+  use _ <- result.try(equal(
+    page(storage.Finished, Some(prefix), 10),
+    Ok([id("finished")]),
+    "list filters by phase: finished",
+  ))
+  use all <- result.try(ok(
+    storage.do_list(s, storage.Listing(storage.Pending, None, 100_000)),
+    "list from the start",
+  ))
+  use _ <- result.try(equal(
+    mine(all),
+    [id("a"), id("b"), id("c"), id("d")],
+    "list without a cursor starts at the first id",
+  ))
   lose(holder_pid)
-  equal(list.length(limited) <= 1, True, "unfinished respects its limit")
+  let deadline = ffi.monotonic_time() + within
+  equal(
+    listed_by(deadline, poll_interval(within), fn() {
+      page(storage.Pending, Some(id("d")), 10)
+    }),
+    Ok([id("held")]),
+    "list includes an execution once its claim is lost",
+  )
+}
+
+/// Lists until the listing is not empty or `deadline` passes.
+fn listed_by(
+  deadline: Int,
+  every: Int,
+  list: fn() -> Result(List(String), storage.Error),
+) -> Result(List(String), storage.Error) {
+  case list() {
+    Ok([]) ->
+      case ffi.monotonic_time() < deadline {
+        True -> {
+          process.sleep(every)
+          listed_by(deadline, every, list)
+        }
+        False -> Ok([])
+      }
+    result -> result
+  }
 }
 
 fn poll_interval(within: Int) -> Int {
@@ -728,7 +839,7 @@ fn reporting_claims(
 ) -> Storage {
   let rebuilt =
     storage.new(
-      create: fn(id, data) { storage.do_create(s, id, data) },
+      create: fn(id, records) { storage.do_create(s, id, records) },
       load: fn(id) { storage.do_load(s, id) },
       claim: fn(id) {
         let claimed = storage.do_claim(s, id)
@@ -741,7 +852,7 @@ fn reporting_claims(
       commit: fn(claim, change) { storage.do_commit(s, claim, change) },
       release: fn(claim) { storage.do_release(s, claim) },
       cancel: fn(id) { storage.do_cancel(s, id) },
-      unfinished: fn(limit) { storage.do_unfinished(s, limit) },
+      list: fn(listing) { storage.do_list(s, listing) },
     )
     |> storage.with_call_timeout(storage.call_timeout(s))
   case storage.renewal(s) {

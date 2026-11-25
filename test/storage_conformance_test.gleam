@@ -59,7 +59,7 @@ pub fn conformance_detects_broken_ownership_test() {
       let backend = memory.storage(store)
       let broken =
         storage.new(
-          create: fn(id, data) { storage.do_create(backend, id, data) },
+          create: fn(id, records) { storage.do_create(backend, id, records) },
           load: fn(id) { storage.do_load(backend, id) },
           claim: fn(id) { storage.do_claim(backend, id) },
           commit: fn(claim, commit) {
@@ -67,7 +67,7 @@ pub fn conformance_detects_broken_ownership_test() {
           },
           release: fn(_) { Ok(Nil) },
           cancel: fn(id) { storage.do_cancel(backend, id) },
-          unfinished: fn(limit) { storage.do_unfinished(backend, limit) },
+          list: fn(listing) { storage.do_list(backend, listing) },
         )
       Ok(conformance.fixture(broken, cleanup: fn() { memory.stop(store) }))
     },
@@ -86,7 +86,7 @@ pub fn conformance_detects_forgeable_claims_test() {
       let backend = memory.storage(store)
       let forgeable =
         storage.new(
-          create: fn(id, data) { storage.do_create(backend, id, data) },
+          create: fn(id, records) { storage.do_create(backend, id, records) },
           load: fn(id) { storage.do_load(backend, id) },
           claim: fn(id) {
             let result = storage.do_claim(backend, id)
@@ -112,7 +112,7 @@ pub fn conformance_detects_forgeable_claims_test() {
           },
           release: fn(claim) { storage.do_release(backend, claim) },
           cancel: fn(id) { storage.do_cancel(backend, id) },
-          unfinished: fn(limit) { storage.do_unfinished(backend, limit) },
+          list: fn(listing) { storage.do_list(backend, listing) },
         )
       Ok(conformance.fixture(forgeable, cleanup: fn() { memory.stop(store) }))
     },
