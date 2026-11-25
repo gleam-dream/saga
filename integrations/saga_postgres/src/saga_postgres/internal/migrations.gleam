@@ -33,5 +33,16 @@ pub fn all() -> List(Migration) {
       "CREATE INDEX saga_executions_unfinished ON saga_executions (created_at, id) WHERE phase <> 'finished'",
       "INSERT INTO saga_schema_migrations (version) VALUES (1)",
     ]),
+    // A checkpoint becomes a set of records, one row each, so that a commit
+    // writes only the records that changed. Saved checkpoints of the earlier
+    // single-record format are dropped: drain unfinished executions first.
+    Migration(2, "20261125000000-saga_postgres_v2.sql", [
+      lock,
+      "ALTER TABLE saga_executions DROP COLUMN data",
+      "CREATE TABLE saga_records (execution_id text NOT NULL REFERENCES saga_executions (id) ON DELETE CASCADE, key text NOT NULL, data bytea NOT NULL, PRIMARY KEY (execution_id, key))",
+      "DROP INDEX saga_executions_unfinished",
+      "CREATE INDEX saga_executions_listing ON saga_executions (phase, id COLLATE \"C\")",
+      "INSERT INTO saga_schema_migrations (version) VALUES (2)",
+    ]),
   ]
 }

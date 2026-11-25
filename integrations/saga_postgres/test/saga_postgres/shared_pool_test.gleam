@@ -5,6 +5,7 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
+import gleam/option.{None}
 import gleam/string
 import gleam/time/duration
 import gleeunit/should
@@ -13,6 +14,7 @@ import saga
 import saga/codec
 import saga/durable
 import saga/execution
+import saga/storage
 import saga_postgres
 import saga_postgres/support
 
@@ -85,6 +87,7 @@ pub fn one_pool_serves_the_application_and_saga_test() {
     |> pog.returning(decode.field(0, decode.int, decode.success))
     |> pog.execute(connection)
   counted.rows |> should.equal([5])
-  durable.unfinished(store, limit: 100) |> should.equal(Ok([]))
+  durable.list(store, phase: storage.Pending, after: None, limit: 100)
+  |> should.equal(Ok([]))
   support.drop(connection, schema)
 }

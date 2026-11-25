@@ -2,9 +2,11 @@
 //// often and from however many callers it runs; `with_schema` keeps
 //// stores apart and refuses unsafe names. The shipped SQL also runs independently.
 
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/list
+import gleam/option.{None}
 import gleam/string
 import gleam/time/duration
 import gleeunit/should
@@ -32,14 +34,14 @@ pub fn migrate_creates_the_schema_once_and_again_changes_nothing_test() {
   let assert Ok(config) =
     saga_postgres.config(connection) |> saga_postgres.with_schema(schema)
   saga_postgres.migrate(config) |> should.equal(Ok(Nil))
-  versions(connection, schema) |> should.equal([1])
+  versions(connection, schema) |> should.equal([1, 2])
   let store = saga_postgres.storage(config)
   let id = support.id()
-  let assert Ok(_) = storage.do_create(store, id, <<"kept":utf8>>)
+  let assert Ok(_) = storage.do_create(store, id, record("kept"))
   saga_postgres.migrate(config) |> should.equal(Ok(Nil))
-  versions(connection, schema) |> should.equal([1])
+  versions(connection, schema) |> should.equal([1, 2])
   let assert Ok(stored) = storage.do_load(store, id)
-  storage.data(stored) |> should.equal(<<"kept":utf8>>)
+  storage.records(stored) |> should.equal(record("kept"))
   support.drop(connection, schema)
 }
 
@@ -60,7 +62,7 @@ pub fn concurrent_migrations_all_succeed_and_apply_once_test() {
   })
   |> list.unique
   |> should.equal([Ok(Nil)])
-  versions(connection, schema) |> should.equal([1])
+  versions(connection, schema) |> should.equal([1, 2])
   support.drop(connection, schema)
 }
 
@@ -78,7 +80,7 @@ pub fn migrate_leaves_a_newer_schema_alone_test() {
     )
     |> pog.execute(connection)
   saga_postgres.migrate(config) |> should.equal(Ok(Nil))
-  versions(connection, schema) |> should.equal([1, 99])
+  versions(connection, schema) |> should.equal([1, 2, 99])
   support.drop(connection, schema)
 }
 
@@ -101,11 +103,11 @@ pub fn storages_in_separate_schemas_are_apart_test() {
   let other =
     saga_postgres.storage(support.migrated(connection, b, duration.seconds(30)))
   let id = support.id()
-  let assert Ok(_) = storage.do_create(one, id, <<"one":utf8>>)
+  let assert Ok(_) = storage.do_create(one, id, record("one"))
   storage.do_load(other, id) |> should.equal(Error(storage.NotFound))
-  let assert Ok(_) = storage.do_create(other, id, <<"other":utf8>>)
+  let assert Ok(_) = storage.do_create(other, id, record("other"))
   let assert Ok(stored) = storage.do_load(one, id)
-  storage.data(stored) |> should.equal(<<"one":utf8>>)
+  storage.records(stored) |> should.equal(record("one"))
   support.drop(connection, a)
   support.drop(connection, b)
 }
@@ -153,6 +155,45 @@ pub fn the_sql_files_apply_without_migrate_test() {
   let assert Ok(config) =
     saga_postgres.config(connection) |> saga_postgres.with_schema(schema)
   saga_postgres.migrate(config) |> should.equal(Ok(Nil))
-  versions(connection, schema) |> should.equal([1])
+  versions(connection, schema) |> should.equal([1, 2])
+  support.drop(connection, schema)
+}
+
+/// A checkpoint of one record.
+fn record(text: String) -> dict.Dict(String, BitArray) {
+  dict.from_list([#("checkpoint", <<text:utf8>>)])
+}
+
+/// Migrating a schema at version 1 keeps each execution's row, ownership
+/// and phase, and drops its single-record checkpoint, which no current
+/// saga can read: such an execution loads with no records.
+pub fn migrating_from_version_1_keeps_execution_rows_test() {
+  use connection <- support.using_pool(1)
+  let schema = support.schema()
+  let assert [first, ..] = migrations.all()
+  let assert Ok(_) =
+    pog.transaction(connection, fn(connection) {
+      let run = fn(sql) { pog.query(sql) |> pog.execute(connection) }
+      let assert Ok(_) = run("CREATE SCHEMA \"" <> schema <> "\"")
+      let assert Ok(_) = run("SET LOCAL search_path TO \"" <> schema <> "\"")
+      let assert Ok(_) = list.try_each(first.statements, run)
+      run(
+        "INSERT INTO saga_executions (id, revision, generation, cancelled, phase, data) VALUES ('old', 3, 1, true, 'suspended', 'bytes')",
+      )
+    })
+  let assert Ok(config) =
+    saga_postgres.config(connection) |> saga_postgres.with_schema(schema)
+  saga_postgres.migrate(config) |> should.equal(Ok(Nil))
+  versions(connection, schema) |> should.equal([1, 2])
+  let store = saga_postgres.storage(config)
+  let assert Ok(stored) = storage.do_load(store, "old")
+  #(
+    storage.revision(stored),
+    storage.cancelled(stored),
+    storage.records(stored),
+  )
+  |> should.equal(#(3, True, dict.new()))
+  storage.do_list(store, storage.Listing(storage.Suspended, None, 10))
+  |> should.equal(Ok(["old"]))
   support.drop(connection, schema)
 }
