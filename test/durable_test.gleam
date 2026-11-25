@@ -1638,3 +1638,46 @@ fn drain(from: process.Subject(a), seen: List(a)) -> List(a) {
     Error(Nil) -> list.reverse(seen)
   }
 }
+
+/// A step's worker receives what its attempt needs, not the run's state.
+/// The memory of the last step's worker grows with the step count only by
+/// the outputs an attempt may read its input from, a few words per step.
+pub fn a_worker_does_not_copy_the_run_state_test() {
+  let worker_words = fn(steps: Int) {
+    let sizes = process.new_subject()
+    let workflow =
+      saga.define("chain", fn(input) {
+        list.fold(chain_numbers(steps, []), input, fn(port, number) {
+          saga.perform(
+            port,
+            text_step("step-" <> string.inspect(number), fn(value) {
+              case number == steps {
+                True -> process.send(sizes, total_heap_words())
+                False -> Nil
+              }
+              Ok(value)
+            }),
+          )
+        })
+      })
+    let store = start_memory()
+    let assert Ok(execution.Completed(_)) =
+      drive(start(prepare(workflow), memory.storage(store), "chain"))
+    memory.stop(store)
+    let assert Ok(words) = process.receive(sizes, 0)
+    words
+  }
+  let short = worker_words(5)
+  let long = worker_words(80)
+  #(long - short <= 16 * 75, short, long) |> should.equal(#(True, short, long))
+}
+
+fn chain_numbers(up_to: Int, acc: List(Int)) -> List(Int) {
+  case up_to {
+    0 -> acc
+    _ -> chain_numbers(up_to - 1, [up_to, ..acc])
+  }
+}
+
+@external(erlang, "saga_test_heap", "total_heap_words")
+fn total_heap_words() -> Int
