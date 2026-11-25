@@ -16,8 +16,8 @@ gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 # The storage port with per-step records and paged listing is not released
 # yet: pinned to the integrated redesign commit until the next saga release.
-saga = { git = "https://github.com/gleam-dream/saga.git", ref = "18436daaa360d422ee8eff5ab3e5f988f0bed3a1" }
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "29ea7a90bf820b3c91eb3f76e824abe0d034d78f" }
+saga = { git = "https://github.com/gleam-dream/saga.git", ref = "ec31675925d65552c3c70a4b4e5a8742661f8329" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "02d386e070c6a99900225c613e8d273f3bebe3c2" }
 # Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`: an application that
 # uses both saga_postgres and grind shares one pog/pgo pool (the app's own
 # `pog.Connection` serves the app, grind and saga), and grind pins these exact
