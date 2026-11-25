@@ -1560,3 +1560,41 @@ pub fn classified_resolver_failure_follows_on_unknown_test() {
   process.receive(released, 1000) |> should.equal(Ok(Nil))
   memory.stop(store)
 }
+
+/// Every commit a durable run makes carries a checkpoint that differs from
+/// the one it last wrote: a coordinator message that changes nothing saved
+/// (a finished worker's exit, a timer that lost its race) writes nothing.
+pub fn unchanged_checkpoint_is_not_rewritten_test() {
+  let workflow =
+    saga.define("chain", fn(input) {
+      input
+      |> saga.perform(text_step("a", fn(value) { Ok(value <> "a") }))
+      |> saga.perform(text_step("b", fn(value) { Ok(value <> "b") }))
+      |> saga.perform(text_step("c", fn(value) { Ok(value <> "c") }))
+      |> saga.perform(text_step("d", fn(value) { Ok(value <> "d") }))
+    })
+  let store = start_memory()
+  let backend = memory.storage(store)
+  let writes = process.new_subject()
+  let recording =
+    stores.with_commit(backend, fn(owner, change) {
+      process.send(writes, change.data)
+      storage.do_commit(backend, owner, change)
+    })
+  drive(start(prepare(workflow), recording, "chain"))
+  |> should.equal(Ok(execution.Completed("xabcd")))
+  let written = drain(writes, [])
+  let repeats =
+    list.window_by_2(written)
+    |> list.filter(fn(pair) { pair.0 == pair.1 })
+    |> list.length
+  #(repeats, list.length(written) > 4) |> should.equal(#(0, True))
+  memory.stop(store)
+}
+
+fn drain(from: process.Subject(a), seen: List(a)) -> List(a) {
+  case process.receive(from, 0) {
+    Ok(value) -> drain(from, [value, ..seen])
+    Error(Nil) -> list.reverse(seen)
+  }
+}

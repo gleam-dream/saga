@@ -989,12 +989,20 @@ fn drive_claimed(
           snapshot: envelope.snapshot,
           cancelled: cancelled,
           save: fn(snapshot) {
-            commit(
-              fn(current) {
-                Envelope(..current, snapshot: Some(snapshot), issue: None)
-              },
-              storage.Pending,
-            )
+            // A coordinator message that changed nothing saved (a finished
+            // worker's exit, a timer that lost its race) writes nothing.
+            let assert Ok(#(revision, current)) = process.receive(committed, 0)
+            process.send(committed, #(revision, current))
+            case current.snapshot == Some(snapshot) && current.issue == None {
+              True -> Ok(Nil)
+              False ->
+                commit(
+                  fn(current) {
+                    Envelope(..current, snapshot: Some(snapshot), issue: None)
+                  },
+                  storage.Pending,
+                )
+            }
           },
           failed: fn(reason) {
             // Keep the last committed checkpoint: admissions that were not

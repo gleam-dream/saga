@@ -285,6 +285,10 @@ type RunState(o, e, u) {
     blocked: Option(checkpoint.Failure),
     resume_nodes: Set(Int),
     inputs: Dict(Int, String),
+    // The encoded input, output and undo marker of each completed node, kept
+    // from the first checkpoint that saved them. A completed node's values
+    // never change, so later checkpoints reuse the text.
+    frozen: Dict(Int, List(String)),
     resume_undos: Set(Int),
     deadline_at: Option(Int),
     workflow_name: String,
@@ -513,6 +517,7 @@ fn run(
       blocked: None,
       resume_nodes: set.new(),
       inputs: dict.new(),
+      frozen: dict.new(),
       resume_undos: set.new(),
       deadline_at: option.map(deadline, fn(ms) { ffi.system_time() + ms }),
       workflow_name: workflow_name,
@@ -641,7 +646,7 @@ fn advance(
     _, _ ->
       case checkpoint(state) {
         Error(reason) -> Suspend(state, reason)
-        Ok(Nil) -> {
+        Ok(state) -> {
           let state = start_saved_timers(state)
           list.each(state.dispatch, fn(permit) { process.send(permit, Nil) })
           let state = RunState(..state, dispatch: [], pending_starts: [])
@@ -2771,66 +2776,87 @@ fn saved_address(address: StepAddress) -> checkpoint.Address {
   checkpoint.Address(address.scope, address.name, address.occurrence)
 }
 
-fn checkpoint(state: RunState(o, e, u)) -> Result(Nil, checkpoint.Failure) {
+/// Commits `state` when the run is durable and returns it with the encoded
+/// values that commit produced, for the next checkpoint to reuse.
+fn checkpoint(
+  state: RunState(o, e, u),
+) -> Result(RunState(o, e, u), checkpoint.Failure) {
   case state.blocked, state.persistence {
     Some(reason), _ -> Error(reason)
-    None, None -> Ok(Nil)
+    None, None -> Ok(state)
     None, Some(session) -> {
-      use snapshot <- result.try(freeze(state))
-      session.save(snapshot)
+      use #(snapshot, frozen) <- result.try(freeze(state))
+      use _ <- result.map(session.save(snapshot))
+      RunState(..state, frozen: frozen)
     }
   }
 }
 
 fn freeze(
   state: RunState(o, e, u),
-) -> Result(Snapshot(e, u), checkpoint.Failure) {
+) -> Result(#(Snapshot(e, u), Dict(Int, List(String))), checkpoint.Failure) {
   let progress = build_progress(state)
-  use nodes <- result.try(
-    list.try_map(list.zip(state.order, progress.steps), fn(pair) {
-      let #(id, progress) = pair
-      let assert Ok(n) = dict.get(state.nodes, id)
-      let values = case progress.state {
-        Succeeded | Undoing | Undone | UndoFailedStep ->
-          case n.persistence {
-            Some(p) ->
-              p.freeze(state.store, step_base(state, id), state.correlation)
-              |> result.map_error(checkpoint.at(_, saved_address(n.address)))
-            None -> Error(checkpoint.InvalidState(checkpoint.Malformed))
-          }
-        Attempting(_) | Compensating(_) ->
-          Ok(case dict.get(state.inputs, id) {
-            Ok(input) -> [input]
-            Error(_) -> []
-          })
-        _ -> Ok([])
-      }
-      use values <- result.try(values)
-      let retry_at = case dict.get(state.state, id) {
-        Ok(NodeRetryScheduled(_, _, due)) -> due
-        _ -> 0
-      }
-      Ok(SavedNode(progress.state, values, retry_at))
-    }),
+  use #(frozen, nodes) <- result.try(
+    list.try_fold(
+      list.zip(state.order, progress.steps),
+      #(state.frozen, []),
+      fn(acc, pair) {
+        let #(frozen, saved) = acc
+        let #(id, progress) = pair
+        let assert Ok(n) = dict.get(state.nodes, id)
+        let values = case progress.state {
+          Succeeded | Undoing | Undone | UndoFailedStep ->
+            case dict.get(frozen, id), n.persistence {
+              Ok(values), _ -> Ok(#(frozen, values))
+              Error(Nil), Some(p) ->
+                p.freeze(state.store, step_base(state, id), state.correlation)
+                |> result.map(fn(values) {
+                  #(dict.insert(frozen, id, values), values)
+                })
+                |> result.map_error(checkpoint.at(_, saved_address(n.address)))
+              Error(Nil), None ->
+                Error(checkpoint.InvalidState(checkpoint.Malformed))
+            }
+          Attempting(_) | Compensating(_) ->
+            Ok(
+              #(frozen, case dict.get(state.inputs, id) {
+                Ok(input) -> [input]
+                Error(_) -> []
+              }),
+            )
+          _ -> Ok(#(frozen, []))
+        }
+        use #(frozen, values) <- result.try(values)
+        let retry_at = case dict.get(state.state, id) {
+          Ok(NodeRetryScheduled(_, _, due)) -> due
+          _ -> 0
+        }
+        Ok(#(frozen, [SavedNode(progress.state, values, retry_at), ..saved]))
+      },
+    ),
   )
+  let nodes = list.reverse(nodes)
   let phase = case state.phase {
     PhaseRunning -> SavedRunning
     PhaseSettling(trigger, settlement, _, _) ->
       SavedSettling(trigger, settlement)
     PhaseRollingBack(trigger, settlement) -> SavedRollback(trigger, settlement)
   }
-  Ok(Snapshot(
-    nodes,
-    list.map(state.journal, fn(entry) {
-      dict.get(state.positions, entry.node_id) |> result.unwrap(-1)
-    }),
-    phase,
-    dict.to_list(state.last_failure)
-      |> list.map(fn(pair) {
-        #(dict.get(state.positions, pair.0) |> result.unwrap(-1), pair.1)
+  Ok(#(
+    Snapshot(
+      nodes,
+      list.map(state.journal, fn(entry) {
+        dict.get(state.positions, entry.node_id) |> result.unwrap(-1)
       }),
-    state.unknown_effects,
-    state.deadline_at,
+      phase,
+      dict.to_list(state.last_failure)
+        |> list.map(fn(pair) {
+          #(dict.get(state.positions, pair.0) |> result.unwrap(-1), pair.1)
+        }),
+      state.unknown_effects,
+      state.deadline_at,
+    ),
+    frozen,
   ))
 }
 

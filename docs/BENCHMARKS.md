@@ -67,9 +67,15 @@ Use the command above to capture the current checkout. To reproduce the historic
 report, run its recorded harness/revisions with the recorded configuration;
 missing capture metadata prevents an exact environment reproduction.
 
+## Durable checkpoint cost
+
+`cd bench && gleam run -m durable_writes` drives a chain of N durable steps on the in-memory adapter and counts the checkpoint commits, the bytes those commits carry and the calls of the step output encoder. Each step saves a 1 KB input and a 1 KB output. The counts are exact for a given revision; the time column is observational.
+
+A durable run commits when its saved state changes: twice per step in a chain (admission with the encoded input, then the result), plus three for the run. Each commit still carries the whole checkpoint, so the bytes committed grow with the square of the step count: about 93 MB for 200 steps in this workload. A completed step's values are encoded once per drive.
+
 ## Limits
 
-- Trivial integer steps isolate graph/scheduling overhead. These measurements do not establish remote-effect latency, rollback cost, durable-storage throughput, application memory limits or production tail latency.
+- Trivial integer steps isolate graph/scheduling overhead. These measurements do not establish remote-effect latency, rollback cost, durable-storage throughput on a real database, application memory limits or production tail latency.
 - Definition has one sample per cell; small timings, compilation/JIT warm-up, scheduling and machine load affect comparisons. Doubling ratios and isolated profiles are evidence for a specific cost hypothesis, not an asymptotic proof.
 - Historical findings and the exact earlier tables are linked from [ADR 0002](adr/0002-build-once-run-scoped-values.md). The [native design](design/execution/design.typ#coordinator-internals) owns the storage/readiness contract.
 

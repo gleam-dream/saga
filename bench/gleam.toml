@@ -8,5 +8,6 @@ description = "Throwaway benchmark harness for saga's run cost against step coun
 [dependencies]
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_time = ">= 1.11.0 and < 2.0.0"
 saga = { path = ".." }
 sinal = ">= 0.1.0 and < 0.2.0"
