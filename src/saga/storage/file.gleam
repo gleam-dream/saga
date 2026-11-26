@@ -6,9 +6,11 @@
 //// named after its id, with one file per record and a head file that
 //// indexes them. A commit writes its records to new synced files, then
 //// atomically renames a new head file over the old one, so it writes only
-//// the records that changed. A claim lasts while the claiming process
-//// lives in this VM; a file written by an earlier VM is unowned, so a fresh
-//// VM can resume it at once. The directory must be a canonical absolute
+//// the records that changed. A load takes no lock: when a concurrent commit
+//// removed a record file it needed, it reads the new head and the files it
+//// lacks, so it returns one committed revision. A claim lasts while the
+//// claiming process lives in this VM; a file written by an earlier VM is
+//// unowned, so a fresh VM can resume it at once. The directory must be a canonical absolute
 //// path, and the caller creates it. Concurrent VMs, path aliases and
 //// power-loss durability of the directory are unsupported; use the
 //// `saga_postgres` package to share executions across VMs.
