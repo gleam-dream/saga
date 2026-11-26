@@ -19,8 +19,8 @@ packages = [
   { name = "pg_types", version = "0.6.0", build_tools = ["rebar3"], requirements = [], otp_app = "pg_types", source = "hex", outer_checksum = "9949A4849DD13408FA249AB7B745E0D2DFDB9532AEE2B9722326E33CD082A778" },
   { name = "pgo", version = "0.20.0", build_tools = ["rebar3"], requirements = ["backoff", "opentelemetry_api", "pg_types"], otp_app = "pgo", source = "hex", outer_checksum = "2F11E6649CEB38E569EF56B16BE1D04874AE5B11A02867080A2817CE423C683B" },
   { name = "pog", version = "4.1.0", build_tools = ["gleam"], requirements = ["exception", "gleam_erlang", "gleam_otp", "gleam_stdlib", "gleam_time", "pgo"], otp_app = "pog", source = "hex", outer_checksum = "E4AFBA39A5FAA2E77291836C9683ADE882E65A06AB28CA7D61AE7A3AD61EBBD5" },
-  { name = "saga", version = "0.2.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_json", "gleam_otp", "gleam_stdlib", "gleam_time", "sinal"], source = "git", repo = "https://github.com/gleam-dream/saga.git", commit = "ec31675925d65552c3c70a4b4e5a8742661f8329" },
-  { name = "sinal", version = "0.1.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib", "telemetry"], source = "git", repo = "https://github.com/gleam-dream/sinal.git", commit = "02d386e070c6a99900225c613e8d273f3bebe3c2" },
+  { name = "saga", version = "0.3.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_json", "gleam_otp", "gleam_stdlib", "gleam_time", "sinal"], otp_app = "saga", source = "hex", outer_checksum = "CEF215C45CB4513010BC46EEF810772C4963A2ED3A758F79405A93E65ACF4813" },
+  { name = "sinal", version = "0.2.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib", "telemetry"], otp_app = "sinal", source = "hex", outer_checksum = "189D51F9DF72FDC25B0644CD0479523339D00CA2F9BA09E91515E5160EE68E0C" },
   { name = "telemetry", version = "1.4.3", build_tools = ["rebar3"], requirements = [], otp_app = "telemetry", source = "hex", outer_checksum = "17A63581CF2E832A238287F5FE6811E8CA1F333249F1376AD653164A3C4770D4" },
 ]
 
@@ -31,5 +31,5 @@ gleam_time = { version = ">= 1.11.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 pgo = { version = ">= 0.20.0 and < 0.21.0" }
 pog = { version = ">= 4.1.0 and < 4.2.0" }
-saga = { git = "https://github.com/gleam-dream/saga.git", ref = "ec31675925d65552c3c70a4b4e5a8742661f8329" }
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "02d386e070c6a99900225c613e8d273f3bebe3c2" }
+saga = { version = ">= 0.3.0 and < 0.4.0" }
+sinal = { version = ">= 0.2.0 and < 0.3.0" }
