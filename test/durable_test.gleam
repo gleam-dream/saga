@@ -1735,6 +1735,9 @@ pub fn resumed_attempt_permitted_after_settling_began_stays_absent_test() {
   let second = drive_later(reconnect(persistence, backend, "late-settling"))
   let assert Ok(release) = process.receive(resolving, 1000)
   let assert Ok(answer) = process.receive(failing, 1000)
+  // `fail`'s admission was committed before it ran; the next commit is the
+  // one that saves its failure and the settling phase.
+  let _ = drain(commits, [])
   process.send(answer, False)
   let assert Ok(Nil) = process.receive(commits, 1000)
   process.send(release, Nil)
