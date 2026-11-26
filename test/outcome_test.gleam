@@ -308,6 +308,22 @@ pub fn an_unresolved_workflow_is_uncertain_test() {
   )
 }
 
+/// A held timeout may be the attempt's or its decider's, so the evidence
+/// names the kind of failure and not the action that failed.
+pub fn an_unresolved_timeout_names_no_action_test() {
+  let settlement =
+    execution.Settlement(..clean(), undone: [], held: [at("charge")])
+  let assert Error(verdict.Unknown(evidence)) =
+    verdict.classify(
+      execution.Unresolved(at("charge"), saga.TimedOut, settlement),
+      explain,
+    )
+  evidence
+  |> should.equal(
+    "the workflow's effects are not known: the workflow held the effects of step charge unresolved: a timeout left the step's outcome unknown; Saga reported unresolved at charge; held charge",
+  )
+}
+
 /// A held returned error ends the run `Unresolved` with that error, which
 /// `explain` renders after the unknown effects.
 pub fn a_held_decision_renders_its_evidence_test() {
