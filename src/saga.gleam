@@ -1166,14 +1166,14 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
             None -> Ok(produce_value())
           })
           use encoded <- result.try(codec.encode(p.input, value))
-          node_attempt.admit(encoded)
-          Ok(value)
+          Ok(#(value, node_attempt.admit(encoded)))
         }
-        _, _ -> Ok(produce_value())
+        _, _ -> Ok(#(produce_value(), node.Admitted))
       }
       case prepared {
         Error(error) -> node.AttemptBlocked(input_failure(error))
-        Ok(value) ->
+        Ok(#(_, node.Refused)) -> node.AttemptAbsent
+        Ok(#(value, node.Admitted)) ->
           case
             step.attempt(
               value,
@@ -1430,11 +1430,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                 Error(failure) -> node.AttemptBlocked(failure)
                 Ok(input) ->
                   case attempt.saved_input {
-                    None ->
-                      case attempt.stopping {
-                        True -> node.AttemptAbsent
-                        False -> prepare_attempt(attempt, run_store)()
-                      }
+                    None -> prepare_attempt(attempt, run_store)()
                     Some(_) ->
                       case resumed(input, key) {
                         ResumedMaybeSent ->
@@ -1445,11 +1441,7 @@ pub fn perform(input: Port(i, e, u), step: Step(i, o, e, u)) -> Port(o, e, u) {
                               saved_key(key),
                             )),
                           )
-                        ResumedNotSent ->
-                          case attempt.stopping {
-                            True -> node.AttemptAbsent
-                            False -> prepare_attempt(attempt, run_store)()
-                          }
+                        ResumedNotSent -> prepare_attempt(attempt, run_store)()
                         ResumedCompleted(output) ->
                           succeeded(
                             input,

@@ -1651,6 +1651,99 @@ pub fn settling_resume_does_not_start_a_proven_unsent_effect_test() {
   memory.stop(store)
 }
 
+/// A resumed attempt asks for permission when its input is ready, not when
+/// its worker starts: when a sibling fails while the resolver runs, the
+/// run is settling by then, and an attempt proven not sent stays absent.
+pub fn resumed_attempt_permitted_after_settling_began_stays_absent_test() {
+  let entered = process.new_subject()
+  let resolving = process.new_subject()
+  let failing = process.new_subject()
+  let owner = process.new_subject()
+  let commits = process.new_subject()
+  let effect =
+    saga.step("effect", fn(value) {
+      process.send(entered, Nil)
+      process.sleep_forever()
+      Ok(value)
+    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) {
+        let release = process.new_subject()
+        process.send(resolving, release)
+        process.receive_forever(release)
+        durable.NotSent
+      },
+    )
+  let fail =
+    saga.step("fail", fn(_) {
+      // The test answers whether this attempt waits until its runner is
+      // killed (the first drive) or fails at once (the second).
+      let answer = process.new_subject()
+      process.send(failing, answer)
+      case process.receive_forever(answer) {
+        True -> process.sleep_forever()
+        False -> Nil
+      }
+      Error("boom")
+    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.NotSent },
+    )
+  let workflow =
+    saga.define("late-settling", fn(input) {
+      saga.both(saga.perform(input, effect), saga.perform(input, fail))
+      |> saga.map(fn(pair) { pair.0 <> pair.1 })
+    })
+  let persistence =
+    durable.new(
+      workflow,
+      input: codec.text(),
+      output: codec.text(),
+      error: codec.text(),
+      undo_error: codec.text(),
+    )
+    |> durable.with_config(
+      execution.config()
+      |> execution.with_step_timeout(execution.Infinity)
+      |> execution.with_settle_timeout(duration.seconds(2)),
+    )
+  let store = start_memory()
+  let watched = stores.watched(memory.storage(store), owner)
+  let backend =
+    stores.with_commit(watched, fn(claim, change) {
+      let saved = storage.do_commit(watched, claim, change)
+      process.send(commits, Nil)
+      saved
+    })
+  // First drive: both steps are admitted and interrupted.
+  let first = drive_later(start(persistence, backend, "late-settling"))
+  let assert Ok(pid) = process.receive(owner, 1000)
+  let assert Ok(Nil) = process.receive(entered, 1000)
+  let assert Ok(answer) = process.receive(failing, 1000)
+  process.send(answer, True)
+  kill_and_wait(pid)
+  let _ = process.receive(first, 1000)
+  let _ = drain(commits, [])
+  // Second drive: `effect`'s resolver waits while `fail` runs again and
+  // fails, which commits the settling phase.
+  let second = drive_later(reconnect(persistence, backend, "late-settling"))
+  let assert Ok(release) = process.receive(resolving, 1000)
+  let assert Ok(answer) = process.receive(failing, 1000)
+  process.send(answer, False)
+  let assert Ok(Nil) = process.receive(commits, 1000)
+  process.send(release, Nil)
+  let assert Ok(Ok(execution.Failed(execution.StepFailed(_, "boom"), _))) =
+    process.receive(second, 1000)
+  process.receive(entered, 0) |> should.equal(Error(Nil))
+  memory.stop(store)
+}
+
 /// A resumed admission is fenced by the runner's claim even when the
 /// checkpoint it saves is unchanged: a runner whose claim was taken over
 /// (here, every commit is refused as stale) never starts the step again.

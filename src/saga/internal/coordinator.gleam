@@ -203,7 +203,13 @@ pub type Progress {
 /// Messages the control subject accepts. Owned by the coordinator process;
 /// `saga/execution` only ever talks to it through these.
 pub type Control(o, e, u) {
-  InputPrepared(node_id: Int, seq: Int, input: String, reply: Subject(Nil))
+  InputPrepared(
+    node_id: Int,
+    seq: Int,
+    input: String,
+    admitted: Subject(Nil),
+    refused: Subject(Nil),
+  )
   AttemptDone(node_id: Int, seq: Int, result: AttemptResult(e, u))
   RecoveryDone(node_id: Int, seq: Int, recovery: ErasedRecovery(e, u))
   TaskCrashed(node_id: Int, seq: Int, crash: node.Crash)
@@ -1117,9 +1123,16 @@ fn start_attempt(
   let control = state.control
   let attempt =
     node.Attempt(..attempt, admit: fn(input) {
-      let reply = process.new_subject()
-      process.send(control, InputPrepared(node_id, seq, input, reply))
-      process.receive_forever(reply)
+      let admitted = process.new_subject()
+      let refused = process.new_subject()
+      process.send(
+        control,
+        InputPrepared(node_id, seq, input, admitted, refused),
+      )
+      process.new_selector()
+      |> process.select_map(admitted, fn(_) { node.Admitted })
+      |> process.select_map(refused, fn(_) { node.Refused })
+      |> process.selector_receive_forever
     })
   let body = case set.contains(state.resume_nodes, node_id), n.persistence {
     True, Some(p) -> p.resume(attempt, state.store)
@@ -1181,15 +1194,20 @@ fn handle_control(
   message: Control(o, e, u),
 ) -> RunState(o, e, u) {
   case message {
-    InputPrepared(id, seq, input, reply) ->
-      case current_attempt_seq(state, id) == Some(seq) {
-        True ->
+    InputPrepared(id, seq, input, admitted, refused) ->
+      case current_attempt_seq(state, id) == Some(seq), stopping(state) {
+        True, False ->
           RunState(
             ..state,
             inputs: dict.insert(state.inputs, id, input),
-            dispatch: [reply, ..state.dispatch],
+            dispatch: [admitted, ..state.dispatch],
           )
-        False -> state
+        // A stopping run admits no new work: the attempt settles as absent.
+        True, True -> {
+          process.send(refused, Nil)
+          state
+        }
+        False, _ -> state
       }
     AttemptDone(node_id, seq, result) ->
       handle_attempt_done(state, node_id, seq, result)
@@ -3218,19 +3236,21 @@ fn attempt_context(
     number,
     maximum - number,
     step_base(state, id),
-    // A stopping run admits no new work: a recorded cancellation, or a
-    // phase past running, means an interrupted attempt proven absent stays
-    // absent.
-    case state.persistence, state.phase {
-      Some(Session(cancelled: True, ..)), _ -> True
-      _, PhaseSettling(..) | _, PhaseRollingBack(..) -> True
-      _, PhaseRunning -> False
-    },
     option.is_some(state.persistence),
     dict.get(state.inputs, id) |> option.from_result,
-    fn(_) { Nil },
+    fn(_) { node.Admitted },
     state.correlation,
   )
+}
+
+/// Whether the run admits no new work: a recorded cancellation, or a phase
+/// past running.
+fn stopping(state: RunState(o, e, u)) -> Bool {
+  case state.persistence, state.phase {
+    Some(Session(cancelled: True, ..)), _ -> True
+    _, PhaseSettling(..) | _, PhaseRollingBack(..) -> True
+    _, PhaseRunning -> False
+  }
 }
 
 /// Effect timeouts begin after the admission checkpoint, when work is released.

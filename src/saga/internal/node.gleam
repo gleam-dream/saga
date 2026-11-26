@@ -25,20 +25,29 @@ pub type StepAddress {
 
 /// One attempt as the coordinator dispatches it. `base` is the step's stable
 /// key within its execution (`<bytes>:<execution>:<position>`), from which
-/// `saga` derives every public `EffectKey` of the step. `stopping` is true
-/// when the run was cancelled or is settling or rolling back, so a resumed
-/// attempt proven absent must not start.
+/// `saga` derives every public `EffectKey` of the step. A persistent attempt
+/// calls `admit` with its encoded input before its effect and starts only
+/// when the coordinator answers `Admitted`; the coordinator decides then,
+/// not when the worker started, so an attempt whose run began stopping in
+/// between stays absent.
 pub type Attempt {
   Attempt(
     number: Int,
     remaining: Int,
     base: String,
-    stopping: Bool,
     persistent: Bool,
     saved_input: Option(String),
-    admit: fn(String) -> Nil,
+    admit: fn(String) -> Admission,
     correlation: Correlation,
   )
+}
+
+/// The coordinator's answer to an attempt that asks to start: `Admitted`
+/// once its input is committed, `Refused` when the run is stopping
+/// (cancelled, settling, or rolling back) and admits no new work.
+pub type Admission {
+  Admitted
+  Refused
 }
 
 /// What a recovery resolver established about an interrupted action:
