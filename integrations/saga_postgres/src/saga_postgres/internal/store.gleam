@@ -2,10 +2,13 @@
 //// per execution with its revision, ownership, cancellation and phase, and
 //// `saga_records`, one row per checkpoint record.
 ////
-//// Every write is one conditional statement, committed on its own: a commit
-//// updates the execution row and upserts its records in one statement, so
-//// a refused commit writes no record. Every read of records is one
-//// statement too, so it sees one committed revision. A statement that
+//// Every write but a claim is one conditional statement, committed on its
+//// own: a commit updates the execution row and upserts its records in one
+//// statement, so a refused commit writes no record. A claim updates the
+//// execution row and reads its records in one READ COMMITTED transaction,
+//// so the records it returns belong to its own generation and a failed
+//// read takes no ownership. Every other read of records is one statement,
+//// so it sees one committed revision. A statement that
 //// changes no row is diagnosed by a later read, which can observe further
 //// concurrent changes. Commit diagnosis checks missing
 //// execution, then ownership, cancellation and progress disagreements.
@@ -189,6 +192,10 @@ fn load(
     |> pog.returning(row_decoder())
     |> execute(connection),
   )
+  stored_from_rows(rows)
+}
+
+fn stored_from_rows(rows: List(Row)) -> Result(Stored, storage.Error) {
   case rows {
     [] -> Error(storage.NotFound)
     [first, ..] ->
@@ -241,31 +248,82 @@ fn owns(owner: Owner, claim: Claim) -> Bool {
   && owner.generation == storage.claim_generation(claim)
 }
 
+/// What one claim transaction established: a claim with the records of
+/// its generation, or that a live claim holds the execution (or it is
+/// absent).
+type Claimed {
+  Claimed(Claim, List(Row))
+  NotClaimed
+}
+
 fn claim(
   connection: pog.Connection,
   sql: Statements,
   lease: Int,
   id: String,
 ) -> Result(#(Claim, Stored), storage.Error) {
-  use rows <- result.try(
-    pog.query(sql.claim)
-    |> pog.parameter(pog.text(id))
-    |> pog.parameter(pog.int(lease))
-    |> pog.returning({
-      use token <- decode.field(0, decode.string)
-      use generation <- decode.field(1, decode.int)
-      decode.success(#(token, generation))
+  claim_attempt(connection, sql, lease, id, 3)
+}
+
+/// Takes the claim and reads the records in one READ COMMITTED
+/// transaction. The claim's update holds the execution row's lock until the
+/// transaction ends, so no commit can change the records between the two
+/// statements, and the read sees every commit made before the claim. A read
+/// that fails rolls the claim back, so a failed claim takes no ownership.
+fn claim_attempt(
+  connection: pog.Connection,
+  sql: Statements,
+  lease: Int,
+  id: String,
+  attempts: Int,
+) -> Result(#(Claim, Stored), storage.Error) {
+  let claimed =
+    pog.transaction(connection, fn(connection) {
+      use _ <- result.try(
+        pog.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        |> pog.timeout(query_timeout)
+        |> pog.execute(connection),
+      )
+      use claimed <- result.try(
+        pog.query(sql.claim)
+        |> pog.parameter(pog.text(id))
+        |> pog.parameter(pog.int(lease))
+        |> pog.returning({
+          use token <- decode.field(0, decode.string)
+          use generation <- decode.field(1, decode.int)
+          decode.success(#(token, generation))
+        })
+        |> pog.timeout(query_timeout)
+        |> pog.execute(connection),
+      )
+      case claimed.rows {
+        [#(token, generation)] -> {
+          use loaded <- result.try(
+            pog.query(sql.load)
+            |> pog.parameter(pog.text(id))
+            |> pog.returning(row_decoder())
+            |> pog.timeout(query_timeout)
+            |> pog.execute(connection),
+          )
+          Ok(Claimed(storage.claim(id:, generation:, token:), loaded.rows))
+        }
+        _ -> Ok(NotClaimed)
+      }
     })
-    |> execute(connection),
-  )
-  case rows {
-    // Read the records once the claim is committed: no other claim can
-    // commit now, so the read sees the revision this claim starts from.
-    [#(token, generation)] -> {
-      use stored <- result.try(load(connection, sql, id))
-      Ok(#(storage.claim(id:, generation:, token:), stored))
-    }
-    _ -> owner(connection, sql, id) |> result.try(fn(_) { Error(storage.Busy) })
+  case claimed {
+    Ok(Claimed(claim, rows)) ->
+      stored_from_rows(rows) |> result.map(fn(stored) { #(claim, stored) })
+    Ok(NotClaimed) ->
+      owner(connection, sql, id) |> result.try(fn(_) { Error(storage.Busy) })
+    Error(pog.TransactionQueryError(error))
+    | Error(pog.TransactionRolledBack(error)) ->
+      case error {
+        // A serialization failure or a deadlock rolled everything back.
+        pog.PostgresqlError(code:, ..)
+          if attempts > 1 && { code == "40001" || code == "40P01" }
+        -> claim_attempt(connection, sql, lease, id, attempts - 1)
+        _ -> Error(from_query_error(error))
+      }
   }
 }
 

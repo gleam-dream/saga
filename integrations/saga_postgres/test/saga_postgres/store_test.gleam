@@ -221,3 +221,29 @@ pub fn an_expired_claim_commits_until_it_is_replaced_test() {
   |> should.equal(Error(storage.StaleOwner))
   support.drop(connection, schema)
 }
+
+/// A claim and the records it returns are one atomic unit: a claim whose
+/// read of the records fails takes no ownership, so a retry claims at once,
+/// and an accepted claim returns the records of its own generation.
+pub fn a_claim_whose_read_fails_takes_no_ownership_test() {
+  use connection <- support.using_pool(2)
+  let schema = support.schema()
+  let store = fresh(connection, schema)
+  let id = support.id()
+  let assert Ok(_) = storage.do_create(store, id, dict.new())
+  let rename = fn(from, to) {
+    let assert Ok(_) =
+      pog.query(
+        "ALTER TABLE \"" <> schema <> "\"." <> from <> " RENAME TO " <> to,
+      )
+      |> pog.execute(connection)
+    Nil
+  }
+  rename("saga_records", "saga_records_away")
+  let assert Error(storage.Unavailable(_)) = storage.do_claim(store, id)
+  rename("saga_records_away", "saga_records")
+  let assert Ok(#(claim, stored)) = storage.do_claim(store, id)
+  storage.generation(stored) |> should.equal(storage.claim_generation(claim))
+  storage.claim_generation(claim) |> should.equal(1)
+  support.drop(connection, schema)
+}
