@@ -4,7 +4,9 @@
 //// Use this module to observe runs started with `saga/execution` or
 //// `saga/durable`. Each function returns a typed `sinal.Event` descriptor;
 //// attach a handler to it with `sinal.observe` or `sinal.attach`. This
-//// module owns the events, not handler registration.
+//// module owns the events, not handler registration. A Sinal handler
+//// detaches when the process that attached it exits, so attach from a
+//// process that outlives the runs it observes, such as a supervised one.
 ////
 //// Every metadata record carries:
 ////

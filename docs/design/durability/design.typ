@@ -42,7 +42,7 @@
     ("suspended", "suspended", "evidence remains unresolved"),
   ), caption: [Cancellation is an independent intent axis. Driver timeout, death, or lost ownership leaves the latest saved state authoritative and does not introduce cancellation.])
   #answers(title: "Persistence capability", responsibility: [Check an existing Workflow's eligibility and restore-compatible identity.], interface: [`durable.new` with labeled root codecs; with_version, with_config, with_max_checkpoint_bytes; step recoverable/restore_undo/resolvers.], interactions: [Uses step versions, graph wiring, and codec identities to compute the stamp; attaches no second graph.], invariants: [Every persistent step is recoverable; every compensating step declares pure undo reconstruction including explicit NoUndo. Compatibility precedes application decoding.], failure: [Missing/empty persistent capabilities are source defects and new panics with all problems. Changed stamps return IncompatibleDefinition before decoder callbacks.])
-  #answers(title: "Durable handle and driver", responsibility: [Create/reconnect one saved execution and advance it under a current claim.], interface: [`start_or_reconnect`, `reconnect`, `read`, `cancel`, `drive`, `unfinished`; growing Error with stable error_kind.], interactions: [One Storage serves all ids; drive claims, restores, runs, saves outcome, stops helpers, and releases.], invariants: [Create/reconnect runs no effects; same id/definition/encoded input is idempotent. Finished executions return saved Outcome without another effect.], failure: [Busy, Transient, NeedsReconciliation, Incompatible, and Defect remain separate classifications; SuspensionNotSaved retains distinct original and recording failures.])
+  #answers(title: "Durable handle and driver", responsibility: [Create/reconnect one saved execution and advance it under a current claim.], interface: [`start_or_reconnect`, `reconnect`, `read`, `cancel`, `drive`, `list`; growing Error with stable error_kind.], interactions: [One Storage serves all ids; drive claims, restores, runs, saves outcome, stops helpers, and releases.], invariants: [Create/reconnect runs no effects; same id/definition/encoded input is idempotent. Finished executions return saved Outcome without another effect.], failure: [Busy, Transient, NeedsReconciliation, Incompatible, and Defect remain separate classifications; SuspensionNotSaved retains distinct original and recording failures.])
   #points([One optional persistence model and the delivery boundary are recorded in #adr(4).])
 ])
 
@@ -66,15 +66,14 @@
     seq-msg("runner", "store", "commit outcome and new readiness"),
   ), caption: [Loss after permission but before the accepted outcome creates an interrupted admitted action. The stable key and resolver must establish whether its effect happened.],
 ), body: [
-  #answers(title: "Checkpoint interpreter", responsibility: [Save complete execution values and reconstruct compatible run state.], interface: [Opaque storage bytes; versioned envelope, typed checkpoint problems, and root/step codec boundaries.], interactions: [Serializes step progress, inputs/outputs, selected decisions, retries/deadline, failure/rollback intent, journal order, settlement, and uncertainty.], invariants: [Never saves executable closures, PIDs, monitors, sockets, timers, worker leases, or credentials. Every commit rewrites a complete bounded snapshot.], failure: [Malformed/foreign/graph-mismatched state, insufficient restored concurrency, missing compensation input, or nonrestorable undo fails closed.])
+  #answers(title: "Checkpoint interpreter", responsibility: [Save complete execution values and reconstruct compatible run state.], interface: [Named opaque storage records; versioned envelope, typed checkpoint problems, and root/step codec boundaries.], interactions: [Serializes step progress, inputs/outputs, selected decisions, retries/deadline, failure/rollback intent, journal order, settlement, and uncertainty.], invariants: [Never saves executable closures, PIDs, monitors, sockets, timers, worker leases, or credentials. A checkpoint is a set of records: identity and input written once, a run header, and one record per step. A commit writes the header and only the step records that changed, so no commit rewrites an unchanged step's input or output; the header still carries the completion journal, so its bytes grow with the completed steps and are rewritten on each commit. The size bound applies to all records together. A checkpoint that releases admitted work is committed even when no record changed, so the runner's claim fences every admission; only a checkpoint that releases nothing and changed nothing is skipped.], failure: [Malformed/foreign/graph-mismatched state, insufficient restored concurrency, missing compensation input, or nonrestorable undo fails closed.])
   #points(
     [The compatibility stamp includes workflow name/version, ordered occurrences, addresses, dependencies/choice wiring, step versions, codec versions, attempt/time budgets, and declared recovery capabilities. Runtime node ids do not enter it.],
     [Caller changes to callback meaning require version changes even with unchanged native types. A stamp checks declared identity, not semantic equivalence of arbitrary closures.],
     [Codec encoding checks that produced text decodes; it does not prove semantic equality or determinism. The codec author owns those laws and any external resources captured by callbacks.],
     [Undo reconstruction must be pure and may run during validation and restoration. A Continue that carries undo cannot commit if declared reconstruction returns NoUndo.],
     [Codec attachment, undo/resolver configuration, and error mapping preserve recovery capabilities across modifier order. A Failed resolver added after error mapping needs a compensation decider in the mapped vocabulary or fails DeciderMissingAfterMapping.],
-    [Checkpoint format 2 retains correlation. Format 1 opens with correlation.from_key(id); the next commit uses format 2. Earlier binaries cannot read the newer envelope; no automatic arbitrary-definition migration is implied.],
-    [The format 2 schema gained the CoordinatorCrashed cause without a version change. A checkpoint whose trigger, sibling failures, or outcome holds it reads as Malformed in an older saga build, including saga 0.1.0 on Hex; every other format 2 checkpoint stays readable both ways.],
+    [Checkpoint format 3 is the only format read. Checkpoints saved in formats 1 and 2 (one record per execution) are refused, with no upgrade path, so unfinished executions must be drained to a terminal outcome before an upgrade. Earlier binaries cannot read format 3.],
   )
 ])
 
@@ -89,6 +88,7 @@
     [Compensation admitted without decision], [Compensation resolver], [Some applies original-budget decision; None suspends; never repeats original decider.],
     [Marked uncertain returned error], [Retain unknown evidence and saved decision], [Uncommitted attempt uses effect resolver; interrupted decision uses compensation resolver.],
     [Cancellation already recorded], [Reconcile admitted actions before rollback], [NotSent does not start a new effect during cancellation.],
+    [Failure or deadline already settling], [Reconcile admitted actions before rollback], [NotSent, or an attempt with no saved input, does not start a new effect while the run settles. The runner decides when the attempt asks to start, not when its worker began, so a run that starts settling while a resolver runs still keeps the attempt absent.],
   ))
   #behavior(title: "A saved success is reused after runner loss", area: "Recovery", level: "boundary")[
     #given[A step's successful output was committed before the runner stopped.]
@@ -120,23 +120,23 @@
     ("owned", "owned", "valid renewal / current commit"),
     ("owned", "unowned", "release / detected owner loss"),
   ), caption: [Lease expiry makes takeover possible under an adapter's policy. It cannot retract an external call already sent by an earlier runner; fencing guards saved writes.])
-  #answers(title: "Storage port", responsibility: [Persist atomic execution bytes, claims, cancellation intent, and discovery.], interface: [Storage.new supplies create/load/claim/commit/release/cancel/unfinished; optional renewal and operation Duration.], interactions: [Returns opaque Stored and Claim values; Saga commits expected revision and observed cancellation with phase/data.], invariants: [Ownership is the current claim value, not the committing process. Each refused operation leaves checkpoint bytes/revision unchanged.], failure: [StaleOwner precedes CancellationChanged, which precedes Conflict; Busy excludes a competing live claim; unavailable, corrupt, timed-out, and missing records stay distinct.])
+  #answers(title: "Storage port", responsibility: [Persist atomic execution records, claims, cancellation intent, and discovery.], interface: [Storage.new supplies create/load/claim/commit/release/cancel/list; optional renewal and operation Duration.], interactions: [Returns opaque Stored and Claim values; Saga commits expected revision and observed cancellation with phase and the changed records.], invariants: [Ownership is the current claim value, not the committing process. A commit replaces the records it names and keeps the others, atomically with its revision and phase. Each refused operation leaves records/revision unchanged.], failure: [StaleOwner precedes CancellationChanged, which precedes Conflict; Busy excludes a competing live claim; unavailable, corrupt, timed-out, and missing records stay distinct.])
   #md-table(3, (
     [*Operation*], [*Accepted effect*], [*Refusal or idempotence*],
-    [create], [Revision/generation zero; uncancelled Pending bytes], [AlreadyExists; never overwrites another execution.],
-    [load], [Read latest bytes/revision/generation/cancellation], [NotFound or Corrupt distinct from availability.],
+    [create], [Revision/generation zero; uncancelled Pending records], [AlreadyExists; never overwrites another execution.],
+    [load], [Read every record with revision/generation/cancellation], [NotFound or Corrupt distinct from availability.],
     [claim], [Advance generation; return Claim and Stored], [Busy while live claim excludes competition.],
-    [commit], [Current claim + seen cancellation + revision → new bytes/phase and revision+1], [Ordered StaleOwner → CancellationChanged → Conflict.],
+    [commit], [Current claim + seen cancellation + revision → named records replaced, phase set, revision+1], [Ordered StaleOwner → CancellationChanged → Conflict; a refusal writes no record.],
     [release], [Remove current ownership], [StaleOwner for another claim.],
-    [cancel], [Set cancellation flag without changing bytes or revision], [Idempotent; durable cancel is a no-op for saved Finished.],
-    [unfinished], [Up to limit unowned Pending/Suspended ids], [Finished excluded; oldest first where adapter can tell.],
+    [cancel], [Set cancellation flag without changing records or revision], [Idempotent; durable cancel is a no-op for saved Finished.],
+    [list], [Up to limit unowned ids in one phase, after a cursor id, in id byte order], [A page shorter than the limit is the last; listing reserves nothing.],
   ))
   #points(
     [A heartbeat linked to the durable runner renews lease-based storage independently of checkpoint traffic. Retry backoff or a long attempt cannot depend on commit-only renewal.],
     [StaleOwner on renewal stops the runner. Unavailable/TimedOut renewal retries at the next interval; all later writes remain fenced if the lease expires meanwhile. A wrapper rebuilding Storage must preserve renewal.],
     [Drive uses a watchdog for synchronous runner storage operations; other durable operations use bounded helper calls. Timeout stops waiting and kills the helper/runner but does not itself prove whether a remote store applied an operation.],
     [Storage claim constructors expose adapter proofs but cannot establish validity alone. The adapter enforces current generation/token and its declared deployment scope at every mutation.],
-    [The protocol decision is #adr(5). Adapter-specific persistence and distribution guarantees remain separate from the core contract.],
+    [The protocol decision is #adr(5); records and paged listing are #adr(17). Adapter-specific persistence and distribution guarantees remain separate from the core contract.],
   )
 ])
 
@@ -149,11 +149,11 @@
       invariants: [Current claim may be used by any process; claiming-process monitor controls owner loss. Restart discards all saved executions.],
       failure: [Five-second operation wait returns TimedOut; stopped/missing actor returns Unavailable. Runner loss can be survived; VM/store loss cannot.],
     )),
-    component(name: "Reference file storage", tint: "violet", mission: "Recover checkpoint bytes in a fresh VM with one directory owner.", answers: answers-data(
-      responsibility: [Apply atomic per-execution mutations using canonical-path locking and synced temporary-file replacement.],
+    component(name: "Reference file storage", tint: "violet", mission: "Recover checkpoint records in a fresh VM with one directory owner.", answers: answers-data(
+      responsibility: [Apply atomic per-execution mutations using canonical-path locking, one synced file per record, and a head file replaced by rename as the commit point.],
       interface: [Pure file.open(canonical_absolute_directory) returns Storage; caller creates and owns directory.],
       interactions: [Erlang FFI reads/writes records; a claim records this VM's claiming process. Earlier-VM claims are unowned at recovery.],
-      invariants: [One VM at a time uses a canonical directory; lock wait is bounded. Atomic replacement preserves complete snapshots.],
+      invariants: [One VM at a time uses a canonical directory; lock wait is bounded. A commit is visible only once its head file is renamed into place, so a commit cut short leaves only unreferenced record files.],
       failure: [Malformed/read/write/lock failures remain typed. Concurrent VMs, path aliases, and power-loss directory durability are outside its guarantee.],
     )),
   )
@@ -243,7 +243,7 @@
   ]
   #subsection(title: "Discovery and reading")[
     #points(
-      [`durable.unfinished(storage, limit)` lists candidates without reserving them, and reconnect plus drive can still meet Busy. Saga supplies listing and reconnect, never a sweeper or delivery scheduler.],
+      [`durable.list(storage, phase, after, limit)` pages through candidates in one phase without reserving them, and reconnect plus drive can still meet Busy. Pending and Suspended are listed apart, so executions that stay suspended never hold up pending ones. Saga supplies listing and reconnect, never a sweeper or delivery scheduler.],
       [`durable.read(run)` returns Pending, Suspended with its reason, or Finished with the saved report, without a live runner. The saved Outcome is the completion authority; notifications and telemetry are observations.],
     )
   ]

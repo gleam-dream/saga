@@ -256,7 +256,8 @@ pub fn sibling_crash_in_settle_window_is_an_unknown_effect_test() {
 }
 
 /// Retry exhaustion names each attempt that crashed, by number, and not the
-/// attempt that returned a typed error.
+/// attempt that returned a typed error. The last attempt crashed, so the
+/// run holds the step.
 pub fn retry_limit_names_each_crashed_attempt_test() {
   let counter = probe.new_counter()
   let workflow =
@@ -275,7 +276,7 @@ pub fn retry_limit_names_each_crashed_attempt_test() {
     })
 
   let assert Ok(outcome) = execution.run(workflow, 0, execution.config())
-  let assert execution.Failed(execution.RetryLimitReached(_, _), _) = outcome
+  let assert execution.Unresolved(_, saga.Crashed(_), _) = outcome
   effects(outcome)
   |> should.equal([
     #("flaky", execution.StepAttempt(1), Crashed),
@@ -284,7 +285,8 @@ pub fn retry_limit_names_each_crashed_attempt_test() {
 }
 
 /// A compensation decision that crashes, or outlives `cleanup_timeout`, is
-/// an unknown effect of that decision, numbered by the attempt it decided.
+/// an unknown effect of that decision, numbered by the attempt it decided,
+/// and holds the run.
 pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
   let crashing =
     saga.define("wf", fn(input) {
@@ -297,7 +299,7 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
       )
     })
   let assert Ok(outcome) = execution.run(crashing, 0, execution.config())
-  let assert execution.Failed(execution.StepCrashed(..), _) = outcome
+  let assert execution.Unresolved(_, saga.Crashed(_), _) = outcome
   effects(outcome)
   |> should.equal([#("s", execution.StepCompensation(1), Crashed)])
 
@@ -317,7 +319,7 @@ pub fn compensation_crash_and_timeout_are_unknown_effects_test() {
     execution.config()
     |> execution.with_cleanup_timeout(duration.milliseconds(50))
   let assert Ok(outcome) = execution.run(hanging, 0, config)
-  let assert execution.Failed(execution.StepTimedOut(..), _) = outcome
+  let assert execution.Unresolved(_, saga.TimedOut, _) = outcome
   effects(outcome)
   |> should.equal([#("s", execution.StepCompensation(1), TimedOut)])
 }
@@ -449,14 +451,12 @@ pub fn crash_held_is_an_unknown_effect_test() {
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) {
           panic as "crashed"
         })
-        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
-          saga.Hold(Boom)
-        }),
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) { saga.Hold }),
       )
     })
 
   let assert Ok(outcome) = execution.run(workflow, 0, execution.config())
-  let assert execution.Unresolved(_, Boom, settlement) = outcome
+  let assert execution.Unresolved(_, saga.Crashed(_), settlement) = outcome
   effects(outcome)
   |> should.equal([#("s", execution.StepAttempt(1), Crashed)])
   settlement.unknown_effects |> should.equal(execution.unknown_effects(outcome))
@@ -469,14 +469,12 @@ pub fn typed_error_held_has_known_effects_test() {
       input
       |> saga.perform(
         saga.step("s", fn(_x: Int) -> Result(Int, DemoError) { Error(Boom) })
-        |> saga.compensate(max_attempts: 1, with: fn(_failed) {
-          saga.Hold(Boom)
-        }),
+        |> saga.compensate(max_attempts: 1, with: fn(_failed) { saga.Hold }),
       )
     })
 
   let assert Ok(outcome) = execution.run(workflow, 0, execution.config())
-  let assert execution.Unresolved(_, Boom, _) = outcome
+  let assert execution.Unresolved(_, saga.Returned(Boom), _) = outcome
   execution.unknown_effects(outcome) |> should.equal([])
 }
 
@@ -539,14 +537,14 @@ pub fn held_maybe_sent_error_is_named_in_the_settlement_test() {
         |> saga.unknown_when(maybe_sent)
         |> saga.compensate(max_attempts: 1, with: fn(failed) {
           case failed.failure {
-            saga.Returned(error) -> saga.Hold(error)
+            saga.Returned(_) -> saga.Hold
             _ -> saga.Abort(Boom)
           }
         }),
       )
     })
   let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
-  let assert execution.Unresolved(_, MaybeSent, _) = outcome
+  let assert execution.Unresolved(_, saga.Returned(MaybeSent), _) = outcome
   effects(outcome)
   |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
 }
@@ -568,7 +566,7 @@ pub fn classified_error_without_decider_is_named_test() {
     outcome
   }
   let unknown = make(MaybeSent)
-  let assert execution.Unresolved(step, MaybeSent, _) = unknown
+  let assert execution.Unresolved(step, saga.Returned(MaybeSent), _) = unknown
   step |> should.equal(at("charge"))
   effects(unknown)
   |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
@@ -621,7 +619,8 @@ pub fn unknown_effect_holds_earlier_steps_by_default_test() {
         5,
         execution.config(),
       )
-    let assert execution.Unresolved(step, MaybeSent, settlement) = outcome
+    let assert execution.Unresolved(step, saga.Returned(MaybeSent), settlement) =
+      outcome
     step |> should.equal(at("pay"))
     settlement.held |> should.equal([at("reserve")])
     settlement.undone |> should.equal([])
@@ -660,7 +659,8 @@ pub fn exhausted_retries_after_an_unknown_effect_follow_on_unknown_test() {
       5,
       execution.config(),
     )
-  let assert execution.Unresolved(_, MaybeSent, settlement) = held
+  let assert execution.Unresolved(_, saga.Returned(MaybeSent), settlement) =
+    held
   settlement.held |> should.equal([at("reserve")])
   process.receive(released, 50) |> should.equal(Error(Nil))
   let assert Ok(failed) =
@@ -719,7 +719,104 @@ pub fn classifier_survives_error_mapping_test() {
       )
     })
   let assert Ok(outcome) = execution.run(workflow, 5, execution.config())
-  let assert execution.Unresolved(_, "mapped", _) = outcome
+  let assert execution.Unresolved(_, saga.Returned("mapped"), _) = outcome
   effects(outcome)
   |> should.equal([#("charge", execution.StepAttempt(1), ReturnedUnknown)])
+}
+
+// ---------------------------------------------------------------------------
+// One rule for unknown outcomes
+// ---------------------------------------------------------------------------
+
+/// How the charge of `reserve_then_charge` ends without a result.
+type Ending {
+  ChargeTimesOut
+  ChargeCrashes
+}
+
+/// A stock reservation followed by a charge that never returns a result: the
+/// provider answers after the step's timeout, or the attempt crashes. The
+/// charge has no decider; `policy` is its `on_unknown`, or the default.
+fn reserve_then_charge(
+  released: process.Subject(Nil),
+  ending: Ending,
+  policy: Result(saga.OnUnknown, Nil),
+) {
+  let gate = probe.new_gate()
+  let charge =
+    saga.step("charge", fn(_x: Int) -> Result(Int, DemoError) {
+      case ending {
+        ChargeTimesOut -> {
+          // The provider takes longer than the step may wait.
+          probe.enter(gate)
+          Ok(1)
+        }
+        ChargeCrashes -> panic as "connection dropped after the request"
+      }
+    })
+    |> saga.timeout(duration.milliseconds(50))
+  let charge = case policy {
+    Ok(policy) -> saga.on_unknown(charge, policy)
+    Error(Nil) -> charge
+  }
+  saga.define("reserve_then_charge", fn(input) {
+    input
+    |> saga.perform(
+      saga.step("reserve", fn(x: Int) { Ok(x) })
+      |> saga.undo(fn(_) {
+        process.send(released, Nil)
+        Ok(Nil)
+      }),
+    )
+    |> saga.perform(charge)
+  })
+}
+
+/// A charge that times out or crashes may have succeeded, so by default the
+/// run holds the reservation for reconciliation, as for an error that
+/// `unknown_when` classified: the run is `Unresolved` and nothing is undone.
+pub fn timed_out_or_crashed_step_holds_earlier_steps_by_default_test() {
+  let released = process.new_subject()
+  [ChargeTimesOut, ChargeCrashes]
+  |> list.each(fn(ending) {
+    let assert Ok(outcome) =
+      execution.run(
+        reserve_then_charge(released, ending, Error(Nil)),
+        5,
+        execution.config(),
+      )
+    let assert execution.Unresolved(step, failure, settlement) = outcome
+    step |> should.equal(at("charge"))
+    case ending, failure {
+      ChargeTimesOut, saga.TimedOut | ChargeCrashes, saga.Crashed(_) -> Nil
+      _, _ -> panic as "the held failure is not the charge's own"
+    }
+    settlement.held |> should.equal([at("reserve")])
+    settlement.undone |> should.equal([])
+  })
+  process.receive(released, 50) |> should.equal(Error(Nil))
+}
+
+/// `on_unknown(RollBack)` lets a timed-out or crashed step fail the run and
+/// undo the reservation.
+pub fn timed_out_or_crashed_step_rolls_back_when_asked_test() {
+  let released = process.new_subject()
+  let assert Ok(timed_out) =
+    execution.run(
+      reserve_then_charge(released, ChargeTimesOut, Ok(saga.RollBack)),
+      5,
+      execution.config(),
+    )
+  let assert execution.Failed(execution.StepTimedOut(_), settlement) = timed_out
+  settlement.undone |> should.equal([at("reserve")])
+  process.receive(released, 1000) |> should.equal(Ok(Nil))
+  let assert Ok(crashed) =
+    execution.run(
+      reserve_then_charge(released, ChargeCrashes, Ok(saga.RollBack)),
+      5,
+      execution.config(),
+    )
+  let assert execution.Failed(execution.StepCrashed(..), settlement) = crashed
+  settlement.undone |> should.equal([at("reserve")])
+  process.receive(released, 1000) |> should.equal(Ok(Nil))
 }

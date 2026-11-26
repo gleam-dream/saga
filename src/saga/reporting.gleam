@@ -69,11 +69,11 @@ pub fn effect_status(error: Error) -> EffectStatus {
     InvalidRollbackBound(_)
     | StartupExited(_)
     | StartupTimedOut
-    | AdmissionFailed(execution.InvalidConfig(_)) -> NotStarted
-    // The coordinator can already be running when its startup handshake is lost.
-    AdmissionFailed(execution.ExecutionLost(_))
-    | ReceiverReportLost(_)
-    | CoordinatorReportLost(_) -> Unknown
+    | AdmissionFailed(execution.InvalidConfig(_))
+    | // A coordinator admits no step before its startup handshake completes,
+      // and one whose handshake failed is stopped before the start returns.
+      AdmissionFailed(execution.ExecutionLost(_)) -> NotStarted
+    ReceiverReportLost(_) | CoordinatorReportLost(_) -> Unknown
   }
 }
 
@@ -116,7 +116,7 @@ pub fn describe_error(error: Error) -> String {
       "the workflow is misconfigured: "
       <> string.join(list.map(errors, execution.describe_config_error), "; ")
     AdmissionFailed(execution.ExecutionLost(_)) ->
-      "the workflow startup handshake was lost; its effects are unknown"
+      "the workflow startup handshake was lost; the run was stopped before any step started"
     ReceiverReportLost(_) ->
       "the workflow receiver exited without delivering an outcome; its effects are unknown"
     CoordinatorReportLost(_) ->
@@ -130,7 +130,7 @@ type Delivery(o, e, u) =
 /// What the task tells the receiver after starting the Saga run.
 type Start {
   Started(coordinator: Pid)
-  // Admission failed; a lost startup handshake cannot prove no work started.
+  // Admission failed: no coordinator is running.
   NoHandle
 }
 

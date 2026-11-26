@@ -5,7 +5,7 @@
   (slug: "term-persistence-capability", title: [Persistence capability], body: [The checked association of an existing workflow with root codecs, compatibility identity, and checkpoint limits.]),
   (slug: "term-compatibility-stamp", title: [Compatibility stamp], body: [A computed identity of the workflow structure, semantic versions, codecs, and declared recovery capabilities used to admit saved state.]),
   (slug: "term-codec", title: [Codec], body: [A versioned pair of fallible conversions between a native value and saved text.]),
-  (slug: "term-storage", title: [Storage], body: [The atomic persistence port for saved bytes, execution claims, conditional commits, cancellation intent, and unfinished-execution discovery.]),
+  (slug: "term-storage", title: [Storage], body: [The atomic persistence port for saved checkpoint records, execution claims, conditional commits, cancellation intent, and paged discovery by phase.]),
   (slug: "term-claim", title: [Claim], body: [The revocable execution ownership value identified by execution id, increasing generation, and adapter token. _Avoid_: process identity — a current claim can be used by another process.]),
   (slug: "term-revision", title: [Revision], body: [The increasing count of committed checkpoint changes for one durable execution.]),
   (slug: "term-resolver", title: [Resolver], body: [An application callback that establishes the result or absence of an interrupted admitted action without blindly repeating that action.]),

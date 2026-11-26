@@ -106,7 +106,7 @@ fn payment_workflow(
       case failed.failure {
         saga.Returned(MaybeCharged) -> saga.Retry
         saga.Returned(error) -> saga.Abort(error)
-        saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
+        saga.Crashed(_) | saga.TimedOut -> saga.Hold
       }
     })
     |> durable.restore_undo(fn(_undo) { saga.NoUndo })
@@ -288,7 +288,12 @@ pub fn supervised_memory_store_test() {
   let store = memory.named(name)
   // Not started: operations report the store as unavailable.
   let assert Error(storage.Unavailable(_)) =
-    durable.unfinished(memory.storage(store), limit: 1)
+    durable.list(
+      memory.storage(store),
+      phase: storage.Pending,
+      after: None,
+      limit: 1,
+    )
     |> unwrap_storage
 }
 

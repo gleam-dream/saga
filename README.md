@@ -1,5 +1,14 @@
 # Saga
 
+> **Saga 0.3.0 is a breaking release.** Read the [migration guide](https://github.com/gleam-dream/saga/blob/main/docs/MIGRATION.md) before you upgrade from 0.2.
+>
+> - **Drain every unfinished durable execution before you upgrade.** Saga 0.3 does not read checkpoints saved by 0.2 or earlier, and `saga_postgres` migration 2 deletes them.
+> - One rule for unknown outcomes: a step that crashes or times out now holds the run `Unresolved` by default instead of rolling it back. Add `saga.on_unknown(saga.RollBack)` to keep the rollback.
+> - `execution.Unresolved` carries the held `saga.AttemptFailure`, and `saga.Hold` takes no argument.
+> - Durable checkpoints are saved as per-step records; custom storage adapters implement the new port.
+> - `durable.list(storage, phase:, after:, limit:)` replaces `durable.unfinished`.
+> - Depend on `saga >= 0.3.0 and < 0.4.0` and `sinal >= 0.2.0 and < 0.3.0`; use `saga_postgres-v0.2.0` with PostgreSQL.
+
 [![CI](https://github.com/gleam-dream/saga/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/saga/actions/workflows/ci.yml)
 [![saga on Hex](https://img.shields.io/hexpm/v/saga?label=Hex%3A%20saga)](https://hex.pm/packages/saga)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
@@ -21,7 +30,7 @@ Your application owns its clients, stable operation IDs, delivery, and the decis
 - Cancel a local run, inspect progress, and receive a typed terminal outcome.
 - Mark uncertain effects, choose retry or hold for reconciliation, and use a stable idempotency key across attempts.
 - Add versioned codecs and effect resolvers to checkpoint and resume the same workflow.
-- Store durable executions in memory, files, or the separate PostgreSQL adapter; reconnect, read, cancel, and list unfinished executions.
+- Store durable executions in memory, files, or the separate PostgreSQL adapter; reconnect, read, cancel, and page through executions by phase.
 - Emit correlated Sinal telemetry and synchronize tests with `saga/testing`.
 
 ## Install
@@ -36,11 +45,11 @@ For PostgreSQL storage, add the adapter from its Git subdirectory:
 
 ```toml
 [dependencies]
-saga = ">= 0.1.0 and < 0.2.0"
+saga = ">= 0.3.0 and < 0.4.0"
 
 # Optional: PostgreSQL storage for durable executions.
 pog = ">= 4.1.0 and < 4.2.0"
-saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "saga_postgres-v0.1.0", path = "integrations/saga_postgres" }
+saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "saga_postgres-v0.2.0", path = "integrations/saga_postgres" }
 ```
 
 Commit `gleam.toml` and `manifest.toml` to retain the resolved versions and Git commit.
@@ -123,7 +132,7 @@ pub fn checkout() {
         saga.Returned(MaybeCharged) ->
           saga.RetryAfter(duration.milliseconds(500))
         saga.Returned(error) -> saga.Abort(error)
-        saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
+        saga.Crashed(_) | saga.TimedOut -> saga.Hold
       }
     })
   saga.define("checkout", fn(order) {
@@ -135,7 +144,7 @@ pub fn checkout() {
 
 <!-- prettier-ignore-end -->
 
-Only a known successful step enters the undo journal, and each undo callback is attempted once. Saga cannot reverse a provider request or a committed database write on its own. Use the `EffectKey` idempotency key with the external provider, and make recovery decisions from authoritative application evidence.
+Only a known successful step enters the undo journal, and each undo callback is attempted once. Saga cannot reverse a provider request or a committed database write on its own. Use the `EffectKey` idempotency key with the external provider, and make recovery decisions from authoritative application evidence. A local run's key is random per run: it is the same for every attempt inside that run and is never repeated by another run, a restarted VM or another node. Submitting the same order again starts a new run with new keys, so use `saga/durable` with a stable execution id when a repeat of the business operation must deduplicate.
 
 ## Configure and run
 
@@ -179,7 +188,7 @@ Choose storage for the failure scope you need:
 - `saga/storage/file` recovers in a fresh VM when one VM at a time uses a canonical directory. It does not promise directory durability after power loss.
 - [`saga_postgres`](integrations/saga_postgres) stores runs in a shared database for runners on one or several nodes and borrows your pool. Database and application effects still commit separately from Saga checkpoints.
 
-Saga lists unfinished executions but does not schedule or drive them. Your application decides when to reconnect and call `durable.drive`. An interrupted external effect must be resolved before Saga can safely continue: report `Completed` only with proof, `NotSent` only when absence is known, and otherwise preserve uncertainty for reconciliation.
+Saga lists executions by phase with `durable.list` (pending and suspended separately, paged by id) but does not schedule or drive them. Your application decides when to reconnect and call `durable.drive`. An interrupted external effect must be resolved before Saga can safely continue: report `Completed` only with proof, `NotSent` only when absence is known, and otherwise preserve uncertainty for reconciliation.
 
 ## Examples and references
 

@@ -51,7 +51,7 @@ pub fn checkout() {
         saga.Returned(MaybeCharged) ->
           saga.RetryAfter(duration.milliseconds(500))
         saga.Returned(error) -> saga.Abort(error)
-        saga.Crashed(_) | saga.TimedOut -> saga.Hold(MaybeCharged)
+        saga.Crashed(_) | saga.TimedOut -> saga.Hold
       }
     })
   saga.define("checkout", fn(order) {

@@ -43,7 +43,10 @@ pub fn map_panic_between_steps_is_recovered_test() {
           False -> x
         }
       })
-      |> saga.perform(saga.step("b", fn(x: Int) -> Result(Int, Nil) { Ok(x) }))
+      |> saga.perform(
+        saga.step("b", fn(x: Int) -> Result(Int, Nil) { Ok(x) })
+        |> saga.on_unknown(saga.RollBack),
+      )
     })
 
   let assert Ok(execution.Failed(cause, settlement)) =

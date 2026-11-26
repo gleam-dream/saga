@@ -165,7 +165,11 @@ pub type Outcome(o, e, u) {
   CompletedWithUnknownEffects(output: o, unknown_effects: List(UnknownEffect))
   Failed(cause: Cause(e), settlement: Settlement(e, u))
   Cancelled(reason: CancelReason, settlement: Settlement(e, u))
-  Unresolved(step: StepAddress, evidence: e, settlement: Settlement(e, u))
+  Unresolved(
+    step: StepAddress,
+    failure: AttemptFailure(e),
+    settlement: Settlement(e, u),
+  )
 }
 
 pub type StepState {
@@ -199,7 +203,13 @@ pub type Progress {
 /// Messages the control subject accepts. Owned by the coordinator process;
 /// `saga/execution` only ever talks to it through these.
 pub type Control(o, e, u) {
-  InputPrepared(node_id: Int, seq: Int, input: String, reply: Subject(Nil))
+  InputPrepared(
+    node_id: Int,
+    seq: Int,
+    input: String,
+    admitted: Subject(Nil),
+    refused: Subject(Nil),
+  )
   AttemptDone(node_id: Int, seq: Int, result: AttemptResult(e, u))
   RecoveryDone(node_id: Int, seq: Int, recovery: ErasedRecovery(e, u))
   TaskCrashed(node_id: Int, seq: Int, crash: node.Crash)
@@ -285,10 +295,18 @@ type RunState(o, e, u) {
     blocked: Option(checkpoint.Failure),
     resume_nodes: Set(Int),
     inputs: Dict(Int, String),
+    // The encoded input, output and undo marker of each completed node, kept
+    // from the first checkpoint that saved them. A completed node's values
+    // never change, so later checkpoints reuse the text.
+    frozen: Dict(Int, List(String)),
     resume_undos: Set(Int),
     deadline_at: Option(Int),
     workflow_name: String,
     run_id: Int,
+    // What every stable key of this run starts from: the durable execution
+    // id, or 128 random bits drawn for this local run. `run_id` is a counter
+    // of this VM and restarts with it, so it names the run in telemetry only.
+    key_scope: String,
     control: Subject(Control(o, e, u)),
     nodes: Dict(Int, Node(e, u)),
     order: List(Int),
@@ -373,7 +391,7 @@ type RunPhase(e, u) {
 
 pub type Trigger(e) {
   TriggerFailure(cause: Cause(e))
-  TriggerUnresolved(step: StepAddress, evidence: e)
+  TriggerUnresolved(step: StepAddress, failure: AttemptFailure(e))
   TriggerCancel(reason: CancelReason)
 }
 
@@ -392,15 +410,23 @@ pub type Settings {
   )
 }
 
-/// Spawns a coordinator for one run and returns once it is alive, with its
-/// pid and the run's id. `build_graph` calls `saga.for_run` for this one
-/// run: the workflow's already-built node graph (built once, at `define`)
-/// plus a fresh run-scoped `Store` and the output-fetch thunk. `owner` is
-/// monitored: its exit is treated as a cancellation with `OwnerExited`.
-/// `deliver` is called once, from the coordinator process, with the run's
-/// terminal outcome, just before the coordinator exits. It is the only path
-/// by which an outcome leaves this process, and it runs whether or not
-/// `owner` is still alive.
+/// Spawns a coordinator for one run and completes its startup handshake:
+/// the coordinator answers with its control subject, then waits for this
+/// function's go-ahead before it admits any step. `Ok` carries the pid, the
+/// run's id and the control subject. `Error(Nil)` means no answer arrived
+/// within `handshake_timeout` milliseconds; the coordinator never received
+/// the go-ahead, has been killed, and is gone when this function returns, so
+/// no step of the run started.
+///
+/// `build_graph` calls `saga.for_run` for this one run: the workflow's
+/// already-built node graph (built once, at `define`) plus a fresh
+/// run-scoped `Store` and the output-fetch thunk. `owner` is monitored: its
+/// exit is treated as a cancellation with `OwnerExited`, and an owner that
+/// exits before the go-ahead cancels the run before any step. `deliver` is
+/// called once, from the coordinator process, with the run's terminal
+/// outcome, just before the coordinator exits. It is the only path by which
+/// an outcome leaves this process, and it runs whether or not `owner` is
+/// still alive.
 pub fn start(
   workflow_name workflow_name: String,
   owner owner: Pid,
@@ -414,10 +440,10 @@ pub fn start(
       fn(Store) -> ffi.RescueResult(o),
     ),
   deliver deliver: fn(Outcome(o, e, u)) -> Nil,
-  control_subject_out control_subject_out: Subject(Subject(Control(o, e, u))),
-) -> #(Pid, Int) {
+  handshake_timeout handshake_timeout: Int,
+) -> Result(#(Pid, Int, Subject(Control(o, e, u))), Nil) {
   let run_id = ffi.unique_integer()
-  let ready = process.new_subject()
+  let handshake = process.new_subject()
   let pid =
     process.spawn_unlinked(fn() {
       run(
@@ -427,21 +453,54 @@ pub fn start(
         settings,
         build_graph,
         deliver,
-        control_subject_out,
-        ready,
+        Some(handshake),
         None,
       )
     })
-  // This wait is a startup smoke-check, not the caller's actual failure
-  // path: whether or not `ready` arrives in time, `saga/execution.start`
-  // separately waits on `control_subject_out` (with its own bounded
-  // timeout) before handing back a usable `Execution`, and reports
-  // `ExecutionLost` if the coordinator never gets that far. A timeout here
-  // is therefore not silently swallowed overall — it is handled one level
-  // up, where a `Result` can actually be returned (`#(Pid, Int)` here has
-  // no room for one).
-  let _ = process.receive(ready, 5000)
-  #(pid, run_id)
+  case process.receive(handshake, handshake_timeout) {
+    Ok(Handshake(control:, begin:)) -> {
+      process.send(begin, Nil)
+      Ok(#(pid, run_id, control))
+    }
+    Error(Nil) -> {
+      // The coordinator waits for a go-ahead that is never sent, so killing
+      // it here stops a run that has admitted nothing. Wait for its exit,
+      // then remove an answer that arrived after the wait ended.
+      let monitor = process.monitor(pid)
+      process.kill(pid)
+      process.new_selector()
+      |> process.select_specific_monitor(monitor, fn(_down) { Nil })
+      |> process.selector_receive_forever
+      let _ = process.receive(handshake, 0)
+      Error(Nil)
+    }
+  }
+}
+
+/// A new coordinator's answer to its starter: where to send control
+/// messages, and where to send the go-ahead it waits for.
+type Handshake(o, e, u) {
+  Handshake(control: Subject(Control(o, e, u)), begin: Subject(Nil))
+}
+
+/// Sends the handshake to the starter and waits for its go-ahead. `False`
+/// means `owner` exited first: the run then admits nothing, and the owner's
+/// exit, still in the mailbox for `owner_monitor`, cancels it.
+fn await_go_ahead(
+  handshake: Subject(Handshake(o, e, u)),
+  control: Subject(Control(o, e, u)),
+  owner: Pid,
+) -> Bool {
+  let begin = process.new_subject()
+  process.send(handshake, Handshake(control:, begin:))
+  let waiting = process.monitor(owner)
+  let begun =
+    process.new_selector()
+    |> process.select_map(begin, fn(_go) { True })
+    |> process.select_specific_monitor(waiting, fn(_down) { False })
+    |> process.selector_receive_forever
+  process.demonitor_process(waiting)
+  begun
 }
 
 fn run(
@@ -458,16 +517,17 @@ fn run(
       fn(Store) -> ffi.RescueResult(o),
     ),
   deliver: fn(Outcome(o, e, u)) -> Nil,
-  control_subject_out: Subject(Subject(Control(o, e, u))),
-  ready: Subject(Nil),
+  handshake: Option(Subject(Handshake(o, e, u))),
   persistence: Option(Session(e, u)),
 ) -> Nil {
   process.trap_exits(True)
   let baseline_links = ffi.links()
   let control = process.new_subject()
   let owner_monitor = process.monitor(owner)
-  process.send(control_subject_out, control)
-  process.send(ready, Nil)
+  let begun = case handshake {
+    Some(handshake) -> await_go_ahead(handshake, control, owner)
+    None -> True
+  }
   let #(nodes, order, dependents, run_store, fetch_output) = build_graph()
   let node_state =
     dict.map_values(nodes, fn(_id, n) { NodeWaiting(list.length(n.deps)) })
@@ -513,10 +573,15 @@ fn run(
       blocked: None,
       resume_nodes: set.new(),
       inputs: dict.new(),
+      frozen: dict.new(),
       resume_undos: set.new(),
       deadline_at: option.map(deadline, fn(ms) { ffi.system_time() + ms }),
       workflow_name: workflow_name,
       run_id: run_id,
+      key_scope: case persistence {
+        Some(session) -> session.execution_id
+        None -> ffi.random_token()
+      },
       control: control,
       nodes: nodes,
       order: order,
@@ -566,7 +631,10 @@ fn run(
           Some(Session(cancelled: True, ..)) -> handle_cancel_request(initial)
           _ -> initial
         }
-        Continue(admit(initial))
+        case begun {
+          True -> Continue(admit(initial))
+          False -> Wait(initial)
+        }
       })
       |> follow(fetch_output, deliver)
   }
@@ -641,7 +709,7 @@ fn advance(
     _, _ ->
       case checkpoint(state) {
         Error(reason) -> Suspend(state, reason)
-        Ok(Nil) -> {
+        Ok(state) -> {
           let state = start_saved_timers(state)
           list.each(state.dispatch, fn(permit) { process.send(permit, Nil) })
           let state = RunState(..state, dispatch: [], pending_starts: [])
@@ -946,7 +1014,7 @@ fn final_outcome(
     )
   case trigger {
     TriggerFailure(cause) -> Failed(cause, settlement)
-    TriggerUnresolved(step, evidence) -> Unresolved(step, evidence, settlement)
+    TriggerUnresolved(step, failure) -> Unresolved(step, failure, settlement)
     TriggerCancel(reason) -> Cancelled(reason, settlement)
   }
 }
@@ -1050,17 +1118,26 @@ fn start_attempt(
   let assert Ok(n) = dict.get(state.nodes, node_id)
   let seq = ffi.unique_integer()
   let attempt = attempt_context(state, node_id, attempt_number, n.max_attempts)
+  // Bind the control subject first: a closure that read `state.control`
+  // would capture, and copy into the worker, the whole run state.
+  let control = state.control
   let attempt =
     node.Attempt(..attempt, admit: fn(input) {
-      let reply = process.new_subject()
-      process.send(state.control, InputPrepared(node_id, seq, input, reply))
-      process.receive_forever(reply)
+      let admitted = process.new_subject()
+      let refused = process.new_subject()
+      process.send(
+        control,
+        InputPrepared(node_id, seq, input, admitted, refused),
+      )
+      process.new_selector()
+      |> process.select_map(admitted, fn(_) { node.Admitted })
+      |> process.select_map(refused, fn(_) { node.Refused })
+      |> process.selector_receive_forever
     })
   let body = case set.contains(state.resume_nodes, node_id), n.persistence {
     True, Some(p) -> p.resume(attempt, state.store)
     _, _ -> n.prepare_attempt(attempt, state.store)
   }
-  let control = state.control
   let #(pid, permits) =
     spawn_task(state, fn() {
       case ffi.rescue(body) {
@@ -1117,15 +1194,20 @@ fn handle_control(
   message: Control(o, e, u),
 ) -> RunState(o, e, u) {
   case message {
-    InputPrepared(id, seq, input, reply) ->
-      case current_attempt_seq(state, id) == Some(seq) {
-        True ->
+    InputPrepared(id, seq, input, admitted, refused) ->
+      case current_attempt_seq(state, id) == Some(seq), stopping(state) {
+        True, False ->
           RunState(
             ..state,
             inputs: dict.insert(state.inputs, id, input),
-            dispatch: [reply, ..state.dispatch],
+            dispatch: [admitted, ..state.dispatch],
           )
-        False -> state
+        // A stopping run admits no new work: the attempt settles as absent.
+        True, True -> {
+          process.send(refused, Nil)
+          state
+        }
+        False, _ -> state
       }
     AttemptDone(node_id, seq, result) ->
       handle_attempt_done(state, node_id, seq, result)
@@ -1279,18 +1361,17 @@ fn handle_attempt_done(
                 ActionReturnedUnknown,
               )
           }
-          let assert Ok(n) = dict.get(state.nodes, node_id)
-          case recover, unknown, n.rolls_back_unknown, failure {
-            // An unknown effect with no decision grants no rollback
-            // authority unless the step opted in (`saga.on_unknown`).
-            None, True, False, Returned(error) ->
-              hold_terminal(state, node_id, error)
-            None, _, _, _ ->
-              fail_terminal(state, node_id, failure, case unknown {
-                True -> telemetry.AttemptUnknown
-                False -> attempt_result_kind(failure)
-              })
-            Some(prepare_recovery), _, _, _ ->
+          case recover, unknown {
+            None, True ->
+              end_unknown(state, node_id, failure, telemetry.AttemptUnknown)
+            None, False ->
+              fail_terminal(
+                state,
+                node_id,
+                failure,
+                attempt_result_kind(failure),
+              )
+            Some(prepare_recovery), _ ->
               start_recovery_from_returned(
                 state,
                 node_id,
@@ -1560,12 +1641,14 @@ fn handle_recovery_done(
           )
           |> record_compensation_failure(cleanup_failure)
         }
-        EHold(evidence), _ ->
+        EHold, _ -> {
+          let assert Ok(failure) = dict.get(state.last_failure, node_id)
           begin_unresolved(
             RunState(..state, running: state.running - 1),
             node_id,
-            evidence,
+            failure,
           )
+        }
       }
     }
   }
@@ -1576,7 +1659,7 @@ fn decision_kind(recovery: ErasedRecovery(e, u)) -> telemetry.DecisionKind {
     ERetry | ERetryAfter(_) -> telemetry.DecisionRetry
     EContinue(_) -> telemetry.DecisionContinue
     EAbort(_) | EAbortCleanup(_, _) -> telemetry.DecisionAbort
-    EHold(_) | node.EBlocked(_) -> telemetry.DecisionHold
+    EHold | node.EBlocked(_) -> telemetry.DecisionHold
   }
 }
 
@@ -1671,7 +1754,7 @@ fn handle_task_crashed(
             )
           case n.prepare_crash_recovery {
             None ->
-              fail_terminal(
+              end_unknown(
                 state,
                 node_id,
                 Crashed(crash),
@@ -1690,7 +1773,7 @@ fn handle_task_crashed(
             StepCompensation(attempt_number),
             ActionCrashed(crash),
           )
-          |> fail_terminal(node_id, Crashed(crash), telemetry.AttemptCrashed)
+          |> end_unknown(node_id, Crashed(crash), telemetry.AttemptCrashed)
           |> record_compensation_failure(compensation_failure)
         }
         _ -> state
@@ -1774,12 +1857,12 @@ fn handle_step_timeout_fired(
             )
           case n.prepare_crash_recovery {
             None ->
-              // No decider: `fail_terminal` below is this attempt's own
+              // No decider: `end_unknown` below is this attempt's own
               // terminal outcome, and it emits `step_stopped` using this
               // same attempt's real duration (its `started_at` was just
               // preserved above) — a single, correct event, so nothing
               // extra is needed here.
-              fail_terminal(state, node_id, TimedOut, telemetry.AttemptTimedOut)
+              end_unknown(state, node_id, TimedOut, telemetry.AttemptTimedOut)
             Some(prepare) -> {
               // A decider exists: the decision's own resolution
               // (`fail_terminal`/`commit_success`, from
@@ -1830,7 +1913,7 @@ fn handle_cleanup_timeout_fired(
             StepCompensation(attempt_number),
             ActionTimedOut,
           )
-          |> fail_terminal(node_id, TimedOut, telemetry.AttemptTimedOut)
+          |> end_unknown(node_id, TimedOut, telemetry.AttemptTimedOut)
           |> record_compensation_failure(compensation_failure)
         }
         _ -> state
@@ -1973,21 +2056,17 @@ fn fail_terminal_retry_limit(
   let address = node_address(state, node_id)
   let assert Ok(last) = dict.get(state.last_failure, node_id)
   let assert Ok(n) = dict.get(state.nodes, node_id)
+  let last_attempt = StepAttempt(attempt_number_for(state, node_id))
   let last_unknown =
-    list.contains(
-      state.unknown_effects,
-      UnknownEffect(
-        address,
-        StepAttempt(attempt_number_for(state, node_id)),
-        ActionReturnedUnknown,
-      ),
-    )
+    list.any(state.unknown_effects, fn(effect) {
+      effect.step == address && effect.action == last_attempt
+    })
   let state = RunState(..state, running: state.running - 1)
-  case last, last_unknown && !n.rolls_back_unknown {
+  case last_unknown && !n.rolls_back_unknown {
     // The decider asked for another attempt, not for rollback, and the
-    // last attempt's effect is unknown.
-    Returned(error), True -> begin_unresolved(state, node_id, error)
-    _, _ -> {
+    // last attempt's outcome is unknown.
+    True -> begin_unresolved(state, node_id, last)
+    False -> {
       let state =
         RunState(
           ..state,
@@ -1998,29 +2077,33 @@ fn fail_terminal_retry_limit(
   }
 }
 
-/// A step ended with an error that `saga.unknown_when` classified, with no
-/// decision about it: like a `Hold(error)` decision, the run ends
-/// `Unresolved` and nothing is undone.
-fn hold_terminal(
+/// A step's outcome is unknown (its attempt crashed, timed out, or returned
+/// an error that `saga.unknown_when` classified; or its decider crashed or
+/// timed out) and no decision settles it. The step's `saga.on_unknown`
+/// chooses: by default the run ends `Unresolved` like a `Hold` decision and
+/// nothing is undone; `RollBack` fails the run like a known failure. Like
+/// `fail_terminal`, decrements `running` for the task that just finished.
+fn end_unknown(
   state: RunState(o, e, u),
   node_id: Int,
-  error: e,
+  failure: AttemptFailure(e),
+  step_kind: telemetry.AttemptKind,
 ) -> RunState(o, e, u) {
-  let address = node_address(state, node_id)
-  let attempt_number = attempt_number_for(state, node_id)
-  let duration = duration_since_started(state, node_id)
-  emit_step_stopped(
-    state,
-    address,
-    attempt_number,
-    telemetry.AttemptUnknown,
-    duration,
-  )
-  begin_unresolved(
-    RunState(..state, running: state.running - 1),
-    node_id,
-    error,
-  )
+  let assert Ok(n) = dict.get(state.nodes, node_id)
+  case n.rolls_back_unknown {
+    True -> fail_terminal(state, node_id, failure, step_kind)
+    False -> {
+      let address = node_address(state, node_id)
+      let attempt_number = attempt_number_for(state, node_id)
+      let duration = duration_since_started(state, node_id)
+      emit_step_stopped(state, address, attempt_number, step_kind, duration)
+      begin_unresolved(
+        RunState(..state, running: state.running - 1),
+        node_id,
+        failure,
+      )
+    }
+  }
 }
 
 /// A `Hold` decision grants no rollback authority for its own step. If it
@@ -2033,7 +2116,7 @@ fn hold_terminal(
 fn begin_unresolved(
   state: RunState(o, e, u),
   node_id: Int,
-  evidence: e,
+  failure: AttemptFailure(e),
 ) -> RunState(o, e, u) {
   let address = node_address(state, node_id)
   let state =
@@ -2047,7 +2130,7 @@ fn begin_unresolved(
         Settlement(..s, held: [address, ..s.held])
       })
       |> maybe_finish_settling
-    False -> begin_settling(state, TriggerUnresolved(address, evidence))
+    False -> begin_settling(state, TriggerUnresolved(address, failure))
   }
 }
 
@@ -2686,12 +2769,21 @@ pub type SavedPhase(e, u) {
   SavedRollback(trigger: Trigger(e), settlement: Settlement(e, u))
 }
 
+/// Whether a checkpoint releases admitted work once it is saved. A save
+/// that releases work must be fenced by the runner's claim even when the
+/// snapshot did not change, so that a runner that lost its claim never
+/// starts a step.
+pub type Release {
+  ReleasesWork
+  ReleasesNothing
+}
+
 pub type Session(e, u) {
   Session(
     execution_id: String,
     snapshot: Option(Snapshot(e, u)),
     cancelled: Bool,
-    save: fn(Snapshot(e, u)) -> Result(Nil, checkpoint.Failure),
+    save: fn(Snapshot(e, u), Release) -> Result(Nil, checkpoint.Failure),
     failed: fn(checkpoint.Failure) -> Nil,
     stopped: fn() -> Nil,
   )
@@ -2718,8 +2810,6 @@ pub fn execute_saved(
   session: Session(e, u),
   deliver: fn(Outcome(o, e, u)) -> Nil,
 ) -> Nil {
-  let control_out = process.new_subject()
-  let ready = process.new_subject()
   run(
     workflow_name,
     owner,
@@ -2727,22 +2817,16 @@ pub fn execute_saved(
     settings,
     build_graph,
     deliver,
-    control_out,
-    ready,
+    None,
     Some(session),
   )
-  let _ = process.receive(control_out, 0)
-  let _ = process.receive(ready, 0)
-  Nil
 }
 
-/// The stable key base of node `id` in this run: the durable execution id,
-/// or the local run id, and the node's position in the checked definition.
+/// The stable key base of node `id` in this run: the run's key scope and the
+/// node's position in the checked definition. A local scope is random, so no
+/// other run, VM start or node produces the same base.
 fn step_base(state: RunState(o, e, u), id: Int) -> String {
-  let execution = case state.persistence {
-    Some(session) -> session.execution_id
-    None -> int.to_string(state.run_id)
-  }
+  let execution = state.key_scope
   let position = dict.get(state.positions, id) |> result.unwrap(-1)
   int.to_string(string.byte_size(execution))
   <> ":"
@@ -2771,66 +2855,91 @@ fn saved_address(address: StepAddress) -> checkpoint.Address {
   checkpoint.Address(address.scope, address.name, address.occurrence)
 }
 
-fn checkpoint(state: RunState(o, e, u)) -> Result(Nil, checkpoint.Failure) {
+/// Commits `state` when the run is durable and returns it with the encoded
+/// values that commit produced, for the next checkpoint to reuse.
+fn checkpoint(
+  state: RunState(o, e, u),
+) -> Result(RunState(o, e, u), checkpoint.Failure) {
   case state.blocked, state.persistence {
     Some(reason), _ -> Error(reason)
-    None, None -> Ok(Nil)
+    None, None -> Ok(state)
     None, Some(session) -> {
-      use snapshot <- result.try(freeze(state))
-      session.save(snapshot)
+      use #(snapshot, frozen) <- result.try(freeze(state))
+      let release = case state.dispatch {
+        [] -> ReleasesNothing
+        _ -> ReleasesWork
+      }
+      use _ <- result.map(session.save(snapshot, release))
+      RunState(..state, frozen: frozen)
     }
   }
 }
 
 fn freeze(
   state: RunState(o, e, u),
-) -> Result(Snapshot(e, u), checkpoint.Failure) {
+) -> Result(#(Snapshot(e, u), Dict(Int, List(String))), checkpoint.Failure) {
   let progress = build_progress(state)
-  use nodes <- result.try(
-    list.try_map(list.zip(state.order, progress.steps), fn(pair) {
-      let #(id, progress) = pair
-      let assert Ok(n) = dict.get(state.nodes, id)
-      let values = case progress.state {
-        Succeeded | Undoing | Undone | UndoFailedStep ->
-          case n.persistence {
-            Some(p) ->
-              p.freeze(state.store, step_base(state, id), state.correlation)
-              |> result.map_error(checkpoint.at(_, saved_address(n.address)))
-            None -> Error(checkpoint.InvalidState(checkpoint.Malformed))
-          }
-        Attempting(_) | Compensating(_) ->
-          Ok(case dict.get(state.inputs, id) {
-            Ok(input) -> [input]
-            Error(_) -> []
-          })
-        _ -> Ok([])
-      }
-      use values <- result.try(values)
-      let retry_at = case dict.get(state.state, id) {
-        Ok(NodeRetryScheduled(_, _, due)) -> due
-        _ -> 0
-      }
-      Ok(SavedNode(progress.state, values, retry_at))
-    }),
+  use #(frozen, nodes) <- result.try(
+    list.try_fold(
+      list.zip(state.order, progress.steps),
+      #(state.frozen, []),
+      fn(acc, pair) {
+        let #(frozen, saved) = acc
+        let #(id, progress) = pair
+        let assert Ok(n) = dict.get(state.nodes, id)
+        let values = case progress.state {
+          Succeeded | Undoing | Undone | UndoFailedStep ->
+            case dict.get(frozen, id), n.persistence {
+              Ok(values), _ -> Ok(#(frozen, values))
+              Error(Nil), Some(p) ->
+                p.freeze(state.store, step_base(state, id), state.correlation)
+                |> result.map(fn(values) {
+                  #(dict.insert(frozen, id, values), values)
+                })
+                |> result.map_error(checkpoint.at(_, saved_address(n.address)))
+              Error(Nil), None ->
+                Error(checkpoint.InvalidState(checkpoint.Malformed))
+            }
+          Attempting(_) | Compensating(_) ->
+            Ok(
+              #(frozen, case dict.get(state.inputs, id) {
+                Ok(input) -> [input]
+                Error(_) -> []
+              }),
+            )
+          _ -> Ok(#(frozen, []))
+        }
+        use #(frozen, values) <- result.try(values)
+        let retry_at = case dict.get(state.state, id) {
+          Ok(NodeRetryScheduled(_, _, due)) -> due
+          _ -> 0
+        }
+        Ok(#(frozen, [SavedNode(progress.state, values, retry_at), ..saved]))
+      },
+    ),
   )
+  let nodes = list.reverse(nodes)
   let phase = case state.phase {
     PhaseRunning -> SavedRunning
     PhaseSettling(trigger, settlement, _, _) ->
       SavedSettling(trigger, settlement)
     PhaseRollingBack(trigger, settlement) -> SavedRollback(trigger, settlement)
   }
-  Ok(Snapshot(
-    nodes,
-    list.map(state.journal, fn(entry) {
-      dict.get(state.positions, entry.node_id) |> result.unwrap(-1)
-    }),
-    phase,
-    dict.to_list(state.last_failure)
-      |> list.map(fn(pair) {
-        #(dict.get(state.positions, pair.0) |> result.unwrap(-1), pair.1)
+  Ok(#(
+    Snapshot(
+      nodes,
+      list.map(state.journal, fn(entry) {
+        dict.get(state.positions, entry.node_id) |> result.unwrap(-1)
       }),
-    state.unknown_effects,
-    state.deadline_at,
+      phase,
+      dict.to_list(state.last_failure)
+        |> list.map(fn(pair) {
+          #(dict.get(state.positions, pair.0) |> result.unwrap(-1), pair.1)
+        }),
+      state.unknown_effects,
+      state.deadline_at,
+    ),
+    frozen,
   ))
 }
 
@@ -3127,15 +3236,21 @@ fn attempt_context(
     number,
     maximum - number,
     step_base(state, id),
-    case state.persistence {
-      Some(Session(cancelled: True, ..)) -> True
-      _ -> False
-    },
     option.is_some(state.persistence),
     dict.get(state.inputs, id) |> option.from_result,
-    fn(_) { Nil },
+    fn(_) { node.Admitted },
     state.correlation,
   )
+}
+
+/// Whether the run admits no new work: a recorded cancellation, or a phase
+/// past running.
+fn stopping(state: RunState(o, e, u)) -> Bool {
+  case state.persistence, state.phase {
+    Some(Session(cancelled: True, ..)), _ -> True
+    _, PhaseSettling(..) | _, PhaseRollingBack(..) -> True
+    _, PhaseRunning -> False
+  }
 }
 
 /// Effect timeouts begin after the admission checkpoint, when work is released.

@@ -7,7 +7,7 @@
   #no-goal(title: "Workflow scheduling and effect reconciliation")[Saga owns workflow transitions and recovery evidence. Applications own wakeups, business effects, database operation policy, and delivery coordination.]
   #no-goal(title: "Pool lifecycle and database administration")[The adapter borrows a connection handle. The application owns supervision, credentials, connection capacity, database privileges, backups, replication, and failover.]
   #invariant(title: "Only a current claim can replace progress", enforcement: "mechanism")[A checkpoint write matches execution id, claim generation, owner token, expected revision, and observed cancellation in one atomic mutation.]
-  #invariant(title: "Cancellation preserves checkpoint evidence", enforcement: "mechanism")[Recording cancellation leaves checkpoint bytes, revision, phase, generation, and ownership unchanged.]
+  #invariant(title: "Cancellation preserves checkpoint evidence", enforcement: "mechanism")[Recording cancellation leaves checkpoint records, revision, phase, generation, and ownership unchanged.]
   #invariant(title: "Claim and lease presence agree", enforcement: "mechanism")[An execution row has both an owner token and lease deadline, or neither.]
   #principle(title: "Borrow application infrastructure explicitly")[A reusable storage value serves every execution in its schema without creating another pool or imposing a PostgreSQL dependency on core Saga.]
   #principle(title: "Keep uncertainty distinct from absence")[Lost replies and interrupted external actions require reconciliation. A lease and a conditional write do not establish exactly-once external effects.]
@@ -100,7 +100,7 @@
   #state-type(id: "row-cancellation", title: "Stored cancellation intent", variants: ("clear", "requested"))
   #entity(id: "execution-row", title: "Execution row", description: [The store-owned aggregate retaining one durable execution's checkpoint and write authority.], kind: "aggregate", owner: "PostgreSQL store", lifecycle: "stateful", domain: "postgres-persistence", tint: "blue")[
     #attribute(name: "Identity", type: "Execution identifier within a store", provenance: "authored")[The caller selects the id; creation stores it unchanged as the unique row key.]
-    #attribute(name: "Checkpoint", type: "Opaque checkpoint bytes and revision", provenance: "observed")[Saga supplies bytes and expected revision; an accepted write derives the next revision at write time.]
+    #attribute(name: "Checkpoint", type: "Opaque named checkpoint records and revision", provenance: "observed")[Saga supplies the changed records and the expected revision; an accepted write upserts each record as its own `saga_records` row and derives the next revision at write time. Records the write does not name stay.]
     #attribute(name: "Ownership proof", type: "Generation and optional owner token", provenance: "derived")[Claim increments generation and generates a token at write time; release clears the token without resetting generation.]
     #attribute(id: "ownership", name: "Ownership", type: "Lease ownership status", provenance: "derived", state-type: "row-ownership", state-machine: "row-ownership-lifecycle")[Derived at read time from token/deadline presence and the database clock; expiry permits takeover.]
     #attribute(name: "Lease deadline", type: "Optional database instant", provenance: "derived")[Claim, commit, or renewal derives a new deadline from the database clock plus the configured lease.]
@@ -123,9 +123,9 @@
   ]
   #md-table(3, (
     [*Product or sum*], [*Fields or variants*], [*Refinement owner*],
-    [Stored projection], [Revision × generation × cancelled × bytes], [Decoder checks returned types; Saga checks checkpoint meaning. Phase/lease/token/timestamps are not returned by load.],
+    [Stored projection], [Revision × generation × cancelled × records by key], [Decoder checks returned types; Saga checks checkpoint meaning. Phase/lease/token/timestamps are not returned by load.],
     [Claim projection], [Execution id × generation × owner token], [Saga owns its type; this store validates current proof atomically.],
-    [Commit input], [Expected revision × observed cancellation × phase × bytes], [Saga owns the input type; adapter checks agreement and increments revision.],
+    [Commit input], [Expected revision × observed cancellation × phase × changed records], [Saga owns the input type; adapter checks agreement and increments revision.],
     [SchemaError], [InvalidSchema(original input)], [Opaque Config makes unsafe schema interpolation inaccessible through ordinary construction.],
     [MigrateError], [MigrationFailed(reason)], [Reason is diagnostic; it does not distinguish a lost commit reply.],
     [StorageError], [AlreadyExists, NotFound, Busy, StaleOwner, CancellationChanged, Conflict, TimedOut, Corrupt, Unavailable(detail)], [The parent storage vocabulary owns variants and callers' interpretation.],
@@ -162,7 +162,7 @@
     ("finished", "finished", "raw commit Finished"),
   ), caption: [This is the storage-level accepted state set. Saga's compatible checkpoint/driver protocol supplies terminal workflow semantics; the adapter imposes no finished-phase claim or write guard.])
   #points(
-    [Creation yields revision zero, generation zero, clear cancellation, Pending phase, supplied bytes, and no claim. Only accepted checkpoint commits increase revision; only accepted claims increase generation.],
+    [Creation yields revision zero, generation zero, clear cancellation, Pending phase, supplied records, and no claim. Only accepted checkpoint commits increase revision; only accepted claims increase generation.],
     [Ownership, phase, and cancellation are independent axes. Claim does not inspect phase or cancellation; cancellation does not release ownership; Finished is omitted from discovery regardless of ownership.],
     [A claim is transferable across processes. The adapter neither checks the claiming PID nor monitors it; generation and token equality establish current write authority.],
     [Lease expiry alone does not refuse commit, renewal, or release. Those operations match current generation/token; a successor claim revokes all three rights of the prior claim.],
@@ -170,18 +170,18 @@
   )
 ])
 
-#section(title: "Atomic storage operations", lead: "One accepted mutation changes one execution row; diagnostics can require another statement.", body: [
-  #answers(title: "Storage operations", responsibility: [Apply the parent storage protocol to rows without workflow decoding.], interface: [Storage closures for create/load/claim/commit/release/cancel/unfinished plus renewal.], interactions: [Parameterized statements borrow pool connections; decoders return Saga Stored/Claim values.], invariants: [Accepted mutations are atomic; condition refusal leaves progress unchanged.], failure: [No-row results produce typed protocol refusals; driver errors remain distinct from refusal.])
+#section(title: "Atomic storage operations", lead: "One accepted mutation is one statement over an execution row and its record rows, except a claim, which is one transaction; diagnostics can require another statement.", body: [
+  #answers(title: "Storage operations", responsibility: [Apply the parent storage protocol to rows without workflow decoding.], interface: [Storage closures for create/load/claim/commit/release/cancel/list plus renewal.], interactions: [Parameterized statements borrow pool connections; decoders return Saga Stored/Claim values.], invariants: [Accepted mutations are atomic: a data-modifying statement writes the execution row and its records together, so a refused commit writes no record. A claim and its read of records are one transaction, so the returned Stored carries the claim's generation and a failed read leaves no claim. Any other read of records is one statement and sees one committed revision.], failure: [No-row results produce typed protocol refusals; driver errors remain distinct from refusal.])
   #md-table(3, (
     [*Operation*], [*Atomic predicate and mutation*], [*Result*],
-    [create], [Insert id with initial state; on duplicate do nothing.], [Stored or AlreadyExists; existing bytes remain intact.],
-    [load], [Read revision, generation, cancellation, and bytes by id.], [Stored or NotFound; malformed returned types are Corrupt.],
-    [claim], [Match id and absent token or expired deadline; increment generation; generate random UUID token; refresh deadline/update time.], [Claim and latest Stored; otherwise diagnose NotFound or Busy.],
-    [commit], [Match id, generation, token, revision, and cancellation; increment revision; replace bytes/phase; refresh deadline/update time.], [Stored; otherwise diagnose NotFound or ordered refusal.],
+    [create], [Insert id with initial state and its records; on duplicate do nothing.], [Nil or AlreadyExists; existing records remain intact.],
+    [load], [Read revision, generation, cancellation, and every record by id in one statement.], [Stored or NotFound; malformed returned types are Corrupt.],
+    [claim], [In one READ COMMITTED transaction: match id and absent token or expired deadline; increment generation; generate random UUID token; refresh deadline/update time; then read the records while the claim's row lock excludes every commit. A failed read rolls the claim back.], [Claim and the Stored of the same generation; otherwise diagnose NotFound or Busy.],
+    [commit], [Match id, generation, token, revision, and cancellation; increment revision; set phase; upsert the named records; refresh deadline/update time.], [Nil; otherwise diagnose NotFound or ordered refusal.],
     [release], [Match id, generation, and token; clear token/deadline; update time.], [Nil; otherwise NotFound or StaleOwner.],
     [renew], [Match id, generation, and token; refresh deadline only.], [Nil; otherwise NotFound or StaleOwner.],
     [cancel], [Match id; set cancellation true; update time.], [Nil or NotFound; repeated requests succeed.],
-    [unfinished], [Nonfinished phase and absent or expired claim; oldest creation then id; positive row limit.], [List of candidate ids; nonpositive limit returns an empty list without a query.],
+    [list], [Requested phase, id after the cursor, and absent or expired claim; id byte order (`COLLATE "C"`); positive row limit.], [List of candidate ids; nonpositive limit returns an empty list without a query.],
   ))
   #subsection(title: "Conditional writes and refusal precedence")[
     #answers(title: "Commit predicate", responsibility: [Separate changed ownership, changed cancellation, and changed progress.], interface: [Parent Claim and Commit; returned next Stored or storage.Error.], interactions: [One conditional update followed, on no row, by an owner-state read.], invariants: [Generation/token comparison precedes cancellation interpretation; cancellation precedes revision conflict.], failure: [A diagnostic read can fail independently or observe a later concurrent state; it is not the failed mutation's original snapshot.])
@@ -195,7 +195,7 @@
       #given[The caller holds a claim and an expected checkpoint revision with an observed cancellation value.]
       #when[The caller attempts to replace progress.]
       #then[The replacement succeeds only when ownership, revision, and cancellation observation all agree.]
-      #then[A refusal preserves checkpoint bytes and revision.]
+      #then[A refusal preserves checkpoint records and revision.]
     ]
     #behavior(title: "Refusal identifies the highest-priority disagreement", area: "Conditional progress", level: "boundary")[
       #given[A progress replacement changes no execution and the current state can be read.]
@@ -223,7 +223,7 @@
   #behavior(title: "Cancellation records intent without replacing progress", area: "Cancellation", level: "boundary")[
     #given[The execution exists.]
     #when[The caller records cancellation.]
-    #then[The cancellation flag is true while checkpoint bytes and revision remain unchanged.]
+    #then[The cancellation flag is true while checkpoint records and revision remain unchanged.]
     #then[Repeated requests succeed without changing ownership.]
   ]
 ])
@@ -249,7 +249,7 @@
   #md-table(3, (
     [*Boundary*], [*What becomes authoritative*], [*Uncertainty or later work*],
     [Creation reply], [Initial checkpoint and id reservation], [Creation with a lost reply is reconnected by stable id through Saga's input/definition checks.],
-    [Claim reply], [New generation/token plus stored bytes], [A lost reply can leave an unobserved claim until expiry.],
+    [Claim reply], [New generation/token plus stored records], [A lost reply can leave an unobserved claim until expiry.],
     [Commit reply], [Next checkpoint revision and lease refresh], [An unavailable/timed-out reply does not itself establish whether the write took effect.],
     [Effect completion], [Application effect evidence], [A separate checkpoint records it; the gap requires a resolver after interruption.],
     [Cancel reply], [Stored cancellation intent], [Saga observes it at persistence boundaries; it does not stop or reverse a remote effect by itself.],
@@ -323,7 +323,8 @@
   #subsection(title: "Tables and discovery index")[
     #points(
       [Migration version one creates the version ledger, execution table, and partial index on creation time then id for rows whose phase is not Finished. It records version one last.],
-      [The index supports oldest-first unfinished discovery. Lease time is checked dynamically rather than indexed as a fixed expiry bucket; a large population of live unfinished rows can still require filtering.],
+      [Migration version two moves checkpoints into `saga_records` (one row per execution and key, deleted with its execution) and drops the execution table's checkpoint column, discarding checkpoints of the earlier single-record format; unfinished executions must be drained first. It replaces the partial index with an index on phase then id in byte order, and records version two last. #adr(6) records the record rows.],
+      [The index serves paged discovery within one phase. Lease time is checked dynamically rather than indexed as a fixed expiry bucket; a large population of live rows in one phase can still require filtering.],
       [The watermark is maximum version, not a list of gaps or migration checksums. A newer recorded version causes this package to apply nothing older and does not establish that an older adapter understands every newer schema.],
       [Append numbered migrations; preserve released migration statements. Internal statement lists and checked-in SQL up sections must agree statement for statement; #adr(2) records that dual entry point.],
     )
@@ -333,7 +334,7 @@
       [The SQL file uses migration:up/down/end sections. An external tool creates/selects the target schema and runs the up statements in one READ COMMITTED transaction with search_path identifying that schema.],
       [The up statements take the same lock prefix and current_schema-derived key as package migration, then record the same version. Coordinated tools must select unapplied versions after acquiring the lock; the raw SQL file itself is not repeat-idempotent.],
       [Package migrate is forward-only. The shipped down section destructively drops the execution and migration tables; rollback execution and data retention are external administrative decisions.],
-      [Schema installation is separate from checkpoint/definition migration. The adapter never transforms stored Saga bytes or checks a workflow compatibility stamp.],
+      [Schema installation is separate from checkpoint/definition migration. The adapter never transforms stored Saga records or checks a workflow compatibility stamp.],
     )
   ]
   #behavior(title: "Package migration serializes concurrent installation", area: "Migration", level: "boundary")[
@@ -345,22 +346,22 @@
 ])
 
 #section(title: "Release discovery and retention", lead: "Driver lifetime and saved execution lifetime are independent.", body: [
-  #answers(title: "Release and discovery", responsibility: [Make eligible unfinished executions available to an application-owned next driver.], interface: [Current-claim release, renewal callback, and unfinished(limit).], interactions: [Saga normally releases on runner completion/stop; an application scans and reconnects candidates.], invariants: [Release clears only current ownership; discovery excludes Finished and live claims.], failure: [A lost release falls back to lease expiry; candidate scans can race another claim; NotFound and StaleOwner remain distinct.])
+  #answers(title: "Release and discovery", responsibility: [Make eligible unfinished executions available to an application-owned next driver.], interface: [Current-claim release, renewal callback, and list(phase, after, limit).], interactions: [Saga normally releases on runner completion/stop; an application pages through candidates and reconnects them.], invariants: [Release clears only current ownership; discovery returns one phase and excludes live claims.], failure: [A lost release falls back to lease expiry; candidate scans can race another claim; NotFound and StaleOwner remain distinct.])
   #behavior(title: "Release removes only current ownership", area: "Ownership", level: "boundary")[
     #given[The caller holds the current claim.]
     #when[The caller releases it.]
     #then[Ownership becomes vacant while checkpoint progress and generation remain retained.]
   ]
   #behavior(title: "Discovery reports candidates without reservation", area: "Discovery", level: "boundary")[
-    #when[The caller requests unfinished executions with a positive limit.]
-    #then[The result contains at most that many nonfinished executions without a live claim, oldest first with identifier ordering for equal creation times.]
+    #when[The caller requests one phase's executions after a cursor id with a positive limit.]
+    #then[The result contains at most that many executions in that phase without a live claim, with ids after the cursor in byte order.]
     #then[The caller must claim a candidate before driving it.]
   ]
   #points(
     [A killed runner whose drive caller survives can be released promptly by Saga. Complete node loss or release failure leaves the saved ownership until its last lease deadline; the adapter has no process monitor or background sweeper.],
     [The owner-loss window is one configured lease from the last accepted refresh under a progressing database clock. It is not a promise that discovery or a successor starts within that window.],
-    [One discovery call is a snapshot, not a reservation or a continuous watch. Repeated sweepers can receive the same ids; there is no notification, cursor, automatic wakeup, or fairness guarantee.],
-    [#term("term-retention") is indefinite here: no TTL, pruner, delete, or archival API removes executions. Finished rows remain loadable and reserve their ids; release does not delete bytes or journal evidence.],
+    [One discovery call is a snapshot, not a reservation or a continuous watch. Repeated sweepers can receive the same ids; the cursor pages through one snapshot order, and there is no notification, automatic wakeup, or fairness guarantee.],
+    [#term("term-retention") is indefinite here: no TTL, pruner, delete, or archival API removes executions. Finished rows remain loadable and reserve their ids; release does not delete records or journal evidence.],
     [Deleting data with administrative SQL discards recovery and idempotent admission evidence. Applications must decide reference validity, child/compensation authority, backups, and identifier reuse before introducing retention deletion.],
     [The parent #lnk("https://github.com/gleam-dream/saga/blob/main/docs/design/execution/design.typ")[composition contracts] retain independent result/journal retention and owner-backed compensation authority. Those contracts do not exist in this schema and are the extension boundary recorded by #adr(5).],
   )

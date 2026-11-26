@@ -109,7 +109,7 @@
     #points(
       [A step callback receives one record. `step` receives the input only; `effect` receives the input and an opaque #term("term-effect-key"); `undo` receives UndoRequest(input, output, key); `compensate` receives FailedAttempt(input, failure, attempt, attempts_left, key). Callers read records by label and the key through its accessors (idempotency_key, attempt_number, attempt_key, correlation_of).],
       [The #term("term-correlation") of a run is mandatory and reaches every callback through its key. A local run takes a fresh unique correlation unless configured; a durable execution takes the saved one, or the key-derived default. A step's own clients attach it to join the run's observations.],
-      [A local key belongs to one run: its #term("term-idempotency-key") derives from the run id, which each local run creates anew. A durable execution derives its keys from its execution id, so they survive restart.],
+      [A local key belongs to one run: its #term("term-idempotency-key") derives from a random value drawn at start, so no other run, VM start, or node repeats it; it is unique, not stable across a second submission of the same business operation. A durable execution derives its keys from its execution id, so they survive restart.],
       [`define` reports every definition defect together and panics naming the workflow and each offending step. `try_define` returns every DefinitionError for definitions built from runtime data, and `describe_definition_error` renders one. `map_errors` and `map_step_errors` adapt error vocabulary; no saga-owned error type is ever required.],
     )
   ]
@@ -168,7 +168,7 @@
     (id: "finished", description: [Retains one terminal outcome; coordinator exits.]),
   ))
   #entity(id: "execution", title: "Execution", description: [One input interpretation of a Workflow and its effect evidence.], kind: "aggregate", owner: "Saga coordinator", lifecycle: "stateful", domain: "workflow", tint: "violet")[
-    #attribute(name: "Run identity", type: "Local fresh run id or durable execution id", provenance: "derived")[Local id is fresh per start; the durable id is caller-chosen within one store.]
+    #attribute(name: "Run identity", type: "Local fresh run id or durable execution id", provenance: "derived")[Local id is fresh per start and counts within one VM, so it names a run in telemetry and never enters a key; the durable id is caller-chosen within one store.]
     #attribute(id: "phase", name: "Phase", type: "Execution phase", provenance: "derived", state-type: "execution-phase", state-machine: "execution-lifecycle")[Derived from accepted transitions; public progress exposes the three active phases only.]
     #attribute(name: "Primary trigger", type: "Failure, cancellation, or held evidence", provenance: "derived")[The original stopping cause remains separate from subsequently observed sibling and cleanup failures.]
     #attribute(name: "Action evidence", type: "Known results, journal, and unknown actions", provenance: "observed")[Accepted callback results record observations; recovery decisions supply explicit transition authority.]
@@ -228,12 +228,11 @@
     [Continue(output, undo)], [Accept replacement output and its undo capability], [Replacement completion is known; original uncertain attempt remains unknown.],
     [Abort(error)], [Fail and permit reverse undo of known completions], [Native application cause plus earlier unknown effects.],
     [AbortAfterCleanupFailure(error, undo_error)], [Same rollback permission], [Separate compensation cleanup failure.],
-    [Hold(evidence)], [End Unresolved after siblings settle; do not undo], [Native held evidence and every completed step left in place.],
+    [Hold], [End Unresolved after siblings settle; do not undo], [The held attempt failure and every completed step left in place.],
   ))
   #points(
-    [`unknown_when` marks returned business errors whose external effect may have happened. Without a deciding compensation, default `on_unknown(Reconcile)` preserves completed reservations; explicit `RollBack` permits their undo.],
-    [Exhausted retry of a marked uncertain error follows the same Hold/RollBack policy. An explicit Abort permits rollback even after a marked error.],
-    [Crashes and timeouts without a decider fail and roll back known completions while retaining the crashed/timed-out action as unknown. A decider's Abort may produce StepFailed after a crash; the cause alone cannot establish known effects.],
+    [A step's outcome is unknown when its attempt crashes, times out, or returns a business error that `unknown_when` marks, and when its decider crashes or times out. One rule governs all of them: without a deciding compensation, default `on_unknown(Reconcile)` ends the run Unresolved with that failure and preserves completed reservations; explicit `RollBack` permits their undo.],
+    [Exhausted retry after an unknown last attempt follows the same Reconcile/RollBack policy. An explicit Abort permits rollback even after an unknown outcome; a decider's Abort may produce StepFailed after a crash, so the cause alone cannot establish known effects.],
     [Applications own downstream idempotency and reconciliation evidence. Passing an idempotency key alone never proves provider deduplication or exactly-once effects.],
   )
   #behavior(title: "An uncertain retry cannot become clean completion", area: "Unknown effects", level: "boundary")[
@@ -247,7 +246,7 @@
     #then[The outcome is Unresolved and completed steps remain held.]
     #then[No earlier completion is claimed as reversed.]
   ]
-  #points([The uncertainty and rollback decisions are recorded in #adr(3).])
+  #points([The uncertainty and rollback decisions are recorded in #adr(3); the single rule for unknown outcomes is #adr(16).])
 ])
 
 #section(title: "Outcome and settlement", lead: "One full typed report is the authority for application and operational evidence.", body: [
@@ -323,7 +322,7 @@
 ])
 
 #section(title: "Local ownership and reporting", lead: "The starting process owns execution, while outcome delivery may belong to a survivor.", body: [
-  #answers(title: "Local execution port", responsibility: [Start one owner-bound coordinator and expose its outcome, cancellation, and progress.], interface: [`run`, `start`, `await`, `start_reporting`, `cancel`, `progress`, `pid`, and `run_id`.], interactions: [Monitors starting process; ordinary handle delivers to that owner, reporting handle delivers once to its Subject.], invariants: [Only the ordinary starter may await. Reporting handles cannot await; cancel/progress work from any process.], failure: [InvalidConfig starts no work; ExecutionLost cannot prove no effect started. Await distinguishes timeout, NotOwner, consumed outcome, and typed Lost evidence.])
+  #answers(title: "Local execution port", responsibility: [Start one owner-bound coordinator and expose its outcome, cancellation, and progress.], interface: [`run`, `start`, `await`, `start_reporting`, `cancel`, `progress`, `pid`, and `run_id`.], interactions: [Monitors starting process; ordinary handle delivers to that owner, reporting handle delivers once to its Subject.], invariants: [Only the ordinary starter may await. Reporting handles cannot await; cancel/progress work from any process.], failure: [InvalidConfig starts no work. A coordinator admits no step before its starter confirms the startup handshake; when the handshake fails the starter stops the coordinator, so ExecutionLost from a start proves no step started. ExecutionLost from `run` after a started coordinator was lost cannot prove no effect started. Await distinguishes timeout, NotOwner, consumed outcome, and typed Lost evidence.])
   #points(
     [A successful ordinary await consumes the outcome and drains its monitor. A second await may first time out while the coordinator is exiting; AlreadyAwaited is guaranteed only after exit.],
     [A dropped handle after a timed-out await can leave its terminal outcome or monitor message in the owner mailbox. Cancellation requires a subsequent await to consume completion.],
@@ -335,7 +334,7 @@
       [Use this boundary within a per-invocation worker. Repeated use from a long-lived actor retains one receiver per invocation until that actor exits.],
       [rollback_within bounds owner-loss waiting when no coordinator was reported and bounds the notification worker. Once a known coordinator exists, its configured settlement/cleanup govern completion; rollback_within is not a global execution deadline.],
       [Readiness failure closes the startup reply channel, removes monitors, and preserves unrelated mail before any workflow launch. Normal result return and admission failure remove the caller's receiver monitor.],
-      [NotStarted is proven only for rejected rollback/configuration or prelaunch receiver failure. Lost execution handshake, receiver loss, and coordinator loss are Unknown; typed run_error/exit_reason accessors retain causes and safe describe_error excludes crash payloads.],
+      [NotStarted is proven only for rejected rollback/configuration, prelaunch receiver failure, or a lost execution handshake, whose coordinator is stopped before it admits a step. Receiver loss and coordinator loss are Unknown; typed run_error/exit_reason accessors retain causes and safe describe_error excludes crash payloads.],
     )
   ]
 ])

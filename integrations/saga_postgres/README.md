@@ -1,5 +1,11 @@
 # saga_postgres
 
+> **saga_postgres 0.2.0 is a breaking release and requires Saga 0.3.** Read the [migration guide](https://github.com/gleam-dream/saga/blob/main/docs/MIGRATION.md#postgresql-run-migration-2) before you upgrade from 0.1.
+>
+> - **Drain every unfinished durable execution before you upgrade.** Migration 2 drops `saga_executions.data` and so deletes every checkpoint saved by 0.1, finished or not.
+> - Checkpoints are stored one record per row in a new table, `saga_records`.
+> - Use `ref = "saga_postgres-v0.2.0"` and `saga >= 0.3.0 and < 0.4.0`. `saga_postgres.storage(config)` and the configuration functions keep their signatures.
+
 [![CI](https://github.com/gleam-dream/saga/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/saga/actions/workflows/ci.yml)
 [![saga on Hex](https://img.shields.io/hexpm/v/saga?label=Hex%3A%20saga)](https://hex.pm/packages/saga)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
@@ -17,8 +23,8 @@ adapter from its Git subdirectory:
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 pog = ">= 4.1.0 and < 4.2.0"
-saga = ">= 0.1.0 and < 0.2.0"
-saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "saga_postgres-v0.1.0", path = "integrations/saga_postgres" }
+saga = ">= 0.3.0 and < 0.4.0"
+saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "saga_postgres-v0.2.0", path = "integrations/saga_postgres" }
 ```
 
 Commit `gleam.toml` and `manifest.toml` to retain the resolved versions and Git commit.
@@ -77,7 +83,7 @@ versions and interrupted-effect resolvers are described in the main Saga README.
 `durable.drive` returns the workflow's typed outcome or `durable.Error` with its
 recovery information; `durable.error_kind` selects the next action.
 The same storage supports `durable.read`, `durable.cancel`, `durable.reconnect`
-and `durable.unfinished`. Retain a pool connection handle for storage; a
+and `durable.list`. Retain a pool connection handle for storage; a
 transaction-scoped connection is unsuitable as a reusable store across runners.
 
 ## Configuration
@@ -102,6 +108,10 @@ the selected schema's advisory lock; a repeat skips applied versions.
 application migration tool, which runs them in a transaction with `search_path` set
 to the target schema. The raw up file is not repeat-idempotent. The packaged down
 section drops retained execution data, and package `migrate` never runs it.
+Migration 2 moves checkpoints into one row per record and discards checkpoints
+saved by earlier releases: drain unfinished executions before applying it. The
+[migration guide](https://github.com/gleam-dream/saga/blob/main/docs/MIGRATION.md#postgresql-run-migration-2)
+lists the steps.
 
 ## Development
 

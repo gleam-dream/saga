@@ -2,6 +2,8 @@
 
 <a id="adr-0003"></a>
 
+The treatment of crashes and timeouts is superseded by [0016-one-rule-for-unknown-outcomes.md](0016-one-rule-for-unknown-outcomes.md).
+
 ## Decision
 
 - Record crashed, timed-out, interrupted, and application-marked uncertain actions independently from later recovery.
