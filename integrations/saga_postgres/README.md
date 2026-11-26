@@ -1,5 +1,11 @@
 # saga_postgres
 
+> **saga_postgres 0.2.0 is a breaking release and requires Saga 0.3.** Read the [migration guide](https://github.com/gleam-dream/saga/blob/main/docs/MIGRATION.md#postgresql-run-migration-2) before you upgrade from 0.1.
+>
+> - **Drain every unfinished durable execution before you upgrade.** Migration 2 drops `saga_executions.data` and so deletes every checkpoint saved by 0.1, finished or not.
+> - Checkpoints are stored one record per row in a new table, `saga_records`.
+> - Use `ref = "saga_postgres-v0.2.0"` and `saga >= 0.3.0 and < 0.4.0`. `saga_postgres.storage(config)` and the configuration functions keep their signatures.
+
 [![CI](https://github.com/gleam-dream/saga/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/saga/actions/workflows/ci.yml)
 [![saga on Hex](https://img.shields.io/hexpm/v/saga?label=Hex%3A%20saga)](https://hex.pm/packages/saga)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)

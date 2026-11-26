@@ -153,6 +153,8 @@ The [operations example](https://github.com/gleam-dream/saga/blob/main/examples/
 2. Change the `saga_postgres` Git tag to `saga_postgres-v0.2.0` and the `saga` range to `>= 0.3.0 and < 0.4.0`.
 3. Run `saga_postgres.migrate` at startup as before. If an application migration tool applies the SQL in `priv/migrations` instead, add migration 2 to it.
 
+Migration 2 has a down section for development databases. It restores the `data` column empty, so it does not bring back the deleted checkpoints; `saga_postgres.migrate` never runs it.
+
 The `pog` and `pgo` ranges are unchanged (`pog >= 4.1.0 and < 4.2.0`, `pgo >= 0.20.0 and < 0.21.0`). `saga_postgres.storage(config)` and the configuration functions keep their signatures.
 
 ## File storage uses a directory per execution
@@ -183,4 +185,5 @@ These need no code change in most applications.
 - **Local idempotency keys are random per run.** A local run (`execution.run`, `execution.start`) draws its key scope from 128 random bits when it starts, instead of a per-VM counter that repeated after every restart and on every node. Every attempt of the same step inside one run still shares one key. A key is about 37 bytes and stays opaque. Submitting the same business operation again is a new run with new keys; use `saga/durable` with a stable execution id when a repeat must deduplicate. Durable keys are unchanged.
 - **A lost startup handshake starts no step.** When `execution.start` or `execution.start_reporting` returns `ExecutionLost` because the coordinator did not answer, the coordinator is stopped before the call returns and no step has started. `reporting.effect_status` now returns `NotStarted` for that error instead of `Unknown`. `ExecutionLost` from `execution.run` can still mean a coordinator was lost after it started.
 - **A settling run does not start a proven-absent attempt.** When a durable run resumes while it settles after a failure or a deadline, an interrupted attempt with no saved input, or one its resolver proves `NotSent`, is no longer started; it settles as absent and the run rolls back.
+- **The checkpoint size limit counts every record.** `max_checkpoint_bytes` (default 16 MiB) bounds the records of a checkpoint together. A commit writes only the records that changed, but an execution whose checkpoint grows past the bound still suspends.
 - **Telemetry handlers follow Sinal 0.2.** A Sinal handler attached to Saga's events is detached when the attaching process exits. Attach it from a process that outlives the runs it observes, such as a supervised one.
