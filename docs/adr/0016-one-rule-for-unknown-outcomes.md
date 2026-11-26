@@ -23,4 +23,10 @@ the rest of 0003 remains in force.
 
 - Breaking: a crash or timeout without a decider now ends `Unresolved` instead of `Failed(StepCrashed | StepTimedOut)`; add `on_unknown(RollBack)` to keep rollback. `Unresolved.evidence: e` became `failure: AttemptFailure(e)`, and `Hold(e)` became `Hold`.
 - `StepCrashed` and `StepTimedOut` remain the causes a `RollBack` step fails with.
-- Checkpoints saved with the earlier held error read as `Returned(error)`.
+- Checkpoints saved before this change are not read at all ([0017](0017-checkpoints-are-saved-as-records.md)): drain unfinished executions before upgrading.
+
+## Verification
+
+- Each way an outcome becomes unknown (a crash, a timeout, a classified error, a crashing or timed-out decider) ends a `Reconcile` step `Unresolved` with the failure that was held, and undoes nothing.
+- The same cases on a `RollBack` step fail the run and undo the known completions.
+- A retry the attempt budget no longer allows follows `on_unknown`; an explicit `Abort` rolls back and an explicit `Hold` holds, whatever `on_unknown` says.

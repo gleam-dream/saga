@@ -10,6 +10,7 @@ Accepted 2026-11-25 by owner ruling. Extends [0005-storage-claims-as-values.md](
 - `create` takes the first records and `commit` returns nothing; `load` and `claim` return every record.
 - `unfinished(limit)` becomes `list(Listing(phase, after, limit))`: the unowned executions of one phase, in id byte order, after a cursor id.
 - Saved checkpoints of the earlier single-record format are not read. Drain unfinished executions before upgrading.
+- A commit that changes no record is skipped, unless its checkpoint releases admitted work: that commit is made anyway, so the runner's claim fences every admission.
 
 ## Rationale and alternatives
 

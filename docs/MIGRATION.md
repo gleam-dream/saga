@@ -90,7 +90,7 @@ execution.Unresolved(step, saga.Crashed(_), _)
 | execution.Unresolved(step, saga.TimedOut, _) -> reconcile_unknown(step)
 ```
 
-`outcome.summary` renders a held crash or timeout by its kind only ("the attempt crashed", "the attempt timed out"), never the crash reason.
+`outcome.summary` renders a held crash or timeout by its kind only ("a crash left the step's outcome unknown", "a timeout left the step's outcome unknown"), never the crash reason. The crash or timeout can be the attempt's or its decider's.
 
 ## `Hold` takes no argument
 
@@ -180,7 +180,7 @@ Fencing, the refusal order (`StaleOwner`, then `CancellationChanged`, then `Conf
 
 These need no code change in most applications.
 
-- **Local idempotency keys are random per run.** A local run (`execution.run`, `execution.start`) draws its key scope from 128 random bits when it starts, instead of a per-VM counter that repeated after every restart and on every node. Every attempt inside one run still shares one key. A key is about 37 bytes and stays opaque. Submitting the same business operation again is a new run with new keys; use `saga/durable` with a stable execution id when a repeat must deduplicate. Durable keys are unchanged.
+- **Local idempotency keys are random per run.** A local run (`execution.run`, `execution.start`) draws its key scope from 128 random bits when it starts, instead of a per-VM counter that repeated after every restart and on every node. Every attempt of the same step inside one run still shares one key. A key is about 37 bytes and stays opaque. Submitting the same business operation again is a new run with new keys; use `saga/durable` with a stable execution id when a repeat must deduplicate. Durable keys are unchanged.
 - **A lost startup handshake starts no step.** When `execution.start` or `execution.start_reporting` returns `ExecutionLost` because the coordinator did not answer, the coordinator is stopped before the call returns and no step has started. `reporting.effect_status` now returns `NotStarted` for that error instead of `Unknown`. `ExecutionLost` from `execution.run` can still mean a coordinator was lost after it started.
 - **A settling run does not start a proven-absent attempt.** When a durable run resumes while it settles after a failure or a deadline, an interrupted attempt with no saved input, or one its resolver proves `NotSent`, is no longer started; it settles as absent and the run rolls back.
 - **Telemetry handlers follow Sinal 0.2.** A Sinal handler attached to Saga's events is detached when the attaching process exits. Attach it from a process that outlives the runs it observes, such as a supervised one.
