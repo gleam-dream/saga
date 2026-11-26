@@ -120,9 +120,11 @@ fn measure(steps: Int, run: Int) -> #(Int, Int, Int, Int) {
   let assert Ok(started) =
     durable.start_or_reconnect(persistence, counting, id: id, input: payload)
   let before = bench_ffi.monotonic_time()
-  let assert Ok(execution.Completed(_)) =
+  let assert Ok(execution.Completed(output)) =
     durable.drive(started, timeout: duration.seconds(120))
   let elapsed = bench_ffi.monotonic_time() - before
+  // Every timed run must produce the chain's output: the last step's.
+  let assert True = output == payload
   memory.stop(store)
   let #(commits, bytes) = drain(sizes, 0, 0)
   #(commits, bytes, counter.read(encodes), elapsed)
