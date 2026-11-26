@@ -2,7 +2,7 @@
 # records, with leased claims, for runners on several nodes that share one
 # database. A separate package, so that saga itself does not depend on pog.
 name = "saga_postgres"
-version = "0.1.0"
+version = "0.2.0"
 target = "erlang"
 gleam = ">= 1.18.0"
 internal_modules = ["saga_postgres/internal", "saga_postgres/internal/*"]
