@@ -17,8 +17,8 @@ adapter from its Git subdirectory:
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 pog = ">= 4.1.0 and < 4.2.0"
-saga = ">= 0.1.0 and < 0.2.0"
-saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "saga_postgres-v0.1.0", path = "integrations/saga_postgres" }
+saga = ">= 0.3.0 and < 0.4.0"
+saga_postgres = { git = "https://github.com/gleam-dream/saga.git", ref = "saga_postgres-v0.2.0", path = "integrations/saga_postgres" }
 ```
 
 Commit `gleam.toml` and `manifest.toml` to retain the resolved versions and Git commit.
@@ -103,7 +103,9 @@ application migration tool, which runs them in a transaction with `search_path` 
 to the target schema. The raw up file is not repeat-idempotent. The packaged down
 section drops retained execution data, and package `migrate` never runs it.
 Migration 2 moves checkpoints into one row per record and discards checkpoints
-saved by earlier releases: drain unfinished executions before applying it.
+saved by earlier releases: drain unfinished executions before applying it. The
+[migration guide](https://github.com/gleam-dream/saga/blob/main/docs/MIGRATION.md#postgresql-run-migration-2)
+lists the steps.
 
 ## Development
 
