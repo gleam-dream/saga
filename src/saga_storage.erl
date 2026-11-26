@@ -34,11 +34,41 @@ file_create(Dir, Id, Records) ->
         end
     end).
 
+%% A load takes no lock, so it never delays a commit. A commit removes the
+%% record files it replaced once its new head is in place, so a load that
+%% read an earlier head can miss a file. Record files are never rewritten
+%% (a name holds its key and the revision that wrote it), so the load then
+%% reads the head again and reads only the files of the new head it does
+%% not hold yet. A missing file under an unchanged head is corrupt.
 file_load(Dir, Id) ->
     Path = dir(Dir, Id),
     case read(Path) of
-        {ok, Head} -> stored(Path, Head);
+        {ok, Head} -> load(Path, Head, #{});
         Error -> Error
+    end.
+
+load(Path, {head, V, G, C, _, _, Index} = Head, Held) ->
+    try maps:fold(fun(_, Name, {Read, Missing}) ->
+            case maps:find(Name, Held) of
+                {ok, Bytes} -> {maps:put(Name, Bytes, Read), Missing};
+                error ->
+                    case file:read_file(filename:join(Path, Name)) of
+                        {ok, Bytes} -> {maps:put(Name, Bytes, Read), Missing};
+                        {error, enoent} -> {Read, true};
+                        {error, E} -> throw({unavailable, E})
+                    end
+            end
+        end, {#{}, false}, Index) of
+        {Read, false} ->
+            {ok, {stored, V, G, C, maps:map(fun(_, Name) -> maps:get(Name, Read) end, Index)}};
+        {Read, true} ->
+            case read(Path) of
+                {ok, Head} -> {error, corrupt};
+                {ok, Next} -> load(Path, Next, Read);
+                Error -> Error
+            end
+    catch
+        throw:{unavailable, E} -> unavailable(E)
     end.
 
 file_claim(Dir, Id) ->

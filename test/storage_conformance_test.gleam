@@ -1,3 +1,5 @@
+import gleam/dict
+import gleam/erlang/process
 import gleam/int
 import gleam/time/duration
 import gleeunit/should
@@ -171,3 +173,62 @@ fn process_claim(
   storage: storage.Storage,
   id: String,
 ) -> Result(#(storage.Claim, storage.Stored), storage.Error)
+
+/// A file load reads one consistent checkpoint while commits replace its
+/// records: it never finds a record file that a concurrent commit removed.
+pub fn file_load_is_consistent_with_concurrent_commits_test() {
+  let directory = "/tmp/saga-load-race-" <> int.to_string(unique())
+  fresh_directory(directory)
+  let store = file.open(directory)
+  // A load of many records spans several commits, each of which replaces
+  // some of those records and removes their earlier files.
+  let records = fn(n, count) {
+    int.range(from: 0, to: count, with: dict.new(), run: fn(records, key) {
+      dict.insert(records, int.to_string(key), <<n:size(32)>>)
+    })
+  }
+  let record = fn(n) { records(n, 1000) }
+  let assert Ok(Nil) = storage.do_create(store, "race", record(0))
+  let assert Ok(#(claim, _)) = storage.do_claim(store, "race")
+  let failures = process.new_subject()
+  let stopper = process.new_subject()
+  process.spawn(fn() {
+    let stop = process.new_subject()
+    process.send(stopper, stop)
+    process.send(failures, load_until(store, stop, []))
+  })
+  let assert Ok(stop) = process.receive(stopper, 1000)
+  int.range(from: 0, to: 100, with: Nil, run: fn(_, n) {
+    let assert Ok(Nil) =
+      storage.do_commit(
+        store,
+        claim,
+        storage.Commit(
+          expected_revision: n,
+          observed_cancelled: False,
+          phase: storage.Pending,
+          records: records(n + 1, 20),
+        ),
+      )
+    Nil
+  })
+  process.send(stop, Nil)
+  process.receive(failures, 5000) |> should.equal(Ok([]))
+  remove_directory(directory)
+}
+
+/// Loads "race" until told to stop and returns every failed load.
+fn load_until(
+  store: storage.Storage,
+  stop: process.Subject(Nil),
+  seen: List(storage.Error),
+) -> List(storage.Error) {
+  case process.receive(stop, 0) {
+    Ok(Nil) -> seen
+    Error(Nil) ->
+      case storage.do_load(store, "race") {
+        Ok(_) -> load_until(store, stop, seen)
+        Error(error) -> load_until(store, stop, [error, ..seen])
+      }
+  }
+}
