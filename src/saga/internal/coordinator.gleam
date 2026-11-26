@@ -2751,12 +2751,21 @@ pub type SavedPhase(e, u) {
   SavedRollback(trigger: Trigger(e), settlement: Settlement(e, u))
 }
 
+/// Whether a checkpoint releases admitted work once it is saved. A save
+/// that releases work must be fenced by the runner's claim even when the
+/// snapshot did not change, so that a runner that lost its claim never
+/// starts a step.
+pub type Release {
+  ReleasesWork
+  ReleasesNothing
+}
+
 pub type Session(e, u) {
   Session(
     execution_id: String,
     snapshot: Option(Snapshot(e, u)),
     cancelled: Bool,
-    save: fn(Snapshot(e, u)) -> Result(Nil, checkpoint.Failure),
+    save: fn(Snapshot(e, u), Release) -> Result(Nil, checkpoint.Failure),
     failed: fn(checkpoint.Failure) -> Nil,
     stopped: fn() -> Nil,
   )
@@ -2838,7 +2847,11 @@ fn checkpoint(
     None, None -> Ok(state)
     None, Some(session) -> {
       use #(snapshot, frozen) <- result.try(freeze(state))
-      use _ <- result.map(session.save(snapshot))
+      let release = case state.dispatch {
+        [] -> ReleasesNothing
+        _ -> ReleasesWork
+      }
+      use _ <- result.map(session.save(snapshot, release))
       RunState(..state, frozen: frozen)
     }
   }

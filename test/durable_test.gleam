@@ -1651,6 +1651,54 @@ pub fn settling_resume_does_not_start_a_proven_unsent_effect_test() {
   memory.stop(store)
 }
 
+/// A resumed admission is fenced by the runner's claim even when the
+/// checkpoint it saves is unchanged: a runner whose claim was taken over
+/// (here, every commit is refused as stale) never starts the step again.
+pub fn unchanged_resumed_admission_is_fenced_by_the_claim_test() {
+  let entered = process.new_subject()
+  let owner = process.new_subject()
+  let effect =
+    saga.step("effect", fn(value) {
+      process.send(entered, Nil)
+      process.sleep_forever()
+      Ok(value)
+    })
+    |> durable.recoverable(
+      version: "1",
+      input: codec.text(),
+      output: codec.text(),
+      resolve: fn(_, _) { durable.NotSent },
+    )
+  let workflow =
+    saga.define("fenced-resume", fn(input) { saga.perform(input, effect) })
+  let persistence =
+    durable.new(
+      workflow,
+      input: codec.text(),
+      output: codec.text(),
+      error: codec.text(),
+      undo_error: codec.text(),
+    )
+    |> durable.with_config(
+      execution.config() |> execution.with_step_timeout(execution.Infinity),
+    )
+  let store = start_memory()
+  let watched = stores.watched(memory.storage(store), owner)
+  let run = start(persistence, watched, "fenced-resume")
+  let result = drive_later(run)
+  let assert Ok(pid) = process.receive(owner, 1000)
+  let assert Ok(Nil) = process.receive(entered, 1000)
+  kill_and_wait(pid)
+  let _ = process.receive(result, 1000)
+  let stale =
+    stores.with_commit(memory.storage(store), fn(_, _) {
+      Error(storage.StaleOwner)
+    })
+  let assert Error(_) = drive(reconnect(persistence, stale, "fenced-resume"))
+  process.receive(entered, 100) |> should.equal(Error(Nil))
+  memory.stop(store)
+}
+
 /// Every commit a durable run makes carries a checkpoint that differs from
 /// the one it last wrote: a coordinator message that changes nothing saved
 /// (a finished worker's exit, a timer that lost its race) writes nothing.

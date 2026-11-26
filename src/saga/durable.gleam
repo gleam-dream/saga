@@ -1022,15 +1022,20 @@ fn drive_claimed(
           execution_id: run.id,
           snapshot: envelope.snapshot,
           cancelled: cancelled,
-          save: fn(snapshot) {
+          save: fn(snapshot, release) {
             // A coordinator message that changed nothing saved (a finished
-            // worker's exit, a timer that lost its race) writes nothing.
+            // worker's exit, a timer that lost its race) writes nothing. A
+            // save that releases admitted work always commits, unchanged or
+            // not: the claim-fenced commit is what proves this runner still
+            // owns the execution before a step starts.
             let assert Ok(#(revision, current, sizes)) =
               process.receive(committed, 0)
             process.send(committed, #(revision, current, sizes))
-            case current.snapshot == Some(snapshot) && current.issue == None {
-              True -> Ok(Nil)
-              False ->
+            let unchanged =
+              current.snapshot == Some(snapshot) && current.issue == None
+            case unchanged, release {
+              True, coordinator.ReleasesNothing -> Ok(Nil)
+              _, _ ->
                 commit(
                   fn(current) {
                     Envelope(..current, snapshot: Some(snapshot), issue: None)
