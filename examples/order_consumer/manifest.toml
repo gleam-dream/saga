@@ -15,7 +15,7 @@ packages = [
   { name = "gleam_time", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleam_time", source = "hex", outer_checksum = "3AB789C3ED4EB9DDA7283F46C3CF83A5487C9CFB790DC3FF8F8ACB5BF7B7A6C1" },
   { name = "gleeunit", version = "1.11.0", build_tools = ["gleam"], requirements = ["gleam_stdlib"], otp_app = "gleeunit", source = "hex", outer_checksum = "EC31ABA74256AEA531EDF8169931D775BBB384FED0A8A1BDC4DD9354E3E21826" },
   { name = "json_blueprint", version = "3.0.0", build_tools = ["gleam"], requirements = ["gleam_crypto", "gleam_json", "gleam_stdlib"], otp_app = "json_blueprint", source = "hex", outer_checksum = "95B0B7D0CB98184FE05C7B8D4C0FB6312097FFCD6E1F22A563267F417D9154F3" },
-  { name = "saga", version = "0.2.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_json", "gleam_otp", "gleam_stdlib", "gleam_time", "sinal"], source = "local", path = "../.." },
+  { name = "saga", version = "0.3.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_json", "gleam_otp", "gleam_stdlib", "gleam_time", "sinal"], source = "local", path = "../.." },
   { name = "sinal", version = "0.2.0", build_tools = ["gleam"], requirements = ["gleam_erlang", "gleam_otp", "gleam_stdlib", "telemetry"], otp_app = "sinal", source = "hex", outer_checksum = "189D51F9DF72FDC25B0644CD0479523339D00CA2F9BA09E91515E5160EE68E0C" },
   { name = "telemetry", version = "1.4.3", build_tools = ["rebar3"], requirements = [], otp_app = "telemetry", source = "hex", outer_checksum = "17A63581CF2E832A238287F5FE6811E8CA1F333249F1376AD653164A3C4770D4" },
 ]
